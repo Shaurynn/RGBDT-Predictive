@@ -1,0 +1,24 @@
+{
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.black-formatter",
+        "editor.formatOnSave": true,
+      },
+    "black-formatter.args": [
+        "--max-line-length=120",
+    ],
+    "flake8.args": [
+        "--disable=C0111",
+        "--max-line-length=120",
+    ],
+    "pylint.args": [
+        // "--reports",
+        // "12",
+        // "--disable-C0114",
+        // "--disable-C0115",
+        "--disable-C0116",
+        "--max-line-length=120",
+    ],
+    "python.analysis.diagnosticSeverityOverrides": {
+
+    }
+}
