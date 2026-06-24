@@ -2,3 +2,5 @@
 .pytest_cache/
 .oython-version
 .dvc/
+diagnostics/
+results/
