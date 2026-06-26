@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
+import segmentation_models_pytorch as smp
 
 
 class GlobalContextModalityAttention(nn.Module):
@@ -76,38 +76,31 @@ class GlobalContextModalityAttention(nn.Module):
         return fused_spatial
     
 class TriModalPredictiveNetwork(nn.Module):
-    def __init__(self, num_classes: int = 14): # Defaulting to MM5's top-level class count
+    def __init__(self, num_classes: int = 14): 
         super().__init__()
         
         # Backbone A: RGB-D Geometry Encoder (4 Input Channels)
-        # Using pretrained=False because ImageNet weights are useless for 4-channel spatial tensors
-        self.rgbd_encoder = timm.create_model(
-            'segformer_b0', 
-            in_chans=4, 
-            pretrained=False, 
-            features_only=True
+        # Using weights=None because ImageNet weights are useless for 4-channel spatial tensors
+        self.rgbd_encoder = smp.encoders.get_encoder(
+            "mit_b0",
+            in_channels=4,
+            depth=5,
+            weights=None 
         )
         
         # Backbone B: Thermodynamic Encoder (1 Input Channel)
-        self.therm_encoder = timm.create_model(
-            'segformer_b0', 
-            in_chans=1, 
-            pretrained=False, 
-            features_only=True
-        )
-        
-        # Add a lightweight reconstruction head to output the predicted thermal tensor
-        self.therm_decoder = nn.Sequential(
-            nn.Conv2d(256, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, kernel_size=1) # Outputs 1 channel (Thermal)
+        self.therm_encoder = smp.encoders.get_encoder(
+            "mit_b0",
+            in_channels=1,
+            depth=5,
+            weights=None
         )
         
         # The GCMA Fusion Head
-        # MiT-B0 typically outputs 256 channels at its final stage
+        # MiT-B0 outputs 256 channels at its final stage (depth 5)
         self.fusion_head = GlobalContextModalityAttention(embed_dim=256, num_heads=4)
         
-        # The Final Classifier (Predicting the Segmentation Mask)
+        # The Final Classifier (Anatomy)
         self.classifier = nn.Sequential(
             nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(256),
@@ -115,9 +108,14 @@ class TriModalPredictiveNetwork(nn.Module):
             nn.Conv2d(256, num_classes, kernel_size=1)
         )
         
-        # --- Modality-Specific Supervisory Head (Thermal Expert) ---
-        # This forces the thermal encoder to independently recognize rot/decay 
-        # without relying on the RGB-D visual texture.
+        # The Thermal Decoder (Physics)
+        self.therm_decoder = nn.Sequential(
+            nn.Conv2d(256, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 1, kernel_size=1) 
+        )
+
+        # Modality-Specific Supervisory Head (Thermal Expert)
         self.aux_therm_classifier = nn.Sequential(
             nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(128),
@@ -127,11 +125,8 @@ class TriModalPredictiveNetwork(nn.Module):
         )
 
     def forward(self, x_rgbd: torch.Tensor, x_therm: torch.Tensor):
-        """
-        x_rgbd: [Batch, 4, H, W]
-        x_therm: [Batch, 1, H, W]
-        """
         # 1. Independent Feature Extraction
+        # SMP encoders return a list of features. We grab the final layer [-1].
         feat_rgbd = self.rgbd_encoder(x_rgbd)[-1]   
         feat_therm = self.therm_encoder(x_therm)[-1] 
         
@@ -148,11 +143,8 @@ class TriModalPredictiveNetwork(nn.Module):
         
         # 4. Training-Only Expert Supervision
         if self.training:
-            # Generate a segmentation mask using ONLY the thermal features
             aux_logits = self.aux_therm_classifier(feat_therm)
             out_aux_seg = F.interpolate(aux_logits, size=(x_rgbd.shape[2], x_rgbd.shape[3]), mode='bilinear', align_corners=False)
             return out_seg, out_therm, out_aux_seg
             
-        # During eval/deployment, the aux head is entirely ignored
         return out_seg, out_therm
-        
