@@ -112,10 +112,14 @@ class SemanticGradCAM:
 
 # --- 3. The State Manager ---
 class ExperimentManager:
-    def __init__(self, model_instance, base_dir="results"):
+    def __init__(self, model_instance, data_domain="MM5", base_dir="results"):
         self.model_name = model_instance.__class__.__name__
-        self.model_dir = os.path.join(base_dir, self.model_name)
+        self.data_domain = data_domain
+        
+        # NESTED ROUTING: results/Architecture/Data_Domain/
+        self.model_dir = os.path.join(base_dir, self.model_name, self.data_domain)
         os.makedirs(self.model_dir, exist_ok=True)
+        
         self.phase_sequence = ["baseline", "hpo", "hero", "microtune", "export"]
         
     def detect_state(self):
@@ -184,7 +188,8 @@ class ExperimentManager:
 def build_phase_config(phase, model, max_epochs, model_dir, num_classes):
     lr, gamma, dice, opt_type = 0.0753, 1.6627, 0.6250, "AdamW"
     momentum, weight_decay = 0.9685, 0.0003
-    alpha = 0.5 # Default physics/anatomy loss balance
+    alpha = 0.5 # Default physics/anatomy (JEPA) loss balance
+    beta = 0.4  # Default Thermal Expert auxiliary loss balance
     
     if phase in ["hero", "microtune"]:
         existing_runs = sorted(glob.glob(os.path.join(model_dir, "*_*")))
@@ -200,6 +205,7 @@ def build_phase_config(phase, model, max_epochs, model_dir, num_classes):
                 momentum = p.get("sgd_momentum", momentum)
                 weight_decay = p.get("weight_decay", weight_decay)
                 alpha = p.get("alpha", alpha)
+                beta = p.get("beta", beta) # Auto-load beta if HPO optimized it
 
     criterion = FocalDiceLoss(num_classes=num_classes, ignore_index=0, gamma=gamma, dice_weight=dice)
 
@@ -219,10 +225,10 @@ def build_phase_config(phase, model, max_epochs, model_dir, num_classes):
             opt = optim.SGD(model.parameters(), lr=1e-4, weight_decay=weight_decay, momentum=0.9, nesterov=True)
         sch = optim.lr_scheduler.StepLR(opt, step_size=50, gamma=0.5)
         
-    return opt, sch, criterion, alpha
+    return opt, sch, criterion, alpha, beta
 
 # --- 5. Isolated HPO Engine (Predictive Adaptation) ---
-def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_dataset, train_loader, eval_loader, num_classes, device):
+def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_loader, eval_loader, num_classes, device):
     print("--- Initiating Optuna Hyperparameter Sweep (30 Trials) ---")
     study_db_path = os.path.join(run_dir, "optuna_study.db")
     
@@ -239,20 +245,21 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_data
         gamma = trial.suggest_float("gamma", 1.0, 4.0)
         dice = trial.suggest_float("dice_weight", 0.5, 2.0)
         
-        # 3. JEPA Predictive Params
-        alpha = trial.suggest_float("alpha", 0.1, 1.5)
-        # Dynamically inject the mask ratio into the dataset for this trial
-        mask_ratio = trial.suggest_float("mask_ratio", 0.15, 0.65)
-        train_dataset.mask_ratio = mask_ratio 
+        # 3. JEPA Predictive & Expert Params
+        alpha = trial.suggest_float("alpha", 0.1, 1.5) # Physics vs Anatomy
+        beta = trial.suggest_float("beta", 0.1, 1.0)   # Thermal Expert penalty
         
-        # Lock to AdamW for Transformer stability
+        # Dynamically inject the mask ratio directly through the loader
+        mask_ratio = trial.suggest_float("mask_ratio", 0.15, 0.65)
+        train_loader.dataset.mask_ratio = mask_ratio 
+        
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
         criterion = FocalDiceLoss(num_classes, gamma=gamma, dice_weight=dice)
         scaler = GradScaler(device.type)
         
         best_miou = 0.0
         
-        for epoch in range(30): # 30 Epoch fast-pruning limit
+        for epoch in range(30): 
             model.train()
             for batch in train_loader:
                 rgbd = batch['rgbd'].to(device)
@@ -263,10 +270,16 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_data
                 
                 optimizer.zero_grad()
                 with autocast(device_type=device.type):
-                    pred_seg, pred_therm = model(rgbd, therm_masked)
+                    # Unpack all 3 outputs from the training-mode forward pass
+                    pred_seg, pred_therm, aux_therm_seg = model(rgbd, therm_masked)
+                    
+                    # Calculate independent objectives
                     loss_seg = criterion(pred_seg, seg_mask)
                     loss_therm = masked_mse_loss(pred_therm, therm_target, block_mask)
-                    loss = loss_seg + (alpha * loss_therm)
+                    loss_aux = criterion(aux_therm_seg, seg_mask)
+                    
+                    # The Tri-Objective Gradient
+                    loss = loss_seg + (alpha * loss_therm) + (beta * loss_aux)
                     
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -281,6 +294,7 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_data
                     seg_mask = batch['seg_mask'].to(device)
                     
                     with autocast(device_type=device.type):
+                        # Eval mode only returns 2 outputs
                         logits, _ = model(rgbd, therm_masked)
                     val_miou += compute_batch_miou(logits, seg_mask, num_classes)
                     batches += 1
@@ -345,16 +359,25 @@ def main():
     parser = argparse.ArgumentParser(description="TriModal Predictive State-Machine Pipeline")
     parser.add_argument("--model", type=str, default="TriModalPredictiveNetwork")
     parser.add_argument("--params", type=str, default="{}")
+    
+    # NEW: Data routing arguments
+    parser.add_argument("--data_domain", type=str, default="MM5", help="Name of the physical domain (e.g., MM5, Structural_Defects, UVSS)")
+    parser.add_argument("--data_dir", type=str, default="dataset/MM5", help="Path to the dataset")
+    
     args = parser.parse_args()
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    BATCH_SIZE = 6 # Adjusted for heavier ViT memory footprint
+    BATCH_SIZE = 6 
 
-    train_dataset = TriModalPredictiveDataset(data_dir="dataset/MM5", split="train", mask_ratio=0.30)
-    eval_dataset = TriModalPredictiveDataset(data_dir="dataset/MM5", split="eval", mask_ratio=0.0)
+    # Route the custom data directory to the datasets
+    train_dataset = TriModalPredictiveDataset(data_dir=args.data_dir, split="train", mask_ratio=0.30)
+    eval_dataset = TriModalPredictiveDataset(data_dir=args.data_dir, split="eval", mask_ratio=0.0)
+    
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
     eval_loader = DataLoader(eval_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-    NUM_CLASSES = 14 # Defaulting to MM5 top-level classes
+    
+    # Note: If future datasets have different class counts, you may want to expose NUM_CLASSES as a CLI arg as well.
+    NUM_CLASSES = 14 
 
     try:
         ModelClass = getattr(models, args.model)
@@ -365,7 +388,9 @@ def main():
     model_kwargs.update(json.loads(args.params))
 
     model = ModelClass(**model_kwargs).to(DEVICE)
-    manager = ExperimentManager(model_instance=model)
+    
+    # Route the custom domain name to the State Machine
+    manager = ExperimentManager(model_instance=model, data_domain=args.data_domain)
     state = manager.detect_state()
     
     if state is None or state == (None, None): 
@@ -415,7 +440,7 @@ def main():
     print(f"📊 PHASE: {phase.upper()} | EPOCHS: {MAX_EPOCHS} | PATIENCE: {PATIENCE}")
     print("="*75 + "\n")
 
-    optimizer, scheduler, criterion, alpha = build_phase_config(phase, model, MAX_EPOCHS, manager.model_dir, NUM_CLASSES)
+    optimizer, scheduler, criterion, alpha, beta = build_phase_config(phase, model, MAX_EPOCHS, manager.model_dir, NUM_CLASSES)
     scaler = GradScaler(DEVICE.type)
 
     if state["is_resume"]:
@@ -447,10 +472,20 @@ def main():
             optimizer.zero_grad()
             
             with autocast(device_type=DEVICE.type):
-                pred_seg, pred_therm = model(rgbd, therm_masked)
+                # Unpack the 3 outputs
+                pred_seg, pred_therm, aux_therm_seg = model(rgbd, therm_masked)
+                
+                # Exam A: Anatomy (Primary Fusion Network)
                 loss_seg = criterion(pred_seg, seg_mask)
+                
+                # Exam B: Physics (JEPA Target Prediction)
                 loss_therm = masked_mse_loss(pred_therm, therm_target, block_mask)
-                loss = loss_seg + (alpha * loss_therm)
+                
+                # Exam C: Thermal Expert (Auxiliary Supervision)
+                loss_aux = criterion(aux_therm_seg, seg_mask)
+                
+                # The Tri-Objective Gradient Formulation
+                loss = loss_seg + (alpha * loss_therm) + (beta * loss_aux)
                 
             scaler.scale(loss).backward()
             scaler.step(optimizer)

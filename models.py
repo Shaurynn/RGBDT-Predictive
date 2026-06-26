@@ -96,7 +96,7 @@ class TriModalPredictiveNetwork(nn.Module):
             features_only=True
         )
         
-    # Add a lightweight reconstruction head to output the predicted thermal tensor
+        # Add a lightweight reconstruction head to output the predicted thermal tensor
         self.therm_decoder = nn.Sequential(
             nn.Conv2d(256, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -114,30 +114,45 @@ class TriModalPredictiveNetwork(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(256, num_classes, kernel_size=1)
         )
+        
+        # --- Modality-Specific Supervisory Head (Thermal Expert) ---
+        # This forces the thermal encoder to independently recognize rot/decay 
+        # without relying on the RGB-D visual texture.
+        self.aux_therm_classifier = nn.Sequential(
+            nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),
+            nn.Conv2d(128, num_classes, kernel_size=1)
+        )
 
-    def forward(self, x_rgbd: torch.Tensor, x_therm: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_rgbd: torch.Tensor, x_therm: torch.Tensor):
         """
         x_rgbd: [Batch, 4, H, W]
-        x_therm: [Batch, 1, H, W] (Masked during pre-training, unmasked during inference)
+        x_therm: [Batch, 1, H, W]
         """
         # 1. Independent Feature Extraction
-        # features_only=True returns a list of feature maps from each stage. 
-        # We grab the final layer [-1] for late fusion.
-        feat_rgbd = self.rgbd_encoder(x_rgbd)[-1]   # [Batch, 256, H/32, W/32]
-        feat_therm = self.therm_encoder(x_therm)[-1] # [Batch, 256, H/32, W/32]
+        feat_rgbd = self.rgbd_encoder(x_rgbd)[-1]   
+        feat_therm = self.therm_encoder(x_therm)[-1] 
         
-        # 2. Cross-Modal Fusion
+        # 2. Cross-Modal Fusion & Primary Classification
         fused_features = self.fusion_head(feat_rgbd, feat_therm)
+        logits_seg = self.classifier(fused_features)
         
-        # 3. Classification
-        # Branch 1: Predict the segmentation mask (Anatomy)
-        logits = self.classifier(fused_features)
-        
-        # Branch 2: Predict the missing thermal physics (Physics)
+        # 3. JEPA Physics Prediction
         therm_preds = self.therm_decoder(fused_features)
         
-        # Upsample both to original resolution
-        out_seg = F.interpolate(logits, size=(x_rgbd.shape[2], x_rgbd.shape[3]), mode='bilinear', align_corners=False)
+        # Upsample Primary Outputs
+        out_seg = F.interpolate(logits_seg, size=(x_rgbd.shape[2], x_rgbd.shape[3]), mode='bilinear', align_corners=False)
         out_therm = F.interpolate(therm_preds, size=(x_rgbd.shape[2], x_rgbd.shape[3]), mode='bilinear', align_corners=False)
         
+        # 4. Training-Only Expert Supervision
+        if self.training:
+            # Generate a segmentation mask using ONLY the thermal features
+            aux_logits = self.aux_therm_classifier(feat_therm)
+            out_aux_seg = F.interpolate(aux_logits, size=(x_rgbd.shape[2], x_rgbd.shape[3]), mode='bilinear', align_corners=False)
+            return out_seg, out_therm, out_aux_seg
+            
+        # During eval/deployment, the aux head is entirely ignored
         return out_seg, out_therm
+        
