@@ -32,6 +32,7 @@ def run_diagnostic(output_dir="diagnostics"):
     therm_masked = batch['therm_masked'] # [B, 1, H, W]
     therm_target = batch['therm_target'] # [B, 1, H, W]
     block_mask = batch['block_mask']     # [B, 1, H, W]
+    seg_mask = batch['seg_mask']         # [B, H, W]
     
     # Known normalization stats from dataset.py
     rgb_mean, rgb_std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
@@ -81,6 +82,7 @@ def run_diagnostic(output_dir="diagnostics"):
     plt.tight_layout()
     save_path = os.path.join(output_dir, "jepa_dataloader_sanity_check.png")
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Unique values in masks: {torch.unique(seg_mask)}")
     print(f"[SUCCESS] Diagnostic grid saved to: {save_path}")
 
 if __name__ == '__main__':
