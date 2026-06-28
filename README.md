@@ -66,19 +66,20 @@ The baseline Tri-Objective architecture (Segmentation + Physics MSE + Auxiliary 
 ### 4.2 Hyperparameter Optimization (Optuna)
 The HPO phase successfully isolated the optimal balance between the Segmentation Loss and the Latent Regularization penalty. 
 
-> **[Insert Optuna Dashboard Screenshot Here]**
+> ![Optuna Dashboard](assets/Optuna_TMPN.png)
 > *Figure 1: Optuna Parallel Coordinate Plot detailing the correlation between the latent loss weight, learning rate, and the objective Validation mIoU.*
 
 ### 4.3 Training Dynamics & Convergence
 Transitioning to the Latent JEPA architecture effectively eliminated the severe train/validation loss discrepancies observed in prior pixel-space models. 
 
-> **[Insert TensorBoard Loss/mIoU Graphs Here]**
+> ![TensorBoard Metrics](assets/Tensorboard_TMPN.png)
 > *Figure 2: TensorBoard metrics during the Hero and Microtune phases. Note the stability of the Validation mIoU curve as the microscopic learning rate schedule polishes the spatial decision boundaries.*
 
 ### 4.4 Explainability & Spatial Attention (Grad-CAM)
 To verify that the GCMA head successfully retains spatial geometry while querying global thermodynamics, Semantic Grad-CAM hooks and Epistemic Uncertainty mapping were applied directly to the evaluation pipeline.
 
-> **[Insert Grad-CAM Overlay & Epistemic Heatmap Images Here]**
+> ![Grad-CAM Overlay](assets/batch0_img1_class15_gradcam.jpg)
+> ![Epistemic Uncertainty](assets/batch0_img1_epistemic_uncertainty.png)
 > *Figure 3: Diagnostics generated during the Evaluation Pass. The Grad-CAM heatmaps demonstrate highly precise boundary delineation around structural defects. The Epistemic Uncertainty map confirms zero variance in background suppression, with hesitation strictly constrained to the extreme sub-pixel edges of the geometric structures.*
 
 ---
