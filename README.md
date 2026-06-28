@@ -78,7 +78,7 @@ Transitioning to the Latent JEPA architecture effectively eliminated the severe 
 ### 4.4 Explainability & Spatial Attention (Grad-CAM)
 To verify that the GCMA head successfully retains spatial geometry while querying global thermodynamics, Semantic Grad-CAM hooks and Epistemic Uncertainty mapping were applied directly to the evaluation pipeline.
 
-> ![Grad-CAM Overlay](assets/batch0_img1_class15_gradcam.jpg)
+> ![Grad-CAM Overlay](assets/batch0_img1_class15_gradcam.png)
 > ![Epistemic Uncertainty](assets/batch0_img1_epistemic_uncertainty.png)
 > *Figure 3: Diagnostics generated during the Evaluation Pass. The Grad-CAM heatmaps demonstrate highly precise boundary delineation around structural defects. The Epistemic Uncertainty map confirms zero variance in background suppression, with hesitation strictly constrained to the extreme sub-pixel edges of the geometric structures.*
 
