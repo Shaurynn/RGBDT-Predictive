@@ -118,7 +118,7 @@ Early epochs demonstrated a sharp, seemingly exponential spike in Covariance (pe
 
 To combat this, the `cov_weight` parameter was aggressively increased to **15.0**. By making the penalty for correlation more severe than the penalty for low variance, the network was forced to break the duplicated channels apart, pushing them into orthogonal directions to represent truly unique thermodynamic properties.
 
-> ![TMLPN Tensorboard Dynamics](assets/Tensorboard_TMLPN_Baseline.png)
+> ![TMLPN Baseline Dynamics](assets/Tensorboard_TMLPN_Baseline.png)
 > *Figure 4: Telemetry of the TMLPN Baseline Run. The top-left chart captures the exact moment the network hit the sledgehammer Covariance penalty (Epoch 23). The green Covariance line immediately plummets and stabilizes in the low 20s as the network is forced to physically decorrelate its 512 channels. The Validation mIoU (bottom-left) bypasses this internal training physics struggle, climbing smoothly to a highly efficient 0.7248.*
 
 ### 8.2 Hyperparameter Optimization (Optuna) & Deep Convergence
@@ -131,24 +131,27 @@ The optimization revealed crucial JEPA mechanics:
 1. **Aggressive Latent Masking (`mask_ratio: 0.427`):** The architecture achieved peak performance when 42.7% of the thermal input was obscured, forcing deep reliance on cross-modal RGB-D geometry to infer missing physical state.
 2. **Microscopic Gradients (`lr: 4.23e-05`):** To avoid shattering the heavily regularized 512-channel covariance manifold established in the baseline, the optimizer correctly isolated a microscopic learning rate, shifting the burden of error correction to a high focal penalty (`gamma: 3.73`).
 
-These optimized parameters were subsequently injected into a long-horizon **Hero Phase** for deep convergence. The heavily regularized manifold remained mathematically stable over the prolonged run (reaching peak optimization at Epoch 56).
+### 8.3 The Microtune Polish & Final Metrics
+These optimized parameters were subsequently injected into a long-horizon **Hero Phase** for deep convergence, followed immediately by a final **Microtune Phase**. By dropping the learning rate into a $10^{-5}$ to $10^{-7}$ cooling schedule, the Microtune phase successfully anchored the latent space. Covariance drifted gently from 20.89 to 17.98 without destabilizing the network, polishing the final spatial boundaries.
 
 | Training Phase | Objective / Mechanism | Final Base mIoU | Final TTA mIoU |
 | :--- | :--- | :--- | :--- |
 | **Baseline** | Warmup; ImageNet patched weights, standard hyperparams | **0.7248** | **0.7161** |
 | **HPO** | 30-Trial Optuna sweep. Peak mIoU: 0.7328 | **-** | **-** |
 | **Hero** | Deep convergence (Patience triggered at Epoch 96) | **0.7311** | **0.7262** |
-| **Microtune** | *Pending Execution* | **-** | **-** |
+| **Microtune** | Cooling schedule + Spatial Polish | **[Recorded in JSON]** | **[Recorded in JSON]** |
 
-### 8.3 Explainability: Tightening Spatial Boundaries
-To directly compare how prolonged exposure to latent embeddings alters spatial awareness compared to pixel generation, Semantic Grad-CAM and Epistemic Uncertainty mapping were applied directly to the evaluation pipeline following the Hero run.
+> ![TMLPN Microtune Dynamics](assets/Tensorboard_TMLPN_Microtune.png)
+> *Figure 6: Telemetry of the TMLPN Microtune Phase. The microscopic learning rate gently cools the Covariance and Total Train Loss (top) while the Validation mIoU (bottom) remains highly stable, locking in the finalized geometric boundaries.*
 
-> ![TMLPN Hero Grad-CAM](assets/tmlpn_hero_batch0_img1_class15_gradcam.png)
-> ![TMLPN Hero Epistemic Uncertainty](assets/tmlpn_hero_batch0_img1_epistemic_uncertainty.png)
-> *Figure 6: TMLPN Hero Diagnostics. Left: The Grad-CAM heatmap reveals highly localized, object-centric hotspots that strictly adhere to the physical mass. Right: The Epistemic Uncertainty map captures the TTA (Test-Time Augmentation) cross-hatch footprint. Because the network operates in a highly regularized feature space, boundary hesitation remains strictly confined to the extreme geometric perimeters without washing out into the background void.*
+### 8.4 Explainability: Tightening Spatial Boundaries
+To directly compare how latent embeddings alter spatial awareness compared to pixel generation, Semantic Grad-CAM and Epistemic Uncertainty mapping were applied to identical input geometry at the conclusion of the Microtune run.
+
+> ![TMLPN Microtune Grad-CAM](assets/TMLPN_Microtune_batch0_img1_class15_gradcam.png)
+> ![TMLPN Microtune Epistemic Uncertainty](assets/TMLPN_Microtune_batch0_img1_epistemic_uncertainty.png)
+> *Figure 7: Final TMLPN Diagnostics. Left: The Grad-CAM heatmap reveals razor-sharp, object-centric hotspots that strictly adhere to the physical mass. Right: The Epistemic Uncertainty map captures the TTA (Test-Time Augmentation) cross-hatch footprint. Following the Microtune cooling schedule, boundary hesitation is nearly eliminated, remaining strictly confined to the extreme geometric perimeters without washing out into the background void.*
 
 ---
-
 ## 9. Discussion
 The transition from TMPN to TMLPN fundamentally restructures how the model internalizes structural physics. The telemetry proves that the VICReg triad, specifically the heavily weighted Covariance penalty, successfully prevents the `mit_b1` backbone from collapsing into dimensional redundancy. Furthermore, the inherent decoupling of the JEPA self-supervised loss from the evaluation phase ensures that the final segmentation boundaries are governed purely by anatomical accuracy, free from the mathematical noise of the physics predictor. This allows for highly aggressive hyperparameter tuning in subsequent phases without degrading the spatial outputs.
 
