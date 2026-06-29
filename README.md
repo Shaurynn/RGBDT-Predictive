@@ -144,7 +144,29 @@ These optimized parameters were subsequently injected into a long-horizon **Hero
 > ![TMLPN Microtune Dynamics](assets/Tensorboard_TMLPN_Microtune.png)
 > *Figure 6: Telemetry of the TMLPN Microtune Phase. The microscopic learning rate gently cools the Covariance and Total Train Loss (top) while the Validation mIoU (bottom) remains highly stable, locking in the finalized geometric boundaries.*
 
-### 8.4 Explainability: Tightening Spatial Boundaries
+### 8.4 Breaking the 0.75 Plateau: Dynamic Class-Weighting (DCW)
+
+During highly imbalanced structural defect detection tasks, a known pathology emerges: "easy" dominant classes (e.g., background, intact structures) rapidly converge, driving their loss to near-zero. At this stage, the sparse gradient signals from "hard" minority classes (e.g., hairline thermal fractures) are suppressed, causing the overall mIoU metric to artificially plateau around ~0.75.
+
+To overcome this dataset-agnostic imbalance without catastrophic forgetting, we instituted a **Dynamic Class-Weighting Schedule (DCW)** [7].
+
+Instead of relying on static scaling factors, the architecture actively tracks an Exponential Moving Average (EMA) of the validation IoU for each specific class. During the Hero phase, the downstream Dice penalty is exponentially scaled on the fly for classes that lag behind:
+
+$$W_c = \text{EMA}\left( W_c, e^{\tau(1 - \text{IoU}_c)} \right)$$
+
+By mathematically bounding this dynamic weight array (to prevent explosive gradients) and smoothing it via EMA, the network safely shifts focus to minority defects. Crucially, by isolating this mechanism strictly to the Hero phase, we ensure the initial VICReg manifold construction (Baseline) remains completely mathematically stable and avoids rank collapse.
+
+### 8.5 Breaking the Performance Ceiling: Knowledge Distillation (KD)
+
+While the Dynamic Class-Weighting schedule effectively resolves class imbalance, the lightweight `mit_b1` backbone (14 million parameters) ultimately reaches a representational capacity limit. Upgrading to a massive `mit_b5` backbone (82 million parameters) shatters this ceiling, but its sheer size violates the strict VRAM and latency budgets required for real-time UAV edge deployment.
+
+To bridge this gap, the pipeline includes a fully integrated **Knowledge Distillation (KD)** engine.
+1. **The Teacher-Student Paradigm:** A massive `mit_b5` Teacher model is trained to convergence on a workstation. The lightweight `mit_b1` Student model is then trained while forced to mimic the Teacher's feature activations.
+2. **Dark Knowledge Transfer:** Instead of learning strictly from hard labels (1s and 0s), the Student minimizes the Kullback-Leibler (KL) Divergence between its own predictions and the Teacher's *soft probabilities* (logits softened by a Temperature parameter, $\tau$). This "Dark Knowledge" transfers complex inter-class similarities and smooths the loss landscape.
+3. **Edge Optimization:** The Student inherits the advanced stochastic noise suppression and superior mIoU limits of the 82M-parameter Teacher, while completely retaining its original, high-speed 14M-parameter footprint for TensorRT execution.
+
+### 8.6 Explainability: Tightening Spatial Boundaries
+
 To directly compare how latent embeddings alter spatial awareness compared to pixel generation, Semantic Grad-CAM and Epistemic Uncertainty mapping were applied to identical input geometry at the conclusion of the Microtune run.
 
 > ![TMLPN Microtune Grad-CAM](assets/TMLPN_Microtune_batch0_img1_class15_gradcam.png)
@@ -152,6 +174,7 @@ To directly compare how latent embeddings alter spatial awareness compared to pi
 > *Figure 7: Final TMLPN Diagnostics. Left: The Grad-CAM heatmap reveals razor-sharp, object-centric hotspots that strictly adhere to the physical mass. Right: The Epistemic Uncertainty map captures the TTA (Test-Time Augmentation) cross-hatch footprint. Following the Microtune cooling schedule, boundary hesitation is nearly eliminated, remaining strictly confined to the extreme geometric perimeters without washing out into the background void.*
 
 ---
+
 ## 9. Discussion
 The transition from TMPN to TMLPN fundamentally restructures how the model internalizes structural physics. The telemetry proves that the VICReg triad, specifically the heavily weighted Covariance penalty, successfully prevents the `mit_b1` backbone from collapsing into dimensional redundancy. Furthermore, the inherent decoupling of the JEPA self-supervised loss from the evaluation phase ensures that the final segmentation boundaries are governed purely by anatomical accuracy, free from the mathematical noise of the physics predictor. This allows for highly aggressive hyperparameter tuning in subsequent phases without degrading the spatial outputs.
 
