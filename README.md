@@ -88,51 +88,70 @@ The final phase of the pipeline serializes the optimized graph to an ONNX artifa
 
 ## PART II: The TriModal Latent Predictive Network (TMLPN)
 
-### 1. Spatial JEPA Adaptation & Domain Traversal
-Unlike temporal JEPAs (such as LeWorldModel) that predict the physics of time and motion, TMLPN acts as a static, spatial JEPA. By freezing time, the network evaluates a visible context region to predict the latent embedding of a masked structural region. 
+## 6. Introduction to Latent Prediction
+While the generative TMPN architecture successfully aligned multimodal features, pixel-space reconstruction is inherently inefficient. The network expends massive computational capacity hallucinating high-frequency thermal "speckle" and ambient heat bleed—artifacts that are irrelevant to the actual physical structure of a defect. Part II introduces the TMLPN, shifting the paradigm from pixel generation to latent feature prediction. By operating entirely in an abstract manifold, the architecture achieves immunity to stochastic noise and accelerates domain traversal.
 
-Inspired by architectures like EchoJEPA, this transition provides three critical advantages for industrial deployment:
-1. **Immunity to Stochastic Noise:** By operating exclusively in the feature space, the latent predictor naturally filters out thermal "speckle" and ambient heat bleed, mapping only the true thermodynamic anomaly of the structural defect.
-2. **Domain Traversal via Shared Semantic Manifolds:** The architecture forces both the RGB-D and Thermal streams into a unified, mathematically abstract space. The domains no longer conflict in pixel-space; they act as cryptographic keys to unlock the same physical concept.
-3. **Sample Efficiency:** The network ceases to waste representational capacity rendering pixel textures, allowing the `mit_b1` backbone to define the structural manifold vastly faster.
+## 7. Methodology & Architecture
 
-### 2. The Latent Regularization Engine (The VICReg Triad)
-Transitioning to latent-space prediction introduces the threat of "Representation Collapse"—where the network simply outputs a constant vector to minimize the similarity loss. To physically prevent this, TMLPN replaces heavy auxiliary classifiers with a highly restrictive Variance-Covariance Regularization Loss governed by three competing constraints:
+### 7.1 Spatial JEPA Adaptation 
+Unlike autoregressive temporal JEPAs (such as LeWorldModel [4]) that predict future states based on past actions ($S_{t} \rightarrow S_{t+1}$), TMLPN acts as a static, spatial JEPA inspired by the I-JEPA framework [5]. Time is frozen; the network evaluates a visible RGB-D context region to predict the uncorrupted latent thermodynamic embedding of an artificially masked structural region. The domains no longer conflict by attempting to map visuals directly to heat; instead, they act as independent cryptographic keys unlocking the same underlying physical concept.
 
-* **Similarity Loss (The Objective):** Forces the predicted latent signature to match the true thermal latent signature extracted by the target encoder.
-* **Variance Loss (The Anti-Collapse Monitor):** Forces the standard deviation of predicted latent variables above a minimum threshold. If the embedding space begins to collapse, a massive hinge loss penalty forces the channels outward.
-* **Covariance Loss (The Decorrelator):** Penalizes off-diagonal elements in the covariance matrix to prevent "Dimensional Redundancy." It forces all 512 channels of the `mit_b1` embedding to learn unique, orthogonal pieces of structural thermodynamics.
+### 7.2 The Latent Regularization Engine (The VICReg Triad)
+Transitioning to latent-space prediction introduces the threat of "Representation Collapse," where the network outputs a constant, meaningless vector to artificially drive the prediction loss to zero. To physically prevent this without relying on computationally expensive auxiliary classifiers, TMLPN adapts the VICReg (Variance-Invariance-Covariance) framework [6]. The network must simultaneously satisfy three competing mathematical constraints:
 
-### 3. Baseline Training Dynamics & Analysis
-
-#### 3.1 The Mathematical "Tug-of-War"
-During the initial 150-epoch baseline run, tracking the decoupled Latent Triad revealed a severe mathematical pathology as the wide 512-channel architecture unspooled its ImageNet priors. Early epochs demonstrated a sharp spike in Covariance. Desperate to satisfy the massive Variance penalty, the network attempted a mathematical "cheat code"—copying a few learned features across all 512 channels and amplifying them simultaneously.
-
-To combat this, the `cov_weight` was heavily penalized (set to 15.0). 
-
-> ![TMLPN Tensorboard Dynamics](assets/Tensorboard_TMLPN_Baseline.png)
-> *Figure 1: Telemetry of the TMLPN Baseline Run. The top-left chart captures the exact moment the network hit the sledgehammer Covariance penalty (Epoch 23). The green Covariance line immediately plummets and stabilizes as the network is forced to decorrelate its 512 channels. The Validation mIoU (bottom-left) bypasses this training physics struggle entirely, climbing smoothly to a highly efficient 0.7248.*
-
-The success of this regularization is proven by the Validation metric. The unoptimized TMLPN Baseline achieved a peak **Validation mIoU of 0.7248 at Epoch 63**. This rapid spatial convergence heavily outpaces the generative TMPN model, validating the efficiency of latent physical prediction.
-
-#### 3.2 Explainability: Latent vs. Generative Attention
-To directly compare how predicting latent embeddings alters spatial awareness compared to predicting pixels, Semantic Grad-CAM hooks and Epistemic Uncertainty mapping were applied to the exact same input geometry utilized in the Part I TMPN diagnostics.
-
-> ![TMLPN Grad-CAM](assets/tmlpn_bl_batch0_img1_class15_gradcam.png)
-> ![TMLPN Epistemic Uncertainty](assets/tmlpn_bl_batch0_img1_epistemic_uncertainty.png)
-> *Figure 2: TMLPN Diagnostics. Left: The Grad-CAM heatmap reveals highly localized, object-centric hotspots. Right: The Epistemic Uncertainty map captures the TTA (Test-Time Augmentation) cross-hatch footprint. Because the network operates in a highly regularized feature space rather than hallucinating pixels, boundary hesitation remains strictly confined to the geometric perimeters without washing out into the background void.*
+* **Similarity Loss (Invariance):** The primary objective. Forces the predicted latent signature to match the true thermal latent signature extracted by the frozen target encoder.
+* **Variance Loss (Anti-Collapse):** A hinge loss that forces the standard deviation of predicted latent variables above a threshold of 1.0. This physically prevents the embedding space from collapsing into a single point.
+* **Covariance Loss (The Decorrelator):** Penalizes off-diagonal elements in the covariance matrix. This forces the 512 channels of the `mit_b1` embedding to remain orthogonal, preventing the network from learning redundant features [6].
 
 ---
 
-## 4. Edge Deployment
-The final phase of the pipeline serializes the optimized graph to an ONNX artifact (`opset_version=14`). The architecture is strictly engineered for low-latency inference. By discarding the generative decoders required in Part I, the TMLPN architecture drastically reduces VRAM footprint and is prepared for downstream FP16 quantization and TensorRT engine compilation via `trtexec` for edge hardware execution.
+## 8. Results & Analysis
+
+### 8.1 Baseline Training Dynamics 
+During the unoptimized 150-epoch baseline run, two distinct mathematical phenomena occurred that are highly characteristic of heavily regularized JEPA frameworks. These behaviors indicate successful manifold construction rather than gradient instability.
+
+#### 8.1.1 The Train/Validation Loss Discrepancy
+Telemetry indicated a Total Training Loss plateauing near **~40.0**, while Validation Loss dropped abruptly to **~0.14**. This massive divide is mathematically expected. In JEPA frameworks, latent target generation is strictly a self-supervised auxiliary task used during training to shape the feature manifold [5]. During inference (and therefore Validation), the network does not have a "target" thermal tensor to predict against. Thus, the Validation loop strictly evaluates the downstream Semantic Segmentation head, completely bypassing the massive VICReg penalties. The Validation Loss accurately reflects the Segmentation cross-entropy error, completely isolated from the turbulent manifold construction happening in the background.
+
+#### 8.1.2 The Covariance Pathology & Sledgehammer Intervention
+Early epochs demonstrated a sharp, seemingly exponential spike in Covariance (peaking at ~42.0 around Epoch 23). This is a known pathology in high-capacity architectures attempting to satisfy VICReg constraints [6]. Generating 512 unique, high-variance features from randomly initialized weights is computationally difficult. To quickly minimize the massive Variance penalty, the network falls into a "lazy" local minimum: it learns a small handful of basic features (e.g., raw edge detection) and duplicates them across all 512 channels, artificially scaling up their magnitudes. Because these duplicated channels are perfectly correlated, the off-diagonal elements of the covariance matrix explode (Dimensional Redundancy).
+
+To combat this, the `cov_weight` parameter was aggressively increased to **15.0**. By making the penalty for correlation more severe than the penalty for low variance, the network was forced to break the duplicated channels apart, pushing them into orthogonal directions to represent truly unique thermodynamic properties.
+
+> ![TMLPN Tensorboard Dynamics](assets/Tensorboard_TMLPN_Baseline.png)
+> *Figure 4: Telemetry of the TMLPN Baseline Run. The top-left chart captures the exact moment the network hit the sledgehammer Covariance penalty (Epoch 23). The green Covariance line immediately plummets and stabilizes in the low 20s as the network is forced to physically decorrelate its 512 channels. The Validation mIoU (bottom-left) bypasses this internal training physics struggle, climbing smoothly to a highly efficient 0.7248.*
+
+### 8.2 Quantitative Convergence (TMLPN)
+The success of the covariance intervention is definitively proven by the downstream validation metric. The unoptimized TMLPN Baseline achieved a peak **Validation mIoU of 0.7248 at Epoch 63**. Reaching this level of spatial accuracy within the warmup phase—heavily outpacing the generative TMPN baseline—validates the superior sample efficiency of latent physical prediction.
+
+### 8.3 Explainability: Latent vs. Generative Attention
+To directly compare how latent embeddings alter spatial awareness compared to pixel generation, Semantic Grad-CAM and Epistemic Uncertainty mapping were applied to identical input geometry.
+
+> ![TMLPN Grad-CAM](assets/tmlpn_bl_batch0_img1_class15_gradcam.png)
+> ![TMLPN Epistemic Uncertainty](assets/tmlpn_bl_batch0_img1_epistemic_uncertainty.png)
+> *Figure 5: TMLPN Diagnostics. Left: The Grad-CAM heatmap reveals highly localized, object-centric hotspots. Right: The Epistemic Uncertainty map captures the TTA (Test-Time Augmentation) cross-hatch footprint. Because the network operates in a highly regularized feature space rather than hallucinating pixels, boundary hesitation remains strictly confined to the geometric perimeters without washing out into the background void.*
+
+---
+
+## 9. Discussion
+The transition from TMPN to TMLPN fundamentally restructures how the model internalizes structural physics. The telemetry proves that the VICReg triad, specifically the heavily weighted Covariance penalty, successfully prevents the `mit_b1` backbone from collapsing into dimensional redundancy. Furthermore, the inherent decoupling of the JEPA self-supervised loss from the evaluation phase ensures that the final segmentation boundaries are governed purely by anatomical accuracy, free from the mathematical noise of the physics predictor. This allows for highly aggressive hyperparameter tuning in subsequent phases without degrading the spatial outputs.
+
+---
+
+## 10. Conclusion & Deployment
+By abandoning pixel-space generation, the TriModal Latent Predictive Network establishes a vastly more efficient methodology for multimodal defect detection. The architecture successfully isolates structural thermodynamics from stochastic sensor noise, achieving rapid spatial convergence. 
+
+For edge deployment, the optimized TMLPN graph is serialized to an ONNX artifact (`opset_version=14`). Because the generative thermal decoders utilized in Part I have been entirely excised from the architecture, the final deployment model benefits from a drastically reduced VRAM footprint. It is strictly engineered for low-latency inference on companion computers (e.g., Jetson Orin Nano) and is ready for FP16 quantization and TensorRT engine compilation via `trtexec`.
 
 ---
 
 ## References
 [1] Vaswani, A., et al. (2017). *Attention Is All You Need*. NeurIPS.  
 [2] Xie, E., et al. (2021). *SegFormer: Simple and Efficient Design for Semantic Segmentation with Transformers*. NeurIPS.  
-[3] Sudre, C. H., et al. (2017). *Generalised Dice overlap as a deep learning loss function for highly unbalanced segmentations*. DLMIA.
+[3] Sudre, C. H., et al. (2017). *Generalised Dice overlap as a deep learning loss function for highly unbalanced segmentations*. DLMIA.  
+[4] Maes, L., et al. (2024). *LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels*. arXiv preprint.  
+[5] Assran, M., et al. (2023). *Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture*. CVPR.  
+[6] Bardes, A., Ponce, J., & LeCun, Y. (2022). *VICReg: Variance-Invariance-Covariance Regularization for Self-Supervised Learning*. ICLR.
 
 ---
 
