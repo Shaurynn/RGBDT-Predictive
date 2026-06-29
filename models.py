@@ -173,12 +173,15 @@ class TriModalLatentPredictiveNetwork(nn.Module):
         logits_seg = self.classifier(fused_features)
         out_seg = F.interpolate(logits_seg, size=(x_rgbd.shape[2], x_rgbd.shape[3]), mode='bilinear', align_corners=False)
         
+        # Target Prediction Mode (Training)
+        # If the target tensor is physically provided, we predict physics.
+        if x_therm_target is not None:
+            with torch.no_grad():
+                z_target = self.therm_encoder(x_therm_target)[-1].detach()
+                
+            z_pred = self.latent_predictor(fused_features)
+            return out_seg, z_pred, z_target
+            
         # Inference / Deployment Mode 
-        if not self.training or x_therm_target is None:
-            return out_seg
-            
-        # Target Prediction Mode
-        with torch.no_grad():
-            z_target = self.therm_encoder(x_therm_target)[-1].detach()
-            
-        z_pred = self.latent_predictor(fused_features)
+        # If the target is omitted, we bypass the physics engine and return the geometry mask.
+        return out_seg
