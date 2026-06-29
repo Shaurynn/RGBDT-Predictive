@@ -151,7 +151,6 @@ class TriModalLatentPredictiveNetwork(nn.Module):
         )
         
         # The Expanded Latent World Model Engine
-        # Deepened from a single bottleneck to a 3-layer mapping to better predict physical state transitions
         self.latent_predictor = nn.Sequential(
             nn.Conv2d(512, 1024, kernel_size=1, bias=False),
             nn.BatchNorm2d(1024), nn.ReLU(inplace=True),
@@ -160,6 +159,7 @@ class TriModalLatentPredictiveNetwork(nn.Module):
             nn.Conv2d(1024, 512, kernel_size=1)
         )
 
+    # Restored correct forward pass for feature extraction and target prediction
     def forward(self, x_rgbd: torch.Tensor, x_therm_masked: torch.Tensor, x_therm_target: torch.Tensor = None):
         feat_rgbd = self.rgbd_encoder(x_rgbd)[-1]   
         feat_therm_masked = self.therm_encoder(x_therm_masked)[-1] 

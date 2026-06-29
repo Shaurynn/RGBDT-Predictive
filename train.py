@@ -66,7 +66,7 @@ def masked_mse_loss(preds, targets, mask):
     return (diff * mask).sum() / (mask.sum() + 1e-8)
 
 class LatentRegularizationLoss(nn.Module):
-    def __init__(self, sim_weight=25.0, var_weight=25.0, cov_weight=1.0):
+    def __init__(self, sim_weight=25.0, var_weight=25.0, cov_weight=15.0):
         super().__init__()
         self.sim_weight = sim_weight
         self.var_weight = var_weight
@@ -88,7 +88,12 @@ class LatentRegularizationLoss(nn.Module):
         cov_y = (y_centered.T @ y_centered) / (y.shape[0] - 1)
         
         cov_loss = (self.off_diagonal(cov_x).pow_(2).sum() / C) + (self.off_diagonal(cov_y).pow_(2).sum() / C)
-        return (self.sim_weight * sim_loss) + (self.var_weight * var_loss) + (self.cov_weight * cov_loss)
+        
+        # Calculate the aggregate weighted loss
+        total_latent_loss = (self.sim_weight * sim_loss) + (self.var_weight * var_loss) + (self.cov_weight * cov_loss)
+        
+        # Return total, and unpack the individual metrics for TensorBoard tracking
+        return total_latent_loss, sim_loss, var_loss, cov_loss
 
     def off_diagonal(self, x):
         n, m = x.shape
@@ -337,10 +342,14 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
                 with autocast(device_type=device.type):
                     if is_latent_model:
                         pred_seg, z_pred, z_target = model(rgbd, therm_masked, therm_target)
-                        loss = criterion(pred_seg, seg_mask) + (alpha * latent_criterion(z_pred, z_target))
+                        loss_seg = criterion(pred_seg, seg_mask)
+                        loss_phys, _, _, _ = latent_criterion(z_pred, z_target)
+                        loss = loss_seg + (alpha * loss_phys)
                     else:
                         pred_seg, pred_therm, aux_therm_seg = model(rgbd, therm_masked)
-                        loss = criterion(pred_seg, seg_mask) + (alpha * masked_mse_loss(pred_therm, therm_target, block_mask)) + (beta * criterion(aux_therm_seg, seg_mask))
+                        loss_seg = criterion(pred_seg, seg_mask)
+                        loss_phys = masked_mse_loss(pred_therm, therm_target, block_mask)
+                        loss = loss_seg + (alpha * loss_phys) + (beta * criterion(aux_therm_seg, seg_mask))
                         
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -468,6 +477,9 @@ def main():
         model.train()
         train_loss, train_seg_loss, train_physics_loss = 0.0, 0.0, 0.0
         
+        # New variables to track the Latent Triad
+        train_sim, train_var, train_cov = 0.0, 0.0, 0.0 
+        
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [Train]")
         for batch in loop:
             rgbd, therm_masked = batch['rgbd'].to(DEVICE), batch['therm_masked'].to(DEVICE)
@@ -479,7 +491,9 @@ def main():
                 if is_latent_model:
                     pred_seg, z_pred, z_target = model(rgbd, therm_masked, therm_target)
                     loss_seg = criterion(pred_seg, seg_mask)
-                    loss_phys = latent_criterion(z_pred, z_target)
+                    
+                    # Unpack the specific VICReg loss metrics
+                    loss_phys, sim, var, cov = latent_criterion(z_pred, z_target)
                     loss = loss_seg + (alpha * loss_phys)
                 else:
                     pred_seg, pred_therm, aux_therm_seg = model(rgbd, therm_masked)
@@ -494,6 +508,13 @@ def main():
             train_loss += loss.item()
             train_seg_loss += loss_seg.item()
             train_physics_loss += loss_phys.item()
+            
+            # Accumulate Latent Triad
+            if is_latent_model:
+                train_sim += sim.item()
+                train_var += var.item()
+                train_cov += cov.item()
+                
             loop.set_postfix(loss=loss.item())
             
         scheduler.step()
@@ -522,6 +543,15 @@ def main():
         
         writer.add_scalars("Loss/Total", {'Train': train_loss / len(train_loader), 'Validation': avg_val_loss}, epoch + 1)
         writer.add_scalar("Metrics/Validation_mIoU", avg_val_miou, epoch + 1)
+        
+        # Output the dissected latent metrics to TensorBoard
+        if is_latent_model:
+            writer.add_scalars("Loss/Latent_Components", {
+                'Similarity': train_sim / len(train_loader),
+                'Variance': train_var / len(train_loader),
+                'Covariance': train_cov / len(train_loader)
+            }, epoch + 1)
+            
         writer.flush() 
         
         print(f"Epoch {epoch+1} | Seg: {train_seg_loss/len(train_loader):.4f} | Physics: {train_physics_loss/len(train_loader):.4f} | Val mIoU: {avg_val_miou:.4f}")
