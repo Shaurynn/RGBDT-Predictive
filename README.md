@@ -121,25 +121,31 @@ To combat this, the `cov_weight` parameter was aggressively increased to **15.0*
 > ![TMLPN Tensorboard Dynamics](assets/Tensorboard_TMLPN_Baseline.png)
 > *Figure 4: Telemetry of the TMLPN Baseline Run. The top-left chart captures the exact moment the network hit the sledgehammer Covariance penalty (Epoch 23). The green Covariance line immediately plummets and stabilizes in the low 20s as the network is forced to physically decorrelate its 512 channels. The Validation mIoU (bottom-left) bypasses this internal training physics struggle, climbing smoothly to a highly efficient 0.7248.*
 
-### 8.1.3 Quantitative Convergence (TMLPN)
-The success of the covariance intervention is definitively proven by the downstream validation metric. The unoptimized TMLPN Baseline achieved a peak **Validation mIoU of 0.7248 at Epoch 63**. Reaching this level of spatial accuracy within the warmup phase—heavily outpacing the generative TMPN baseline—validates the superior sample efficiency of latent physical prediction.
-
-### 8.1.4 Explainability: Latent vs. Generative Attention
-To directly compare how latent embeddings alter spatial awareness compared to pixel generation, Semantic Grad-CAM and Epistemic Uncertainty mapping were applied to identical input geometry.
-
-> ![TMLPN Grad-CAM](assets/tmlpn_bl_batch0_img1_class15_gradcam.png)
-> ![TMLPN Epistemic Uncertainty](assets/tmlpn_bl_batch0_img1_epistemic_uncertainty.png)
-> *Figure 5: TMLPN Diagnostics. Left: The Grad-CAM heatmap reveals highly localized, object-centric hotspots. Right: The Epistemic Uncertainty map captures the TTA (Test-Time Augmentation) cross-hatch footprint. Because the network operates in a highly regularized feature space rather than hallucinating pixels, boundary hesitation remains strictly confined to the geometric perimeters without washing out into the background void.*
-
-### 8.2 Hyperparameter Optimization (Optuna)
+### 8.2 Hyperparameter Optimization (Optuna) & Deep Convergence
 Following the establishment of the baseline manifold, a 30-trial Bayesian sweep was executed via Optuna to balance the latent physics penalty ($\alpha$) and standard learning parameters. 
 
 > ![TMLPN Optuna Dashboard](assets/Optuna_TMLPN.png)
-> *Figure 6: Optuna Parallel Coordinate and History Plot. The objective seamlessly converged on a peak Validation mIoU of **0.7328**.*
+> *Figure 5: Optuna Parallel Coordinate and History Plot. The objective seamlessly converged on a peak Validation mIoU of **0.7328**.*
 
 The optimization revealed crucial JEPA mechanics:
 1. **Aggressive Latent Masking (`mask_ratio: 0.427`):** The architecture achieved peak performance when 42.7% of the thermal input was obscured, forcing deep reliance on cross-modal RGB-D geometry to infer missing physical state.
 2. **Microscopic Gradients (`lr: 4.23e-05`):** To avoid shattering the heavily regularized 512-channel covariance manifold established in the baseline, the optimizer correctly isolated a microscopic learning rate, shifting the burden of error correction to a high focal penalty (`gamma: 3.73`).
+
+These optimized parameters were subsequently injected into a long-horizon **Hero Phase** for deep convergence. The heavily regularized manifold remained mathematically stable over the prolonged run (reaching peak optimization at Epoch 56).
+
+| Training Phase | Objective / Mechanism | Final Base mIoU | Final TTA mIoU |
+| :--- | :--- | :--- | :--- |
+| **Baseline** | Warmup; ImageNet patched weights, standard hyperparams | **0.7248** | **0.7161** |
+| **HPO** | 30-Trial Optuna sweep. Peak mIoU: 0.7328 | **-** | **-** |
+| **Hero** | Deep convergence (Patience triggered at Epoch 96) | **0.7311** | **0.7262** |
+| **Microtune** | *Pending Execution* | **-** | **-** |
+
+### 8.3 Explainability: Tightening Spatial Boundaries
+To directly compare how prolonged exposure to latent embeddings alters spatial awareness compared to pixel generation, Semantic Grad-CAM and Epistemic Uncertainty mapping were applied directly to the evaluation pipeline following the Hero run.
+
+> ![TMLPN Hero Grad-CAM](assets/tmlpn_hero_batch0_img1_class15_gradcam.png)
+> ![TMLPN Hero Epistemic Uncertainty](assets/tmlpn_hero_batch0_img1_epistemic_uncertainty.png)
+> *Figure 6: TMLPN Hero Diagnostics. Left: The Grad-CAM heatmap reveals highly localized, object-centric hotspots that strictly adhere to the physical mass. Right: The Epistemic Uncertainty map captures the TTA (Test-Time Augmentation) cross-hatch footprint. Because the network operates in a highly regularized feature space, boundary hesitation remains strictly confined to the extreme geometric perimeters without washing out into the background void.*
 
 ---
 
