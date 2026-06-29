@@ -402,7 +402,9 @@ def export_to_onnx(model, weights_path, run_dir, device):
     with torch.no_grad():
         torch.onnx.export(
             model, (dummy_rgbd, dummy_therm), onnx_path,
-            export_params=True, opset_version=14, do_constant_folding=True,
+            export_params=True, 
+            opset_version=18, # <--- BUMPED TO 18 TO BYPASS THE BROKEN C++ DOWNGRADE
+            do_constant_folding=True,
             input_names=['input_rgbd', 'input_therm'],
             output_names=['output_mask'],
             dynamic_axes={'input_rgbd': {0: 'batch_size'}, 'input_therm': {0: 'batch_size'}, 'output_mask': {0: 'batch_size'}}
