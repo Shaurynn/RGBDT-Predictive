@@ -92,13 +92,22 @@ class LatentRegularizationLoss(nn.Module):
         # Calculate the aggregate weighted loss
         total_latent_loss = (self.sim_weight * sim_loss) + (self.var_weight * var_loss) + (self.cov_weight * cov_loss)
         
-        # Return total, and unpack the individual metrics for TensorBoard tracking
         return total_latent_loss, sim_loss, var_loss, cov_loss
 
     def off_diagonal(self, x):
         n, m = x.shape
         assert n == m
         return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
+def knowledge_distillation_loss(student_logits, teacher_logits, temperature=4.0):
+    """
+    Computes the KL Divergence between the soft probabilities of the student and teacher.
+    Extracts 'Dark Knowledge' to smooth the student's loss landscape.
+    """
+    soft_targets = F.softmax(teacher_logits / temperature, dim=1)
+    student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
+    kd_loss = F.kl_div(student_log_probs, soft_targets, reduction='batchmean') * (temperature ** 2)
+    return kd_loss
 
 # ====================================================================================
 # --- 2. ADVANCED ROBUSTNESS EVALUATION SUITE ---
@@ -413,6 +422,13 @@ def main():
     parser.add_argument("--data_domain", type=str, default="MM5")
     parser.add_argument("--data_dir", type=str, default="dataset/MM5")
     parser.add_argument("--disable_tta", action="store_true", help="Skip TTA computation in diagnostics")
+    
+    # KNOWLEDGE DISTILLATION ARGUMENTS
+    parser.add_argument("--teacher_backbone", type=str, default=None, help="Backbone of the teacher model (e.g., mit_b5)")
+    parser.add_argument("--teacher_weights", type=str, default=None, help="Path to teacher weights for Knowledge Distillation")
+    parser.add_argument("--kd_temp", type=float, default=4.0, help="Temperature for Softmax in KD")
+    parser.add_argument("--kd_alpha", type=float, default=0.5, help="Weight for the Distillation Loss")
+    
     args = parser.parse_args()
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -431,6 +447,19 @@ def main():
     model = ModelClass(**model_kwargs).to(DEVICE)
     
     is_latent_model = (args.model == "TriModalLatentPredictiveNetwork")
+    
+    # --------------------------------------------------------------------------------
+    # KNOWLEDGE DISTILLATION TEACHER INSTANTIATION
+    # --------------------------------------------------------------------------------
+    teacher_model = None
+    if args.teacher_weights and os.path.exists(args.teacher_weights):
+        print(f"\n[INFO] Loading Teacher Model ({args.teacher_backbone}) for Knowledge Distillation...")
+        teacher_kwargs = {"num_classes": NUM_CLASSES, "backbone_name": args.teacher_backbone}
+        teacher_model = ModelClass(**teacher_kwargs).to(DEVICE)
+        teacher_model.load_state_dict(torch.load(args.teacher_weights, map_location=DEVICE))
+        teacher_model.eval()
+        for param in teacher_model.parameters():
+            param.requires_grad = False
     
     # --------------------------------------------------------------------------------
     # KERAS-STYLE TOPOLOGY REPORT
@@ -477,7 +506,7 @@ def main():
 
     for epoch in range(state["start_epoch"], MAX_EPOCHS):
         model.train()
-        train_loss, train_seg_loss, train_physics_loss = 0.0, 0.0, 0.0
+        train_loss, train_seg_loss, train_physics_loss, train_kd_loss = 0.0, 0.0, 0.0, 0.0
         
         # New variables to track the Latent Triad
         train_sim, train_var, train_cov = 0.0, 0.0, 0.0 
@@ -503,6 +532,19 @@ def main():
                     loss_phys = masked_mse_loss(pred_therm, therm_target, block_mask)
                     loss = loss_seg + (alpha * loss_phys) + (beta * criterion(aux_therm_seg, seg_mask))
                 
+                # --- KNOWLEDGE DISTILLATION PASS ---
+                if teacher_model is not None:
+                    with torch.no_grad():
+                        if is_latent_model:
+                            teacher_seg = teacher_model(rgbd, therm_masked)
+                        else:
+                            teacher_seg, _ = teacher_model(rgbd, therm_masked)
+                    
+                    # Calculate Distillation Error & Blend Total Loss
+                    loss_kd = knowledge_distillation_loss(pred_seg, teacher_seg, temperature=args.kd_temp)
+                    loss = (1 - args.kd_alpha) * loss + (args.kd_alpha * loss_kd)
+                    train_kd_loss += loss_kd.item()
+                    
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -546,6 +588,9 @@ def main():
         writer.add_scalars("Loss/Total", {'Train': train_loss / len(train_loader), 'Validation': avg_val_loss}, epoch + 1)
         writer.add_scalar("Metrics/Validation_mIoU", avg_val_miou, epoch + 1)
         
+        if teacher_model is not None:
+            writer.add_scalar("Loss/Distillation", train_kd_loss / len(train_loader), epoch + 1)
+        
         # Output the dissected latent metrics to TensorBoard
         if is_latent_model:
             writer.add_scalars("Loss/Latent_Components", {
@@ -556,7 +601,10 @@ def main():
             
         writer.flush() 
         
-        print(f"Epoch {epoch+1} | Seg: {train_seg_loss/len(train_loader):.4f} | Physics: {train_physics_loss/len(train_loader):.4f} | Val mIoU: {avg_val_miou:.4f}")
+        if teacher_model is not None:
+            print(f"Epoch {epoch+1} | Seg: {train_seg_loss/len(train_loader):.4f} | Phys: {train_physics_loss/len(train_loader):.4f} | KD: {train_kd_loss/len(train_loader):.4f} | Val mIoU: {avg_val_miou:.4f}")
+        else:
+            print(f"Epoch {epoch+1} | Seg: {train_seg_loss/len(train_loader):.4f} | Physics: {train_physics_loss/len(train_loader):.4f} | Val mIoU: {avg_val_miou:.4f}")
 
         state["start_epoch"] = epoch + 1
         torch.save({'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'scheduler_state': scheduler.state_dict(), 'scaler_state': scaler.state_dict()}, os.path.join(run_dir, "latest_checkpoint.pt"))
