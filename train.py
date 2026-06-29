@@ -214,10 +214,11 @@ class SemanticGradCAM:
 # ====================================================================================
 
 class ExperimentManager:
-    def __init__(self, model_instance, data_domain="MM5", base_dir="results"):
+    def __init__(self, model_instance, backbone="mit_b1", data_domain="MM5", base_dir="results"):
         self.model_name = model_instance.__class__.__name__
         self.data_domain = data_domain
-        self.model_dir = os.path.join(base_dir, self.model_name, self.data_domain)
+        self.backbone = backbone
+        self.model_dir = os.path.join(base_dir, self.model_name, self.backbone, self.data_domain)
         os.makedirs(self.model_dir, exist_ok=True)
         self.phase_sequence = ["baseline", "hpo", "hero", "microtune", "export"]
         
@@ -407,6 +408,7 @@ def export_to_onnx(model, weights_path, run_dir, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="TriModalPredictiveNetwork")
+    parser.add_argument("--backbone", type=str, default="mit_b1", help="Vision Transformer backbone (e.g., mit_b1, mit_b2, mit_b5)")
     parser.add_argument("--params", type=str, default="{}")
     parser.add_argument("--data_domain", type=str, default="MM5")
     parser.add_argument("--data_dir", type=str, default="dataset/MM5")
@@ -424,7 +426,7 @@ def main():
     NUM_CLASSES = train_dataset.num_classes
 
     ModelClass = getattr(models, args.model)
-    model_kwargs = {"num_classes": NUM_CLASSES}
+    model_kwargs = {"num_classes": NUM_CLASSES, "backbone_name": args.backbone}
     model_kwargs.update(json.loads(args.params))
     model = ModelClass(**model_kwargs).to(DEVICE)
     
@@ -439,7 +441,7 @@ def main():
     summary(model, input_size=[(BATCH_SIZE, 4, 480, 640), (BATCH_SIZE, 1, 480, 640)], col_names=["input_size", "output_size", "num_params", "mult_adds"], depth=4)
     print("="*75)
     
-    manager = ExperimentManager(model_instance=model, data_domain=args.data_domain)
+    manager = ExperimentManager(model_instance=model, backbone=args.backbone, data_domain=args.data_domain)
     state = manager.detect_state()
     if state is None: return 
         

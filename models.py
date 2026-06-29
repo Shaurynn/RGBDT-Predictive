@@ -62,11 +62,11 @@ class GlobalContextModalityAttention(nn.Module):
 # ====================================================================================
 
 class TriModalPredictiveNetwork(nn.Module):
-    def __init__(self, num_classes: int): 
+    def __init__(self, num_classes: int, backbone_name: str = "mit_b1"): 
         super().__init__()
         
-        # 1. ImageNet Stem Patch for 4-Channels (Upgraded to mit_b1)
-        self.rgbd_encoder = smp.encoders.get_encoder("mit_b1", in_channels=3, depth=5, weights="imagenet")
+        # 1. ImageNet Stem Patch for 4-Channels
+        self.rgbd_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, depth=5, weights="imagenet")
         first_conv = self.rgbd_encoder.patch_embed1.proj
         
         new_conv = nn.Conv2d(4, first_conv.out_channels, kernel_size=first_conv.kernel_size, stride=first_conv.stride, padding=first_conv.padding, bias=(first_conv.bias is not None))
@@ -76,25 +76,28 @@ class TriModalPredictiveNetwork(nn.Module):
             if first_conv.bias is not None: new_conv.bias = first_conv.bias
         self.rgbd_encoder.patch_embed1.proj = new_conv
         
-        # Thermal Encoder (Upgraded to mit_b1)
-        self.therm_encoder = smp.encoders.get_encoder("mit_b1", in_channels=1, depth=5, weights=None)
+        # Thermal Encoder
+        self.therm_encoder = smp.encoders.get_encoder(backbone_name, in_channels=1, depth=5, weights=None)
         
-        # GCMA Fusion Head (Scaled for 512 channels, increased to 8 attention heads)
-        self.fusion_head = GlobalContextModalityAttention(embed_dim=512, num_heads=8)
+        # Dynamically acquire the output dimension of the selected backbone
+        embed_dim = self.rgbd_encoder.out_channels[-1]
         
-        # Classifiers updated to accept 512-channel embeddings
+        # GCMA Fusion Head
+        self.fusion_head = GlobalContextModalityAttention(embed_dim=embed_dim, num_heads=8)
+        
+        # Classifiers dynamically scaled to match backbone embedding
         self.classifier = nn.Sequential(
-            nn.Conv2d(512, 256, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(embed_dim, 256, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(256), nn.ReLU(inplace=True),
             nn.Conv2d(256, num_classes, kernel_size=1)
         )
         self.therm_decoder = nn.Sequential(
-            nn.Conv2d(512, 128, kernel_size=3, padding=1),
+            nn.Conv2d(embed_dim, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True), 
             nn.Conv2d(128, 1, kernel_size=1) 
         )
         self.aux_therm_classifier = nn.Sequential(
-            nn.Conv2d(512, 128, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(embed_dim, 128, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True), nn.Dropout2d(0.1),
             nn.Conv2d(128, num_classes, kernel_size=1)
         )
@@ -123,11 +126,11 @@ class TriModalPredictiveNetwork(nn.Module):
 # ====================================================================================
 
 class TriModalLatentPredictiveNetwork(nn.Module):
-    def __init__(self, num_classes: int): 
+    def __init__(self, num_classes: int, backbone_name: str = "mit_b1"): 
         super().__init__()
         
-        # 1. ImageNet Stem Patch for 4-Channels (Upgraded to mit_b1)
-        self.rgbd_encoder = smp.encoders.get_encoder("mit_b1", in_channels=3, depth=5, weights="imagenet")
+        # 1. ImageNet Stem Patch for 4-Channels
+        self.rgbd_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, depth=5, weights="imagenet")
         first_conv = self.rgbd_encoder.patch_embed1.proj
         
         new_conv = nn.Conv2d(4, first_conv.out_channels, kernel_size=first_conv.kernel_size, stride=first_conv.stride, padding=first_conv.padding, bias=(first_conv.bias is not None))
@@ -137,29 +140,31 @@ class TriModalLatentPredictiveNetwork(nn.Module):
             if first_conv.bias is not None: new_conv.bias = first_conv.bias
         self.rgbd_encoder.patch_embed1.proj = new_conv
         
-        # Thermal Encoder (Upgraded to mit_b1)
-        self.therm_encoder = smp.encoders.get_encoder("mit_b1", in_channels=1, depth=5, weights=None)
+        # Thermal Encoder
+        self.therm_encoder = smp.encoders.get_encoder(backbone_name, in_channels=1, depth=5, weights=None)
         
-        # GCMA Fusion Head (Scaled for 512 channels, increased to 8 attention heads)
-        self.fusion_head = GlobalContextModalityAttention(embed_dim=512, num_heads=8)
+        # Dynamically acquire the output dimension of the selected backbone
+        embed_dim = self.rgbd_encoder.out_channels[-1]
+        
+        # GCMA Fusion Head
+        self.fusion_head = GlobalContextModalityAttention(embed_dim=embed_dim, num_heads=8)
         
         # Anatomy Classifier
         self.classifier = nn.Sequential(
-            nn.Conv2d(512, 256, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(embed_dim, 256, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(256), nn.ReLU(inplace=True),
             nn.Conv2d(256, num_classes, kernel_size=1)
         )
         
         # The Expanded Latent World Model Engine
         self.latent_predictor = nn.Sequential(
-            nn.Conv2d(512, 1024, kernel_size=1, bias=False),
+            nn.Conv2d(embed_dim, 1024, kernel_size=1, bias=False),
             nn.BatchNorm2d(1024), nn.ReLU(inplace=True),
             nn.Conv2d(1024, 1024, kernel_size=1, bias=False),
             nn.BatchNorm2d(1024), nn.ReLU(inplace=True),
-            nn.Conv2d(1024, 512, kernel_size=1)
+            nn.Conv2d(1024, embed_dim, kernel_size=1)
         )
 
-    # Restored correct forward pass for feature extraction and target prediction
     def forward(self, x_rgbd: torch.Tensor, x_therm_masked: torch.Tensor, x_therm_target: torch.Tensor = None):
         feat_rgbd = self.rgbd_encoder(x_rgbd)[-1]   
         feat_therm_masked = self.therm_encoder(x_therm_masked)[-1] 
@@ -177,4 +182,3 @@ class TriModalLatentPredictiveNetwork(nn.Module):
             z_target = self.therm_encoder(x_therm_target)[-1].detach()
             
         z_pred = self.latent_predictor(fused_features)
-        return out_seg, z_pred, z_target
