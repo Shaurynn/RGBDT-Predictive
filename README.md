@@ -113,7 +113,9 @@ By explicitly enforcing the VICReg constraints [6], TMLPN proves that mathematic
 ### 9.5 Mitigating Imbalance and Asymptotic Limits (DCW & KD)
 Industrial defect datasets exhibit extreme class imbalance. To overcome this without unbalancing the VICReg latent space, TMLPN utilizes a Dynamic Class-Weighting Schedule (DCW) [7]. By tracking an Exponential Moving Average (EMA) of the validation IoU for each class, the downstream Dice penalty is exponentially scaled on the fly specifically for lagging minority classes:
 
-text W_c = EMA( W_c, e^[τ * (1 - IoU_c)] ) 
+```text
+W_c = EMA( W_c, e^[τ * (1 - IoU_c)] )
+``` 
 
 While DCW resolves focal imbalance, the lightweight mit_b1 backbone (14M parameters) eventually encounters a hard capacity limit. Upgrading to an 82M-parameter mit_b5 backbone shatters this ceiling but violates real-time edge-inference memory constraints.
 
