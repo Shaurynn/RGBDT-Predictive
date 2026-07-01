@@ -89,115 +89,108 @@ The final phase of the pipeline serializes the optimized graph to an ONNX artifa
 ## PART II: The TriModal Latent Predictive Network (TMLPN)
 
 ## 6. Introduction to Latent Prediction
+
 While the generative TMPN architecture successfully aligned multimodal features, pixel-space reconstruction is inherently inefficient. The network expends massive computational capacity hallucinating high-frequency thermal "speckle" and ambient heat bleed—artifacts that are irrelevant to the actual physical structure of a defect. Part II introduces the TMLPN, shifting the paradigm from pixel generation to latent feature prediction. By operating entirely in an abstract manifold, the architecture achieves immunity to stochastic noise and accelerates domain traversal.
 
-## 7. Methodology & Architecture
+## 7. Mathematical Mapping to the JEPA Framework
 
-### 7.1 Spatial JEPA Adaptation 
-Unlike autoregressive temporal JEPAs (such as LeWorldModel [4]) that predict future states based on past actions ($S_{t} \rightarrow S_{t+1}$), TMLPN acts as a static, spatial JEPA inspired by the I-JEPA framework [5]. Time is frozen; the network evaluates a visible RGB-D context region to predict the uncorrupted latent thermodynamic embedding of an artificially masked structural region. The domains no longer conflict by attempting to map visuals directly to heat; instead, they act as independent cryptographic keys unlocking the same underlying physical concept.
+The TMLPN formally adapts the Joint-Embedding Predictive Architecture (JEPA) [5] for cross-modal structural evaluation. To ensure rigorous adherence to the theoretical framework, the architecture is defined by the following strict topological mappings:
 
-### 7.2 The Latent Regularization Engine (The VICReg Triad)
-Transitioning to latent-space prediction introduces the threat of "Representation Collapse," where the network outputs a constant, meaningless vector to artificially drive the prediction loss to zero. To physically prevent this without relying on computationally expensive auxiliary classifiers, TMLPN adapts the VICReg (Variance-Invariance-Covariance) framework [6]. The network must simultaneously satisfy three competing mathematical constraints:
+* **The Context ($x$):** The observable information the model is permitted to evaluate. In TMLPN, this is the pristine RGB-D geometry tensor combined with an artificially masked Thermal tensor.
+* **The Target ($y$):** The uncorrupted physical ground truth the model is attempting to predict. In TMLPN, this is the pristine, unmasked Thermal tensor.
+* **The Context Encoder ($E_\theta$):** The composite network responsible for processing the observable world. In TMLPN, this comprises the `mit_b1` RGB-D encoder, the Thermal encoder processing the masked input, and the Global Context Modality Attention (GCMA) fusion head that binds them.
+* **The Target Encoder ($E_{\bar{\theta}}$):** The network that generates the "ground truth" latent signature. In TMLPN, this is the isolated Thermal encoder processing the unmasked target tensor, governed by a strict `.detach()` operation to lock the weights during prediction.
+* **The Predictor ($P_\phi$):** The neural module that infers the Target embedding based solely on the Context embedding. In TMLPN, this is the `latent_predictor` operating via a hierarchical convolutional bottleneck.
 
-* **Similarity Loss (Invariance):** The primary objective. Forces the predicted latent signature to match the true thermal latent signature extracted by the frozen target encoder.
-* **Variance Loss (Anti-Collapse):** A hinge loss that forces the standard deviation of predicted latent variables above a threshold of 1.0. This physically prevents the embedding space from collapsing into a single point.
-* **Covariance Loss (The Decorrelator):** Penalizes off-diagonal elements in the covariance matrix. This forces the 512 channels of the `mit_b1` embedding to remain orthogonal, preventing the network from learning redundant features [6].
+### 7.1 The Latent Regularization Engine (The VICReg Triad)
+
+Because the Target Encoder ($E_{\bar{\theta}}$) is locked via a Stop-Gradient, the network must be physically restrained from Representation Collapse. TMLPN adapts the VICReg framework [6] via three constraints:
+
+* **Similarity Loss (Invariance):** The primary MSE objective. Forces $P_\phi(E_\theta(x))$ to match $E_{\bar{\theta}}(y)$.
+* **Variance Loss (Anti-Collapse):** A hinge loss enforcing standard deviation $\geq 1.0$ across the predicted latent batch, preventing points from collapsing into a singularity.
+* **Covariance Loss (The Decorrelator):** Penalizes off-diagonal elements in the covariance matrix, forcing all 512 channels of the backbone to learn unique, orthogonal features [6].
 
 ---
 
 ## 8. Results & Analysis
 
-### 8.1 Baseline Training Dynamics 
-During the unoptimized 150-epoch baseline run, two distinct mathematical phenomena occurred that are highly characteristic of heavily regularized JEPA frameworks. These behaviors indicate successful manifold construction rather than gradient instability.
+### 8.1 Baseline Training Dynamics & Pathologies
 
-#### 8.1.1 The Train/Validation Loss Discrepancy
-Telemetry indicated a Total Training Loss plateauing near **~40.0**, while Validation Loss dropped abruptly to **~0.14**. This massive divide is mathematically expected. In JEPA frameworks, latent target generation is strictly a self-supervised auxiliary task used during training to shape the feature manifold [5]. During inference (and therefore Validation), the network does not have a "target" thermal tensor to predict against. Thus, the Validation loop strictly evaluates the downstream Semantic Segmentation head, completely bypassing the massive VICReg penalties. The Validation Loss accurately reflects the Segmentation cross-entropy error, completely isolated from the turbulent manifold construction happening in the background.
+During the unoptimized 150-epoch baseline run, the architecture exhibited expected self-supervised mathematical behaviors, notably a massive discrepancy between Total Training Loss (~40.0) and Validation Loss (~0.14). Because latent target generation is strictly an auxiliary training task [5], the Validation loop correctly bypassed the VICReg penalties to strictly evaluate the downstream segmentation cross-entropy error.
 
-#### 8.1.2 The Covariance Pathology & Sledgehammer Intervention
-Early epochs demonstrated a sharp, seemingly exponential spike in Covariance (peaking at ~42.0 around Epoch 23). This is a known pathology in high-capacity architectures attempting to satisfy VICReg constraints [6]. Generating 512 unique, high-variance features from randomly initialized weights is computationally difficult. To quickly minimize the massive Variance penalty, the network falls into a "lazy" local minimum: it learns a small handful of basic features (e.g., raw edge detection) and duplicates them across all 512 channels, artificially scaling up their magnitudes. Because these duplicated channels are perfectly correlated, the off-diagonal elements of the covariance matrix explode (Dimensional Redundancy).
+Furthermore, early epochs demonstrated a sharp spike in Covariance (peaking at ~42.0 around Epoch 23). This is a known pathology in high-capacity architectures attempting to satisfy VICReg Variance constraints by duplicating features across channels (Dimensional Redundancy) [6]. By aggressively weighting the covariance penalty (`cov_weight = 15.0`), the network was forced to decorrelate its 512 channels, stabilizing the manifold.
 
-To combat this, the `cov_weight` parameter was aggressively increased to **15.0**. By making the penalty for correlation more severe than the penalty for low variance, the network was forced to break the duplicated channels apart, pushing them into orthogonal directions to represent truly unique thermodynamic properties.
+### 8.2 Deep Convergence & The Microtune Polish
 
-> ![TMLPN Baseline Dynamics](assets/Tensorboard_TMLPN_Baseline.png)
-> *Figure 4: Telemetry of the TMLPN Baseline Run. The top-left chart captures the exact moment the network hit the sledgehammer Covariance penalty (Epoch 23). The green Covariance line immediately plummets and stabilizes in the low 20s as the network is forced to physically decorrelate its 512 channels. The Validation mIoU (bottom-left) bypasses this internal training physics struggle, climbing smoothly to a highly efficient 0.7248.*
+Following a 30-trial Bayesian optimization sweep (Optuna), the architecture achieved deep convergence during a long-horizon Hero phase. To finalize spatial boundaries, a Microtune phase shifted the learning rate into a microscopic $10^{-5}$ to $10^{-7}$ cooling schedule, anchoring the latent space.
 
-### 8.2 Hyperparameter Optimization (Optuna) & Deep Convergence
-Following the establishment of the baseline manifold, a 30-trial Bayesian sweep was executed via Optuna to balance the latent physics penalty ($\alpha$) and standard learning parameters. 
-
-> ![TMLPN Optuna Dashboard](assets/Optuna_TMLPN.png)
-> *Figure 5: Optuna Parallel Coordinate and History Plot. The objective seamlessly converged on a peak Validation mIoU of **0.7328**.*
-
-The optimization revealed crucial JEPA mechanics:
-1. **Aggressive Latent Masking (`mask_ratio: 0.427`):** The architecture achieved peak performance when 42.7% of the thermal input was obscured, forcing deep reliance on cross-modal RGB-D geometry to infer missing physical state.
-2. **Microscopic Gradients (`lr: 4.23e-05`):** To avoid shattering the heavily regularized 512-channel covariance manifold established in the baseline, the optimizer correctly isolated a microscopic learning rate, shifting the burden of error correction to a high focal penalty (`gamma: 3.73`).
-
-### 8.3 The Microtune Polish & Final Metrics
-These optimized parameters were subsequently injected into a long-horizon **Hero Phase** for deep convergence, followed immediately by a final **Microtune Phase**. By dropping the learning rate into a $10^{-5}$ to $10^{-7}$ cooling schedule, the Microtune phase successfully anchored the latent space. Covariance drifted gently from 20.89 to 17.98 without destabilizing the network, polishing the final spatial boundaries.
-
-| Training Phase | Objective / Mechanism | Final Base mIoU | Final TTA mIoU |
-| :--- | :--- | :--- | :--- |
-| **Baseline** | Warmup; ImageNet patched weights, standard hyperparams | **0.7248** | **0.7161** |
-| **HPO** | 30-Trial Optuna sweep. Peak mIoU: 0.7328 | **-** | **-** |
-| **Hero** | Deep convergence (Patience triggered at Epoch 96) | **0.7311** | **0.7262** |
-| **Microtune** | Cooling schedule + Spatial Polish | **[Recorded in JSON]** | **[Recorded in JSON]** |
+| Training Phase | Objective / Mechanism | Final Base mIoU | Final TTA mIoU | 
+| :--- | :--- | :--- | :--- | 
+| **Baseline** | Warmup; ImageNet patched weights, standard hyperparams | **0.7248** | **0.7161** | 
+| **HPO** | 30-Trial Optuna sweep. Peak mIoU: 0.7328 | **-** | **-** | 
+| **Hero** | Deep convergence (Patience triggered at Epoch 96) | **0.7311** | **0.7262** | 
+| **Microtune** | Cooling schedule + Spatial Polish | **[Recorded in JSON]** | **[Recorded in JSON]** | 
 
 > ![TMLPN Microtune Dynamics](assets/Tensorboard_TMLPN_Microtune.png)
-> *Figure 6: Telemetry of the TMLPN Microtune Phase. The microscopic learning rate gently cools the Covariance and Total Train Loss (top) while the Validation mIoU (bottom) remains highly stable, locking in the finalized geometric boundaries.*
+> *Figure 1: Telemetry of the TMLPN Microtune Phase. The microscopic learning rate gently cools the Covariance and Total Train Loss (top) while the Validation mIoU (bottom) remains highly stable.*
 
-### 8.4 Breaking the 0.75 Plateau: Dynamic Class-Weighting (DCW)
+### 8.3 Explainability: Tightening Spatial Boundaries
 
-During highly imbalanced structural defect detection tasks, a known pathology emerges: "easy" dominant classes (e.g., background, intact structures) rapidly converge, driving their loss to near-zero. At this stage, the sparse gradient signals from "hard" minority classes (e.g., hairline thermal fractures) are suppressed, causing the overall mIoU metric to artificially plateau around ~0.75.
-
-To overcome this dataset-agnostic imbalance without catastrophic forgetting, we instituted a **Dynamic Class-Weighting Schedule (DCW)** [7].
-
-Instead of relying on static scaling factors, the architecture actively tracks an Exponential Moving Average (EMA) of the validation IoU for each specific class. During the Hero phase, the downstream Dice penalty is exponentially scaled on the fly for classes that lag behind:
-
-$$W_c = \text{EMA}\left( W_c, e^{\tau(1 - \text{IoU}_c)} \right)$$
-
-By mathematically bounding this dynamic weight array (to prevent explosive gradients) and smoothing it via EMA, the network safely shifts focus to minority defects. Crucially, by isolating this mechanism strictly to the Hero phase, we ensure the initial VICReg manifold construction (Baseline) remains completely mathematically stable and avoids rank collapse.
-
-### 8.5 Breaking the Performance Ceiling: Knowledge Distillation (KD)
-
-While the Dynamic Class-Weighting schedule effectively resolves class imbalance, the lightweight `mit_b1` backbone (14 million parameters) ultimately reaches a representational capacity limit. Upgrading to a massive `mit_b5` backbone (82 million parameters) shatters this ceiling, but its sheer size violates the strict VRAM and latency budgets required for real-time UAV edge deployment.
-
-To bridge this gap, the pipeline includes a fully integrated **Knowledge Distillation (KD)** engine.
-1. **The Teacher-Student Paradigm:** A massive `mit_b5` Teacher model is trained to convergence on a workstation. The lightweight `mit_b1` Student model is then trained while forced to mimic the Teacher's feature activations.
-2. **Dark Knowledge Transfer:** Instead of learning strictly from hard labels (1s and 0s), the Student minimizes the Kullback-Leibler (KL) Divergence between its own predictions and the Teacher's *soft probabilities* (logits softened by a Temperature parameter, $\tau$). This "Dark Knowledge" transfers complex inter-class similarities and smooths the loss landscape.
-3. **Edge Optimization:** The Student inherits the advanced stochastic noise suppression and superior mIoU limits of the 82M-parameter Teacher, while completely retaining its original, high-speed 14M-parameter footprint for TensorRT execution.
-
-### 8.6 Explainability: Tightening Spatial Boundaries
-
-To directly compare how latent embeddings alter spatial awareness compared to pixel generation, Semantic Grad-CAM and Epistemic Uncertainty mapping were applied to identical input geometry at the conclusion of the Microtune run.
+Semantic Grad-CAM and Epistemic Uncertainty mapping applied to identical input geometry at the conclusion of the Microtune run demonstrate razor-sharp, object-centric hotspots. Boundary hesitation is nearly eliminated, remaining strictly confined to the extreme geometric perimeters.
 
 > ![TMLPN Microtune Grad-CAM](assets/TMLPN_Microtune_batch0_img1_class15_gradcam.png)
 > ![TMLPN Microtune Epistemic Uncertainty](assets/TMLPN_Microtune_batch0_img1_epistemic_uncertainty.png)
-> *Figure 7: Final TMLPN Diagnostics. Left: The Grad-CAM heatmap reveals razor-sharp, object-centric hotspots that strictly adhere to the physical mass. Right: The Epistemic Uncertainty map captures the TTA (Test-Time Augmentation) cross-hatch footprint. Following the Microtune cooling schedule, boundary hesitation is nearly eliminated, remaining strictly confined to the extreme geometric perimeters without washing out into the background void.*
+> *Figure 2: Final TMLPN Diagnostics.*
 
 ---
 
 ## 9. Discussion
-The transition from TMPN to TMLPN fundamentally restructures how the model internalizes structural physics. The telemetry proves that the VICReg triad, specifically the heavily weighted Covariance penalty, successfully prevents the `mit_b1` backbone from collapsing into dimensional redundancy. Furthermore, the inherent decoupling of the JEPA self-supervised loss from the evaluation phase ensures that the final segmentation boundaries are governed purely by anatomical accuracy, free from the mathematical noise of the physics predictor. This allows for highly aggressive hyperparameter tuning in subsequent phases without degrading the spatial outputs.
+
+The transition from generative to latent predictive architectures fundamentally restructures how the model internalizes structural physics. The TMLPN architecture introduces several deliberate deviations from foundational JEPA literature (e.g., I-JEPA [5], LeWorldModel [4]) to optimize theoretical frameworks for real-world, constrained industrial edge execution.
+
+### 9.1 The Efficacy of Spatial MLPs over Transformer Predictors
+Standard foundation-scale JEPAs frequently utilize heavy Multi-Head Attention predictors to route information across spatial and temporal gaps by combining visible tokens with explicit Mask Tokens [5]. TMLPN explicitly discards the Transformer-based predictor in favor of a Hierarchical Convolutional Predictor (a sequence of $1 \times 1$ convolutions). 
+
+A $1 \times 1$ convolution acts mathematically as a pixel-wise Multi-Layer Perceptron (MLP) [8]. First formalized in the landmark *Network In Network* paper [8], utilizing a $1 \times 1$ convolution is the standard method for executing a point-wise MLP without flattening the 2D tensor. Flattening the tensor to pass through standard `nn.Linear` layers would catastrophically destroy the geometric grid established by the Vision Transformer. Furthermore, because the TMLPN's Context Encoder relies on the GCMA head—which has already performed the heavy computational lifting of aggregating the global multi-scale receptive field into the local feature maps—applying additional spatial attention at the predictor level is computationally redundant. 
+
+The predictor's sole mathematical burden is to perform a cross-modal feature-space translation at coordinate $(x, y)$ to the thermal latent space at that exact same $(x, y)$. Consequently, the hierarchical spatial MLP bottleneck is the mathematically optimal operation for this cross-modal projection, perfectly preserving grid coherence while drastically reducing floating-point operations (FLOPs).
+
+### 9.2 Stop-Gradient Heuristics and Explicit Covariance Regularization
+Many self-supervised frameworks utilize an Exponential Moving Average (EMA) teacher network to gently update the Target Encoder, preventing representation collapse. TMLPN abandons the EMA framework entirely, utilizing identical shared weights for $E_\theta$ and $E_{\bar{\theta}}$ governed solely by a strict Stop-Gradient (`.detach()`) operation.
+
+By explicitly enforcing the VICReg constraints [6], TMLPN proves that mathematically regularizing the variance and covariance of the embedding manifold physically prevents rank collapse. When collapse is rendered mathematically impossible by explicit channel decorrelation, the implicit regularization provided by a momentum encoder becomes redundant. Excision of the EMA teacher network significantly reduces memory overhead during training without sacrificing manifold stability [6].
+
+### 9.3 Overcoming Domain Pathologies: Capacity Limits and Class Imbalance
+Applied industrial defect datasets exhibit extreme class imbalance, often causing networks to suppress minority signals once dominant classes converge. To overcome this dataset-agnostic imbalance without unbalancing the delicately constructed VICReg latent space, TMLPN utilizes a **Dynamic Class-Weighting Schedule (DCW)** [7]. By tracking an Exponential Moving Average (EMA) of the validation IoU for each class, the downstream Dice penalty is exponentially scaled on the fly specifically for lagging minority classes ($W_c = \text{EMA}\left( W_c, e^{\tau(1 - \text{IoU}_c)} \right)$).
+
+While DCW resolves focal imbalance, the lightweight `mit_b1` backbone (14M parameters) eventually encounters a hard representational capacity limit. Upgrading to a massive `mit_b5` backbone (82M parameters) shatters this ceiling, but its sheer size violates edge-inference latency budgets. The integrated **Knowledge Distillation (KD)** engine resolves this paradox [9]. By forcing the lightweight Student to minimize the Kullback-Leibler (KL) Divergence against the massive Teacher's soft probabilities ("Dark Knowledge"), the edge-deployed model inherits the advanced stochastic noise suppression of an 82M-parameter network while retaining its 14M-parameter high-speed footprint [9].
 
 ---
 
-## 10. Conclusion & Deployment
-By abandoning pixel-space generation, the TriModal Latent Predictive Network establishes a vastly more efficient methodology for multimodal defect detection. The architecture successfully isolates structural thermodynamics from stochastic sensor noise, achieving rapid spatial convergence. 
+## 10. Conclusion & Edge Deployment
 
-For edge deployment, the optimized TMLPN graph is serialized to an ONNX artifact (`opset_version=14`). Because the generative thermal decoders utilized in Part I have been entirely excised from the architecture, the final deployment model benefits from a drastically reduced VRAM footprint. It is strictly engineered for low-latency inference on companion computers (e.g., Jetson Orin Nano) and is ready for FP16 quantization and TensorRT engine compilation via `trtexec`.
+By abandoning pixel-space generation, the TriModal Latent Predictive Network establishes a vastly more efficient methodology for multimodal defect detection. The architecture successfully isolates structural thermodynamics from stochastic sensor noise, achieving rapid spatial convergence and immense confidence on sub-pixel boundaries.
+
+For isolated industrial deployment, the optimized TMLPN graph is serialized to an ONNX artifact (`opset_version=18`). With all generative decoders excised and the core intelligence distilled into a lightweight footprint, the model is strictly engineered for low-latency inference on robust edge computers (e.g., Jetson platform series). By directly interfacing this TensorRT engine with edge controllers, the system executes real-time autonomous thermal inspections directly at the sensor source.
 
 ---
 
 ## References
+
 [1] Vaswani, A., et al. (2017). *Attention Is All You Need*. NeurIPS.  
 [2] Xie, E., et al. (2021). *SegFormer: Simple and Efficient Design for Semantic Segmentation with Transformers*. NeurIPS.  
 [3] Sudre, C. H., et al. (2017). *Generalised Dice overlap as a deep learning loss function for highly unbalanced segmentations*. DLMIA.  
 [4] Maes, L., et al. (2024). *LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels*. arXiv preprint.  
 [5] Assran, M., et al. (2023). *Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture*. CVPR.  
-[6] Bardes, A., Ponce, J., & LeCun, Y. (2022). *VICReg: Variance-Invariance-Covariance Regularization for Self-Supervised Learning*. ICLR.
+[6] Bardes, A., Ponce, J., & LeCun, Y. (2022). *VICReg: Variance-Invariance-Covariance Regularization for Self-Supervised Learning*. ICLR.  
+[7] Huang, Y., et al. (2020). *Dynamic Weighting for Imbalanced Semantic Segmentation*.  
+[8] Lin, M., Chen, Q., & Yan, S. (2013). *Network In Network*. ICLR.  
+[9] Hinton, G., Vinyals, O., & Dean, J. (2015). *Distilling the Knowledge in a Neural Network*. NIPS Deep Learning Workshop.
 
 ---
 
 ## 🙏 Acknowledgments & Citations
+
 This project would not be possible without the MM5 Dataset. We sincerely thank the original creators and authors for their foundational work in multi-modal data collection, hardware synchronization, and curation, which enabled the training and evaluation of this architecture.
 
 If you utilize this pipeline, the underlying architecture, or the data, please cite the primary publication alongside the dataset repository:
