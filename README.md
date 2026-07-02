@@ -96,7 +96,8 @@ Semantic Grad-CAM and Epistemic Uncertainty mapping applied to identical input g
 
 > ![TMLPN Microtune Grad-CAM](assets/TMLPN_Microtune_batch0_img1_class15_gradcam.png)
 > ![TMLPN Microtune Epistemic Uncertainty](assets/TMLPN_Microtune_batch0_img1_epistemic_uncertainty.png)
-> Figure 4: Final TMLPN Diagnostics. Left: The Grad-CAM heatmap reveals object-centric hotspots that strictly adhere to physical mass. Right: The Epistemic Uncertainty map captures the model's spatial hesitation during Test-Time Augmentation (TTA).
+> 
+>Figure 4: Final TMLPN Diagnostics. Top: The Grad-CAM heatmap reveals object-centric hotspots that strictly adhere to physical mass. Bottom: The Epistemic Uncertainty map captures the model's spatial hesitation during Test-Time Augmentation (TTA).
 
 ### 8.4 Interpreting the Uncertainty Maps: Grid Artifacts & Boundary Hesitation
 
