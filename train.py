@@ -28,14 +28,32 @@ class FocalDiceLoss(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.gamma = gamma
-        self.dice_weight = dice_weight
+        self.base_dice_weight = dice_weight
         self.ignore_index = ignore_index
+        
+        # Base CE weights
+        self.register_buffer('ce_weights', torch.ones(num_classes))
+        self.ce_weights[0] = 0.1 # Background suppression
+        
+        # Dynamic Dice weights initialized to 1.0
+        self.register_buffer('dynamic_dice_weights', torch.ones(num_classes))
+
+    def update_dynamic_weights(self, per_class_iou, momentum=0.9, tau=2.0):
+        """
+        Dynamic Class-Weighting Schedule (DCW)
+        Exponentially scales the dice penalty for minority/hard classes based on validation IoU.
+        Uses Exponential Moving Average (EMA) to prevent gradient shock and manifold collapse.
+        """
+        per_class_iou = per_class_iou.to(self.dynamic_dice_weights.device)
+        
+        target_weights = torch.exp(tau * (1.0 - per_class_iou))
+        target_weights[0] = 1.0 # Prevent background weight inflation
+        
+        self.dynamic_dice_weights = (momentum * self.dynamic_dice_weights) + ((1.0 - momentum) * target_weights)
+        self.dynamic_dice_weights = torch.clamp(self.dynamic_dice_weights, min=1.0, max=10.0)
 
     def forward(self, inputs, targets):
-        class_weights = torch.ones(self.num_classes, device=inputs.device)
-        class_weights[0] = 0.1 
-
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none', ignore_index=self.ignore_index, weight=class_weights)
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none', ignore_index=self.ignore_index, weight=self.ce_weights)
         pt = torch.exp(-ce_loss)
         focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
 
@@ -51,15 +69,16 @@ class FocalDiceLoss(nn.Module):
             
             intersection = (inputs_soft * targets_one_hot).sum(dim=0)
             denominator = inputs_soft.sum(dim=0) + targets_one_hot.sum(dim=0)
-            dice = (2.0 * intersection + 1e-5) / (denominator + 1e-5) 
+            dice_raw = (2.0 * intersection + 1e-5) / (denominator + 1e-5) 
             
             present_classes = targets_one_hot.sum(dim=0) > 0
             if present_classes.sum() > 0:
-                dice_loss = 1.0 - dice[present_classes].mean()
+                weighted_dice = (1.0 - dice_raw[present_classes]) * self.dynamic_dice_weights[present_classes]
+                dice_loss = weighted_dice.mean() / (self.dynamic_dice_weights[present_classes].mean() + 1e-8)
             else:
                 dice_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
 
-        return focal_loss + (self.dice_weight * dice_loss)
+        return focal_loss + (self.base_dice_weight * dice_loss)
 
 def masked_mse_loss(preds, targets, mask):
     diff = (preds - targets) ** 2
@@ -89,7 +108,6 @@ class LatentRegularizationLoss(nn.Module):
         
         cov_loss = (self.off_diagonal(cov_x).pow_(2).sum() / C) + (self.off_diagonal(cov_y).pow_(2).sum() / C)
         
-        # Calculate the aggregate weighted loss
         total_latent_loss = (self.sim_weight * sim_loss) + (self.var_weight * var_loss) + (self.cov_weight * cov_loss)
         
         return total_latent_loss, sim_loss, var_loss, cov_loss
@@ -100,10 +118,6 @@ class LatentRegularizationLoss(nn.Module):
         return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 def knowledge_distillation_loss(student_logits, teacher_logits, temperature=4.0):
-    """
-    Computes the KL Divergence between the soft probabilities of the student and teacher.
-    Extracts 'Dark Knowledge' to smooth the student's loss landscape.
-    """
     soft_targets = F.softmax(teacher_logits / temperature, dim=1)
     student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
     kd_loss = F.kl_div(student_log_probs, soft_targets, reduction='batchmean') * (temperature ** 2)
@@ -113,17 +127,41 @@ def knowledge_distillation_loss(student_logits, teacher_logits, temperature=4.0)
 # --- 2. ADVANCED ROBUSTNESS EVALUATION SUITE ---
 # ====================================================================================
 
-def compute_batch_miou(logits, targets, num_classes, ignore_index=255):
-    preds = torch.argmax(logits, dim=1)
-    ious = []
-    for c in range(num_classes):
-        if c == ignore_index: continue
-        pred_inds = preds == c
-        target_inds = targets == c
-        intersection = (pred_inds & target_inds).sum().item()
-        union = (pred_inds | target_inds).sum().item()
-        if union > 0: ious.append(intersection / float(union))
-    return sum(ious) / max(len(ious), 1) if ious else 0.0
+class IoUMetric:
+    def __init__(self, num_classes, device):
+        self.num_classes = num_classes
+        self.device = device
+        self.intersections = torch.zeros(num_classes, device=device)
+        self.unions = torch.zeros(num_classes, device=device)
+        
+    def update(self, logits, targets, ignore_index=255):
+        preds = torch.argmax(logits, dim=1)
+        valid_mask = targets != ignore_index
+        preds = preds[valid_mask]
+        targets = targets[valid_mask]
+        
+        if targets.numel() == 0:
+            return
+            
+        bins = targets * self.num_classes + preds
+        bincount = torch.bincount(bins, minlength=self.num_classes**2)
+        conf_matrix = bincount.reshape(self.num_classes, self.num_classes)
+        
+        intersection = torch.diag(conf_matrix)
+        union = conf_matrix.sum(dim=1) + conf_matrix.sum(dim=0) - intersection
+        
+        self.intersections += intersection
+        self.unions += union
+        
+    def get_per_class_iou(self):
+        ious = self.intersections / torch.clamp(self.unions, min=1.0)
+        ious[self.unions == 0] = 1.0 
+        return ious
+        
+    def get_miou(self):
+        valid_classes = self.unions > 0
+        if valid_classes.sum() == 0: return 0.0
+        return self.get_per_class_iou()[valid_classes].mean().item()
 
 def compute_ece(logits, targets, num_bins=10, ignore_index=255):
     preds = torch.argmax(logits, dim=1)
@@ -366,17 +404,18 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
                 scaler.update()
             
             model.eval()
-            val_miou, batches = 0.0, 0
+            val_iou_tracker = IoUMetric(num_classes, device)
+            batches = 0
             with torch.no_grad():
                 for batch in eval_loader:
                     rgbd, therm_masked, seg_mask = batch['rgbd'].to(device), batch['therm_masked'].to(device), batch['seg_mask'].to(device)
                     with autocast(device_type=device.type):
                         outputs = model(rgbd, therm_masked)
                         logits = outputs if not isinstance(outputs, tuple) else outputs[0]
-                    val_miou += compute_batch_miou(logits, seg_mask, num_classes)
+                    val_iou_tracker.update(logits, seg_mask)
                     batches += 1
             
-            score = val_miou / batches
+            score = val_iou_tracker.get_miou()
             if score > best_miou: best_miou = score
             trial.report(score, epoch)
             if trial.should_prune(): raise optuna.exceptions.TrialPruned()
@@ -402,9 +441,7 @@ def export_to_onnx(model, weights_path, run_dir, device):
     with torch.no_grad():
         torch.onnx.export(
             model, (dummy_rgbd, dummy_therm), onnx_path,
-            export_params=True, 
-            opset_version=18, # <--- BUMPED TO 18 TO BYPASS THE BROKEN C++ DOWNGRADE
-            do_constant_folding=True,
+            export_params=True, opset_version=18, do_constant_folding=True,
             input_names=['input_rgbd', 'input_therm'],
             output_names=['output_mask'],
             dynamic_axes={'input_rgbd': {0: 'batch_size'}, 'input_therm': {0: 'batch_size'}, 'output_mask': {0: 'batch_size'}}
@@ -510,7 +547,6 @@ def main():
         model.train()
         train_loss, train_seg_loss, train_physics_loss, train_kd_loss = 0.0, 0.0, 0.0, 0.0
         
-        # New variables to track the Latent Triad
         train_sim, train_var, train_cov = 0.0, 0.0, 0.0 
         
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [Train]")
@@ -520,12 +556,10 @@ def main():
             
             optimizer.zero_grad()
             with autocast(device_type=DEVICE.type):
-                # --- DYNAMIC FORWARD PASS (UNIVERSAL RUNNER) ---
                 if is_latent_model:
                     pred_seg, z_pred, z_target = model(rgbd, therm_masked, therm_target)
                     loss_seg = criterion(pred_seg, seg_mask)
                     
-                    # Unpack the specific VICReg loss metrics
                     loss_phys, sim, var, cov = latent_criterion(z_pred, z_target)
                     loss = loss_seg + (alpha * loss_phys)
                 else:
@@ -534,7 +568,6 @@ def main():
                     loss_phys = masked_mse_loss(pred_therm, therm_target, block_mask)
                     loss = loss_seg + (alpha * loss_phys) + (beta * criterion(aux_therm_seg, seg_mask))
                 
-                # --- KNOWLEDGE DISTILLATION PASS ---
                 if teacher_model is not None:
                     with torch.no_grad():
                         if is_latent_model:
@@ -542,7 +575,6 @@ def main():
                         else:
                             teacher_seg, _ = teacher_model(rgbd, therm_masked)
                     
-                    # Calculate Distillation Error & Blend Total Loss
                     loss_kd = knowledge_distillation_loss(pred_seg, teacher_seg, temperature=args.kd_temp)
                     loss = (1 - args.kd_alpha) * loss + (args.kd_alpha * loss_kd)
                     train_kd_loss += loss_kd.item()
@@ -555,7 +587,6 @@ def main():
             train_seg_loss += loss_seg.item()
             train_physics_loss += loss_phys.item()
             
-            # Accumulate Latent Triad
             if is_latent_model:
                 train_sim += sim.item()
                 train_var += var.item()
@@ -566,7 +597,8 @@ def main():
         scheduler.step()
         
         model.eval()
-        val_loss, val_miou_accum, batches = 0.0, 0.0, 0
+        val_loss, batches = 0.0, 0
+        val_iou_tracker = IoUMetric(NUM_CLASSES, DEVICE)
         with torch.no_grad():
             for batch in eval_loader:
                 rgbd, therm_masked = batch['rgbd'].to(DEVICE), batch['therm_masked'].to(DEVICE)
@@ -581,11 +613,14 @@ def main():
                         loss = criterion(pred_seg, seg_mask) + (alpha * masked_mse_loss(pred_therm, therm_target, block_mask))
                     
                 val_loss += loss.item()
-                val_miou_accum += compute_batch_miou(pred_seg, seg_mask, NUM_CLASSES, ignore_index=255)
+                val_iou_tracker.update(pred_seg, seg_mask)
                 batches += 1
                 
         avg_val_loss = val_loss / batches
-        avg_val_miou = val_miou_accum / batches
+        avg_val_miou = val_iou_tracker.get_miou()
+        
+        if phase == "hero":
+            criterion.update_dynamic_weights(val_iou_tracker.get_per_class_iou())
         
         writer.add_scalars("Loss/Total", {'Train': train_loss / len(train_loader), 'Validation': avg_val_loss}, epoch + 1)
         writer.add_scalar("Metrics/Validation_mIoU", avg_val_miou, epoch + 1)
@@ -593,7 +628,6 @@ def main():
         if teacher_model is not None:
             writer.add_scalar("Loss/Distillation", train_kd_loss / len(train_loader), epoch + 1)
         
-        # Output the dissected latent metrics to TensorBoard
         if is_latent_model:
             writer.add_scalars("Loss/Latent_Components", {
                 'Similarity': train_sim / len(train_loader),
@@ -637,8 +671,8 @@ def main():
     grad_cam = SemanticGradCAM(model, target_layer=model.fusion_head)
     
     metrics = {
-        'base': {'miou': 0, 'ece': 0, 'bound': 0, 'ood': 0},
-        'tta': {'miou': 0, 'ece': 0, 'bound': 0, 'ood': 0}
+        'base': {'miou': IoUMetric(NUM_CLASSES, DEVICE), 'ece': 0, 'bound': 0, 'ood': IoUMetric(NUM_CLASSES, DEVICE)},
+        'tta': {'miou': IoUMetric(NUM_CLASSES, DEVICE), 'ece': 0, 'bound': 0, 'ood': IoUMetric(NUM_CLASSES, DEVICE)}
     }
     batches = 0
     
@@ -653,21 +687,22 @@ def main():
             outputs_ood = model(apply_ood_noise(rgbd), apply_ood_noise(therm_masked))
             logits_ood_base = outputs_ood[0] if isinstance(outputs_ood, tuple) else outputs_ood
             
-            metrics['base']['miou'] += compute_batch_miou(logits_base, seg_mask, NUM_CLASSES)
+            metrics['base']['miou'].update(logits_base, seg_mask)
             metrics['base']['ece'] += compute_ece(logits_base, seg_mask)
             metrics['base']['bound'] += compute_boundary_iou(logits_base, seg_mask, NUM_CLASSES)
-            metrics['base']['ood'] += compute_batch_miou(logits_ood_base, seg_mask, NUM_CLASSES)
+            metrics['base']['ood'].update(logits_ood_base, seg_mask)
 
+        var_map = None
         # TTA Evaluation (Only runs if the flag is NOT triggered)
         if not args.disable_tta:
             with torch.no_grad(), autocast(device_type=DEVICE.type):
                 logits_tta, var_map = tta_model(rgbd, therm_masked)
                 logits_ood_tta, _ = tta_model(apply_ood_noise(rgbd), apply_ood_noise(therm_masked))
                 
-                metrics['tta']['miou'] += compute_batch_miou(logits_tta, seg_mask, NUM_CLASSES)
+                metrics['tta']['miou'].update(logits_tta, seg_mask)
                 metrics['tta']['ece'] += compute_ece(logits_tta, seg_mask)
                 metrics['tta']['bound'] += compute_boundary_iou(logits_tta, seg_mask, NUM_CLASSES)
-                metrics['tta']['ood'] += compute_batch_miou(logits_ood_tta, seg_mask, NUM_CLASSES)
+                metrics['tta']['ood'].update(logits_ood_tta, seg_mask)
             
         batches += 1
         
@@ -675,29 +710,36 @@ def main():
         if i < 5:
             predictions = torch.argmax(logits_base, dim=1)
             for b in range(rgbd.size(0)):
+                rgbd_input = rgbd[b].unsqueeze(0)
+                therm_input = therm_masked[b].unsqueeze(0)
+                
+                # Lifted RGB extraction to safely overlay Epistemic Uncertainty
+                # even if no classes trigger the Grad-CAM loop.
+                rgb_tensor = rgbd_input[0, :3, :, :].clone().cpu()
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                rgb_unnorm = torch.clamp((rgb_tensor * std) + mean, 0, 1)
+                rgb_img = cv2.cvtColor((rgb_unnorm.permute(1, 2, 0).numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+
                 for cls in torch.unique(predictions[b]):
                     if cls == 0 or cls == 255: continue
-                    rgbd_input, therm_input = rgbd[b].unsqueeze(0), therm_masked[b].unsqueeze(0)
-                    
                     heatmap = grad_cam.generate_heatmap(rgbd_input, therm_input, cls.item())
                     heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)
-                    
-                    rgb_tensor = rgbd_input[0, :3, :, :].clone().cpu()
-                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-                    rgb_unnorm = torch.clamp((rgb_tensor * std) + mean, 0, 1)
-                    rgb_img = cv2.cvtColor((rgb_unnorm.permute(1, 2, 0).numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-                    
                     overlay = cv2.addWeighted(rgb_img, 0.6, heatmap_colored, 0.4, 0)
                     cv2.imwrite(os.path.join(run_dir, "explainability", f"batch{i}_img{b}_class{cls.item()}_gradcam.png"), overlay)
                     
-                uncert_map = var_map[b].cpu().numpy()
-                uncert_norm = np.uint8(255 * (uncert_map - uncert_map.min()) / (uncert_map.max() - uncert_map.min() + 1e-8))
-                uncert_colored = cv2.applyColorMap(uncert_norm, cv2.COLORMAP_INFERNO)
-                cv2.imwrite(os.path.join(run_dir, "explainability", f"batch{i}_img{b}_epistemic_uncertainty.png"), uncert_colored)
+                if var_map is not None:
+                    uncert_map = var_map[b].cpu().numpy()
+                    uncert_norm = np.uint8(255 * (uncert_map - uncert_map.min()) / (uncert_map.max() - uncert_map.min() + 1e-8))
+                    uncert_colored = cv2.applyColorMap(uncert_norm, cv2.COLORMAP_INFERNO)
+                    uncert_overlay = cv2.addWeighted(rgb_img, 0.6, uncert_colored, 0.4, 0)
+                    cv2.imwrite(os.path.join(run_dir, "explainability", f"batch{i}_img{b}_epistemic_uncertainty.png"), uncert_overlay)
 
     for k in metrics.keys():
-        for metric in metrics[k]: metrics[k][metric] /= batches
+        metrics[k]['miou'] = metrics[k]['miou'].get_miou()
+        metrics[k]['ood'] = metrics[k]['ood'].get_miou()
+        metrics[k]['ece'] /= batches
+        metrics[k]['bound'] /= batches
 
     print("\n" + "="*75)
     print(f"📊 ARCHITECTURAL ROBUSTNESS REPORT: {phase.upper()} PHASE")
