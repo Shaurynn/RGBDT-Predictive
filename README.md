@@ -70,14 +70,14 @@ During the unoptimized 150-epoch baseline run, the architecture exhibited expect
 
 Furthermore, early epochs demonstrated a sharp spike in Covariance (peaking at ~42.0 around Epoch 23). This is a known pathology in high-capacity architectures attempting to satisfy VICReg Variance constraints by duplicating features across channels (Dimensional Redundancy) [6]. By aggressively weighting the covariance penalty (cov_weight = 15.0), the network was forced to decorrelate its 512 channels, stabilizing the manifold.
 
-> 
+> ![TMLPN Baseline Dynamics](assets/Tensorboard_TMLPN_Baseline.png)
 > Figure 1: Telemetry of the TMLPN Baseline Run. The top-left chart captures the exact moment the network hit the sledgehammer Covariance penalty (Epoch 23), successfully forcing the channels into orthogonal representations.
 
 ### 8.2 Deep Convergence & The Microtune Polish
 
 Following a 30-trial Bayesian optimization sweep (Optuna), the architecture achieved deep convergence during a long-horizon Hero phase. To finalize spatial boundaries, a Microtune phase shifted the learning rate into a microscopic 10⁻⁵ to 10⁻⁷ cooling schedule, anchoring the latent space.
 
-> 
+> ![TMLPN Optuna Dashboard](assets/Optuna_TMLPN.png)
 > Figure 2: Optuna Parallel Coordinate Plot demonstrating convergence on an aggressive masking ratio of 42.7% during the HPO phase.
 
 | Training Phase | Objective / Mechanism | Final Base mIoU | Final TTA mIoU |
@@ -87,15 +87,15 @@ Following a 30-trial Bayesian optimization sweep (Optuna), the architecture achi
 | Hero | Deep convergence (Patience triggered at Epoch 96) | 0.7311 | 0.7262 |
 | Microtune | Cooling schedule + Spatial Polish | [Recorded in JSON] | [Recorded in JSON] |
 
-> 
+> ![TMLPN Microtune Dynamics](assets/Tensorboard_TMLPN_Microtune.png)
 > Figure 3: Telemetry of the TMLPN Microtune Phase. The microscopic learning rate gently cools the Covariance and Total Train Loss (top) while the Validation mIoU (bottom) remains highly stable.
 
 ### 8.3 Explainability: Tightening Spatial Boundaries
 
 Semantic Grad-CAM and Epistemic Uncertainty mapping applied to identical input geometry at the conclusion of the Microtune run demonstrate razor-sharp, object-centric hotspots.
 
-> 
-> 
+> ![TMLPN Microtune Grad-CAM](assets/TMLPN_Microtune_batch0_img1_class15_gradcam.png)
+> ![TMLPN Microtune Epistemic Uncertainty](assets/TMLPN_Microtune_batch0_img1_epistemic_uncertainty.png)
 > Figure 4: Final TMLPN Diagnostics. Left: The Grad-CAM heatmap reveals object-centric hotspots that strictly adhere to physical mass. Right: The Epistemic Uncertainty map captures the model's spatial hesitation during Test-Time Augmentation (TTA).
 
 ### 8.4 Interpreting the Uncertainty Maps: Grid Artifacts & Boundary Hesitation
