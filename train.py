@@ -534,6 +534,10 @@ def main():
     optimizer, scheduler, criterion, latent_criterion, alpha, beta = build_phase_config(phase, model, MAX_EPOCHS, manager.model_dir, NUM_CLASSES, is_latent_model)
     scaler = GradScaler(DEVICE.type)
 
+    # Push the loss modules (and their registered buffers) to the GPU
+    criterion = criterion.to(DEVICE)
+    latent_criterion = latent_criterion.to(DEVICE)
+    
     if state["is_resume"]:
         checkpoint = torch.load(os.path.join(run_dir, "latest_checkpoint.pt"))
         model.load_state_dict(checkpoint['model_state']); optimizer.load_state_dict(checkpoint['optimizer_state'])
