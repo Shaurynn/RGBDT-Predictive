@@ -7,3 +7,5 @@ results/
 archive/
 documents/
 *.ipynb
+__pycache__/
+.vscode/
