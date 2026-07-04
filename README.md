@@ -11,9 +11,24 @@ The detection of structural defects utilizing high-resolution sensors (e.g., Bau
 
 ---
 
+## 2. Core Repository Structure
+
+This repository is strictly for deploying the O(N) TriModal Latent Predictive Network (TMLPN). All legacy artifacts have been isolated in the `deprecated/` directory.
+
+RGBDT-Predictive/
+├── assets/                  # High-resolution diagnostic Grad-CAM heatmaps and telemetry logs.
+├── dataset.py               # Optimized MM5 dataloader for aligned RGB-D-T triplets.
+├── models.py                # Dual 'mit_b1' SegFormer encoders, GCMA Fusion, and Latent Predictor.
+├── pyproject.toml           # Project metadata and top-level dependency declarations.
+├── README.md                # Theoretical mapping and hardware defense.
+├── train.py                 # The TMLPN execution engine, VICReg logic, and TTA diagnostics.
+└── uv.lock                  # Deterministic lockfile for exact environment reproduction.
+
+---
+
 ## PART I: The Legacy Tri-Objective Generative Network (TMPN)
 
-### 2.1 TMPN Methodology & Architecture
+### 3.1 TMPN Methodology & Architecture
 
 The baseline TMPN architecture addresses cross-modal alignment by forcing the network to hallucinate obscured thermodynamic data back into pixel space.
 
@@ -21,7 +36,7 @@ The baseline TMPN architecture addresses cross-modal alignment by forcing the ne
 * Thermal Reconstruction (Physics Loss): An Object-Aware Block Mask obscures a percentage of the input Thermal tensor. The network's decoder must reconstruct this masked region in pixel-space using a Masked Mean Squared Error (MSE) loss, forcing it to learn structural thermodynamics.
 * Global Context Modality Attention (GCMA): To resolve mechanical parallax (Y-axis sensor offset), the GCMA head preserves pristine geometry by treating every individual pixel in the RGB-D feature map as a discrete Query. The globally pooled Thermal and RGB-D signatures act as the Keys and Values [1].
 
-### 2.2 TMPN Quantitative Milestones
+### 3.2 TMPN Quantitative Milestones
 
 The state-machine progression on the MM5 dataset yielded the following quantitative milestones. Test-Time Augmentation (TTA) was utilized during the final diagnostic passes to measure robustness against asymmetric false-positives.
 
@@ -38,11 +53,11 @@ The state-machine progression on the MM5 dataset yielded the following quantitat
 
 ## PART II: The TriModal Latent Predictive Network (TMLPN)
 
-## 6. Introduction to Latent Prediction
+## 4. Introduction to Latent Prediction
 
 While the generative TMPN architecture successfully aligned multimodal features, pixel-space reconstruction is inherently inefficient. The network expends massive computational capacity hallucinating high-frequency thermal "speckle" and ambient heat bleed—artifacts that are irrelevant to the actual physical structure of a defect. Part II introduces the TMLPN, shifting the paradigm from pixel generation to latent feature prediction. By operating entirely in an abstract manifold, the architecture achieves immunity to stochastic noise and accelerates domain traversal.
 
-## 7. Mathematical Mapping to the JEPA Framework
+## 5. Mathematical Mapping to the JEPA Framework
 
 > ![TMLPN Architecture](assets/TMLPN_Architecture_Diagram_v02.jpg)
 > Figure 1: Comprehensive pipeline of the TriModal Latent Predictive Network, detailing the intermediate-fusion topology, the hierarchical spatial MLP predictor, and the VICReg regularization engine.
@@ -54,7 +69,7 @@ The TMLPN formally adapts the Joint-Embedding Predictive Architecture (JEPA) [5]
 * The Target Encoder (E_target): The network that generates the "ground truth" latent signature. In TMLPN, this is the isolated Thermal encoder processing the unmasked target tensor, governed by a strict .detach() operation to lock the weights during prediction.
 * The Predictor (P_φ): The neural module that infers the Target embedding based solely on the Context embedding. In TMLPN, this is the latent_predictor operating via a hierarchical convolutional bottleneck.
 
-### 7.1 The Latent Regularization Engine (The VICReg Triad)
+### 6.1 The Latent Regularization Engine (The VICReg Triad)
 
 Because the Target Encoder is locked via a Stop-Gradient, the network must be physically restrained from Representation Collapse. TMLPN adapts the VICReg framework [6] via three constraints:
 
@@ -64,9 +79,9 @@ Because the Target Encoder is locked via a Stop-Gradient, the network must be ph
 
 ---
 
-## 8. Results & Analysis
+## 7. Results & Analysis
 
-### 8.1 Baseline Training Dynamics & Pathologies
+### 7.1 Baseline Training Dynamics & Pathologies
 
 During the unoptimized 150-epoch baseline run, the architecture exhibited expected self-supervised mathematical behaviors, notably a massive discrepancy between Total Training Loss (~40.0) and Validation Loss (~0.14). Because latent target generation is strictly an auxiliary training task [5], the Validation loop correctly bypassed the VICReg penalties to strictly evaluate the downstream segmentation cross-entropy error.
 
@@ -75,7 +90,7 @@ Furthermore, early epochs demonstrated a sharp spike in Covariance (peaking at ~
 > ![TMLPN Baseline Dynamics](assets/Tensorboard_TMLPN_Baseline.png)
 > Figure 2: Telemetry of the TMLPN Baseline Run. The top-left chart captures the exact moment the network hit the sledgehammer Covariance penalty (Epoch 23), successfully forcing the channels into orthogonal representations.
 
-### 8.2 Deep Convergence & The Microtune Polish
+### 7.2 Deep Convergence & The Microtune Polish
 
 Following a 30-trial Bayesian optimization sweep (Optuna), the architecture achieved deep convergence during a long-horizon Hero phase. To finalize spatial boundaries, a Microtune phase shifted the learning rate into a microscopic 10⁻⁵ to 10⁻⁷ cooling schedule, anchoring the latent space.
 
@@ -92,7 +107,7 @@ Following a 30-trial Bayesian optimization sweep (Optuna), the architecture achi
 > ![TMLPN Microtune Dynamics](assets/Tensorboard_TMLPN_Microtune.png)
 > Figure 4: Telemetry of the TMLPN Microtune Phase. The microscopic learning rate gently cools the Covariance and Total Train Loss (top) while the Validation mIoU (bottom) remains highly stable.
 
-### 8.3 Explainability: Tightening Spatial Boundaries
+### 7.3 Explainability: Tightening Spatial Boundaries
 
 Semantic Grad-CAM and Epistemic Uncertainty mapping applied to identical input geometry at the conclusion of the Microtune run demonstrate razor-sharp, object-centric hotspots.
 
@@ -100,7 +115,7 @@ Semantic Grad-CAM and Epistemic Uncertainty mapping applied to identical input g
 > ![TMLPN Microtune Epistemic Uncertainty](assets/TMLPN_Microtune_batch0_img1_epistemic_uncertainty.png)
 > Figure 5: Final TMLPN Diagnostics. Top: The Grad-CAM heatmap reveals object-centric hotspots that strictly adhere to physical mass. Bottom: The Epistemic Uncertainty map captures the model's spatial hesitation during Test-Time Augmentation (TTA).
 
-### 8.4 Interpreting the Uncertainty Maps: Grid Artifacts & Boundary Hesitation
+### 7.4 Interpreting the Uncertainty Maps: Grid Artifacts & Boundary Hesitation
 
 The Epistemic Uncertainty map evaluates cross-modal agreement and spatial confidence by measuring the prediction variance across multiple TTA orientations. The visual artifacts rendered on these maps are highly indicative of the underlying Vision Transformer mechanics:
 
@@ -110,29 +125,29 @@ The Epistemic Uncertainty map evaluates cross-modal agreement and spatial confid
 
 ---
 
-## 9. Architectural Trade-Offs & Theoretical Defenses
+## 8. Architectural Trade-Offs & Theoretical Defenses
 
-### 9.1 Intermediate vs. Early Fusion Topology
+### 8.1 Intermediate vs. Early Fusion Topology
 A common theoretical critique of multimodal perception engines is the assumption of "early-fusion," where heterogeneous sensors (RGB, Depth, Thermal) are concatenated into a single backbone input. Naive early-fusion ignores the distinct statistical variances of each modality, resulting in catastrophic feature dilution.
 
 TMLPN explicitly avoids this by utilizing an intermediate-fusion topology. The RGB-D and Thermal domains are processed by completely isolated Vision Transformer encoders. Before the feature maps are permitted to interact in the GCMA head, they pass through independent normalization streams, applying dedicated 1×1 convolutions and 2D Batch Normalization to explicitly balance the statistical variance.
 
-### 9.2 The O(N) vs. O(N²) Cross-Attention Bottleneck
+### 8.2 The O(N) vs. O(N²) Cross-Attention Bottleneck
 In the GCMA fusion head, the Thermal Keys and Values are globally pooled before cross-attention is calculated against the RGB-D spatial Queries.
 
 Preserving the full spatial dimensions of the Keys and Values introduces a quadratic O(N²) computational complexity to the cross-attention matrix. On shared-memory edge Linux SoCs, pushing massive attention matrices through the memory bus saturates bandwidth long before GPU ALU limits are reached. By globally pooling the context, TMLPN reduces the mathematical complexity of fusion to linear time O(N). This calculated trade-off sacrifices microscopic thermal localization to guarantee blazing-fast inference speeds (30+ FPS) and inherent immunity to mechanical sensor parallax.
 
-### 9.3 GCMA Context Pooling vs. Latent Perceiver Blocks
+### 8.3 GCMA Context Pooling vs. Latent Perceiver Blocks
 Theoretical optimizations often suggest substituting standard attention with a DeepMind Perceiver block to solve the O(N²) bottleneck. A standard Perceiver achieves linear time by introducing an asymmetrical array of "Latent Tokens" to query the raw sensor space.
 
 However, utilizing a Perceiver block outputs a flattened 1D array of latent tokens, fundamentally destroying the rigid 2D geometric grid established by the SegFormer backbone. The GCMA head solves the exact same computational bottleneck but from the opposite mathematical direction. By preserving the high-resolution RGB-D spatial grid as the Queries and pooling the context as the Keys/Values, the GCMA achieves O(N) runtime while flawlessly preserving the 2D spatial dimensions, allowing the network to retain the sub-pixel boundary mapping required for structural segmentation.
 
-### 9.4 Stop-Gradient Heuristics and Explicit Covariance Regularization
+### 8.4 Stop-Gradient Heuristics and Explicit Covariance Regularization
 Many self-supervised frameworks utilize an Exponential Moving Average (EMA) teacher network to prevent representation collapse in the target encoder. TMLPN abandons the EMA framework entirely, utilizing identical shared weights for the Context and Target encoders governed solely by a strict Stop-Gradient (.detach()) operation.
 
 By explicitly enforcing the VICReg constraints [6], TMLPN proves that mathematically regularizing the variance and covariance of the embedding manifold physically prevents rank collapse. Excision of the EMA teacher network significantly reduces VRAM consumption during training without sacrificing manifold stability.
 
-### 9.5 Mitigating Imbalance and Asymptotic Limits (DCW & KD)
+### 8.5 Mitigating Imbalance and Asymptotic Limits (DCW & KD)
 Industrial defect datasets exhibit extreme class imbalance. To overcome this without unbalancing the VICReg latent space, TMLPN utilizes a Dynamic Class-Weighting Schedule (DCW) [7]. By tracking an Exponential Moving Average (EMA) of the validation IoU for each class, the downstream Dice penalty is exponentially scaled on the fly specifically for lagging minority classes:
 
 $$W_c = EMA( W_c, e^[τ * (1 - IoU_c)] )$$ 
@@ -141,7 +156,7 @@ To break representational capacity ceilings, the pipeline integrates a Knowledge
 
 ---
 
-## 10. Key Concepts & Technical Glossary
+## 9. Key Concepts & Technical Glossary
 
 For researchers and engineers adapting this repository, the architecture relies heavily on the following foundational concepts:
 
@@ -156,7 +171,7 @@ For researchers and engineers adapting this repository, the architecture relies 
 
 ---
 
-## 11. Conclusion & Edge Deployment
+## 10. Conclusion & Edge Deployment
 
 By abandoning pixel-space generation, the TriModal Latent Predictive Network establishes a vastly more efficient methodology for multimodal defect detection. The architecture successfully isolates structural thermodynamics from stochastic sensor noise, achieving rapid spatial convergence and immense confidence on sub-pixel boundaries.
 
