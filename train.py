@@ -1,6 +1,7 @@
 import os
 import glob
 import json
+import inspect
 import torch
 import cv2
 import optuna
@@ -24,6 +25,10 @@ import models
 # ====================================================================================
 
 class FocalDiceLoss(nn.Module):
+    """
+    Evaluates spatial boundaries and heavily penalizes minority class failures.
+    Integrates a Dynamic Class-Weighting (DCW) schedule to scale the dice penalty.
+    """
     def __init__(self, num_classes, gamma=2.0, dice_weight=1.0, ignore_index=255):
         super().__init__()
         self.num_classes = num_classes
@@ -31,18 +36,18 @@ class FocalDiceLoss(nn.Module):
         self.base_dice_weight = dice_weight
         self.ignore_index = ignore_index
         
-        # Base CE weights
+        # Base CE weights (Suppresses background dominance)
         self.register_buffer('ce_weights', torch.ones(num_classes))
-        self.ce_weights[0] = 0.1 # Background suppression
+        self.ce_weights[0] = 0.1 
         
         # Dynamic Dice weights initialized to 1.0
         self.register_buffer('dynamic_dice_weights', torch.ones(num_classes))
 
     def update_dynamic_weights(self, per_class_iou, momentum=0.9, tau=2.0):
         """
-        Dynamic Class-Weighting Schedule (DCW)
+        Dynamic Class-Weighting Schedule (DCW).
         Exponentially scales the dice penalty for minority/hard classes based on validation IoU.
-        Uses Exponential Moving Average (EMA) to prevent gradient shock and manifold collapse.
+        Uses Exponential Moving Average (EMA) to prevent gradient shock.
         """
         per_class_iou = per_class_iou.to(self.dynamic_dice_weights.device)
         
@@ -81,10 +86,16 @@ class FocalDiceLoss(nn.Module):
         return focal_loss + (self.base_dice_weight * dice_loss)
 
 def masked_mse_loss(preds, targets, mask):
+    """Legacy Generative Loss for Pixel-Space Reconstruction."""
     diff = (preds - targets) ** 2
     return (diff * mask).sum() / (mask.sum() + 1e-8)
 
 class LatentRegularizationLoss(nn.Module):
+    """
+    The VICReg Triad (Variance-Invariance-Covariance).
+    Physically prevents representation collapse in the latent space without relying
+    on an EMA momentum teacher network.
+    """
     def __init__(self, sim_weight=25.0, var_weight=25.0, cov_weight=15.0):
         super().__init__()
         self.sim_weight = sim_weight
@@ -93,19 +104,23 @@ class LatentRegularizationLoss(nn.Module):
 
     def forward(self, z_pred, z_target):
         B, C, H, W = z_pred.shape
+        # Flatten spatial dimensions to evaluate channel distributions
         x = z_pred.permute(0, 2, 3, 1).reshape(-1, C)
         y = z_target.permute(0, 2, 3, 1).reshape(-1, C)
 
+        # 1. Invariance (Similarity)
         sim_loss = F.mse_loss(x, y)
+        
+        # 2. Variance (Anti-Collapse)
         std_x = torch.sqrt(x.var(dim=0) + 1e-4)
         std_y = torch.sqrt(y.var(dim=0) + 1e-4)
         var_loss = torch.mean(F.relu(1 - std_x)) + torch.mean(F.relu(1 - std_y))
 
+        # 3. Covariance (Decorrelation)
         x_centered = x - x.mean(dim=0)
         y_centered = y - y.mean(dim=0)
         cov_x = (x_centered.T @ x_centered) / (x.shape[0] - 1)
         cov_y = (y_centered.T @ y_centered) / (y.shape[0] - 1)
-        
         cov_loss = (self.off_diagonal(cov_x).pow_(2).sum() / C) + (self.off_diagonal(cov_y).pow_(2).sum() / C)
         
         total_latent_loss = (self.sim_weight * sim_loss) + (self.var_weight * var_loss) + (self.cov_weight * cov_loss)
@@ -118,6 +133,10 @@ class LatentRegularizationLoss(nn.Module):
         return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 def knowledge_distillation_loss(student_logits, teacher_logits, temperature=4.0):
+    """
+    Computes the Kullback-Leibler (KL) Divergence between the Student and Teacher soft probabilities.
+    Extracts 'Dark Knowledge' (inter-class relationships and noise suppression) from the teacher.
+    """
     soft_targets = F.softmax(teacher_logits / temperature, dim=1)
     student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
     kd_loss = F.kl_div(student_log_probs, soft_targets, reduction='batchmean') * (temperature ** 2)
@@ -164,6 +183,7 @@ class IoUMetric:
         return self.get_per_class_iou()[valid_classes].mean().item()
 
 def compute_ece(logits, targets, num_bins=10, ignore_index=255):
+    """Expected Calibration Error (ECE) metric."""
     preds = torch.argmax(logits, dim=1)
     confs = torch.max(F.softmax(logits, dim=1), dim=1)[0]
     valid_mask = targets != ignore_index
@@ -181,6 +201,7 @@ def compute_ece(logits, targets, num_bins=10, ignore_index=255):
     return ece.item()
 
 def compute_boundary_iou(logits, targets, num_classes, ignore_index=255, dilation_kernel=5):
+    """Evaluates strict perimeter adherence rather than overall volumetric mass."""
     preds = torch.argmax(logits, dim=1).unsqueeze(1).float()
     targets_f = targets.unsqueeze(1).float()
     kernel = torch.ones((1, 1, dilation_kernel, dilation_kernel), device=logits.device)
@@ -198,10 +219,16 @@ def compute_boundary_iou(logits, targets, num_classes, ignore_index=255, dilatio
     return intersection / max(union, 1e-8)
 
 def apply_ood_noise(tensor, noise_std=0.3):
+    """Applies Out-of-Distribution (OOD) structural noise for resilience testing."""
     noise = torch.randn_like(tensor) * noise_std
     return torch.clamp(tensor + noise, 0, 1)
 
 class TTAWrapper(nn.Module):
+    """
+    Test-Time Augmentation (TTA) Wrapper.
+    Evaluates spatial hesitation and epistemic uncertainty by measuring variance
+    across multiple geometric orientations.
+    """
     def __init__(self, model):
         super().__init__()
         self.model = model
@@ -226,6 +253,7 @@ class TTAWrapper(nn.Module):
 # ====================================================================================
 
 class SemanticGradCAM:
+    """Generates high-resolution class-activation heatmaps anchored to the fusion layers."""
     def __init__(self, model, target_layer):
         self.model = model
         self.target_layer = target_layer
@@ -261,6 +289,7 @@ class SemanticGradCAM:
 # ====================================================================================
 
 class ExperimentManager:
+    """Controls the sequential state machine for training lifecycle (baseline -> export)."""
     def __init__(self, model_instance, backbone="mit_b1", data_domain="MM5", base_dir="results"):
         self.model_name = model_instance.__class__.__name__
         self.data_domain = data_domain
@@ -312,11 +341,21 @@ class ExperimentManager:
     def _save_state(self, run_dir, state_dict):
         with open(os.path.join(run_dir, "state.json"), 'w') as f: json.dump(state_dict, f, indent=4)
 
-def build_phase_config(phase, model, max_epochs, model_dir, num_classes, is_latent_model):
+def build_phase_config(phase, model, max_epochs, model_dir, num_classes, is_latent_model,
+                       custom_lr=None, custom_wd=None, custom_sim=25.0, custom_var=25.0, custom_cov=15.0):
+    """Constructs the exact optimizer, scheduler, and loss environment for the active phase."""
+    
+    # Defaults (Overridden by HPO or JSON params)
     lr, gamma, dice, opt_type, momentum, weight_decay = 0.0753, 1.6627, 0.6250, "AdamW", 0.9685, 0.0003
+    
+    # Apply direct JSON overrides (crucial for Knowledge Distillation specific tuning)
+    if custom_lr is not None: lr = custom_lr
+    if custom_wd is not None: weight_decay = custom_wd
+    
     alpha = 0.1 if is_latent_model else 0.5 
     beta = 0.4 
     
+    # Ingest HPO findings if progressing through standard state machine
     if phase in ["hero", "microtune"]:
         existing_runs = sorted(glob.glob(os.path.join(model_dir, "*_*")))
         hpo_runs = [r for r in existing_runs if r.lower().endswith("_hpo")]
@@ -330,10 +369,10 @@ def build_phase_config(phase, model, max_epochs, model_dir, num_classes, is_late
                 if not is_latent_model: beta = p.get("beta", beta)
 
     criterion = FocalDiceLoss(num_classes=num_classes, ignore_index=255, gamma=gamma, dice_weight=dice)
-    latent_criterion = LatentRegularizationLoss()
+    latent_criterion = LatentRegularizationLoss(sim_weight=custom_sim, var_weight=custom_var, cov_weight=custom_cov)
 
     if phase == "baseline":
-        opt = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+        opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_epochs, eta_min=1e-6)
     elif phase == "hero":
         if opt_type == "AdamW": opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -348,6 +387,7 @@ def build_phase_config(phase, model, max_epochs, model_dir, num_classes, is_late
     return opt, sch, criterion, latent_criterion, alpha, beta
 
 def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_loader, eval_loader, num_classes, device):
+    """Executes a 30-Trial Bayesian Hyperparameter Optimization Sweep via Optuna."""
     print("\n" + "="*75)
     print("🚀 INITIATING OPTUNA HYPERPARAMETER SWEEP (30 Trials)")
     study_db_path = os.path.join(run_dir, "optuna_study.db")
@@ -427,6 +467,7 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
     return study.best_value
 
 def export_to_onnx(model, weights_path, run_dir, device):
+    """Compiles the fully optimized network down to ONNX Opset 18 for edge TensorRT deployment."""
     print(f"\n--- Serializing Architecture to ONNX ---")
     model.load_state_dict(torch.load(weights_path, map_location=device))
     model.to(device)
@@ -456,35 +497,68 @@ def export_to_onnx(model, weights_path, run_dir, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="TriModalPredictiveNetwork")
-    parser.add_argument("--backbone", type=str, default="mit_b1", help="Vision Transformer backbone (e.g., mit_b1, mit_b2, mit_b5)")
+    parser.add_argument("--backbone", type=str, default="mit_b1", help="Vision Transformer backbone")
     parser.add_argument("--params", type=str, default="{}")
     parser.add_argument("--data_domain", type=str, default="MM5")
     parser.add_argument("--data_dir", type=str, default="dataset/MM5")
     parser.add_argument("--disable_tta", action="store_true", help="Skip TTA computation in diagnostics")
     
-    # KNOWLEDGE DISTILLATION ARGUMENTS
-    parser.add_argument("--teacher_backbone", type=str, default=None, help="Backbone of the teacher model (e.g., mit_b5)")
-    parser.add_argument("--teacher_weights", type=str, default=None, help="Path to teacher weights for Knowledge Distillation")
-    parser.add_argument("--kd_temp", type=float, default=4.0, help="Temperature for Softmax in KD")
-    parser.add_argument("--kd_alpha", type=float, default=0.5, help="Weight for the Distillation Loss")
+    # Knowledge Distillation Defaults (Overridable via JSON config)
+    parser.add_argument("--teacher_backbone", type=str, default=None)
+    parser.add_argument("--teacher_weights", type=str, default=None)
+    parser.add_argument("--kd_temp", type=float, default=4.0)
+    parser.add_argument("--kd_alpha", type=float, default=0.5)
     
     args = parser.parse_args()
-
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     BATCH_SIZE = 6 
 
-    train_dataset = TriModalPredictiveDataset(data_dir=args.data_dir, split="train", mask_ratio=0.30)
+    ModelClass = getattr(models, args.model)
+    model_kwargs = {"num_classes": 10, "backbone_name": args.backbone} # NUM_CLASSES default init
+    
+    # -------------------------------------------------------------------------
+    # JSON OVERRIDE & PARAMETER ROUTING
+    # -------------------------------------------------------------------------
+    if os.path.exists(args.params):
+        with open(args.params, 'r') as f:
+            config_params = json.load(f)
+            
+        # 1. Override execution args with JSON variables
+        if "teacher_backbone" in config_params: args.teacher_backbone = config_params["teacher_backbone"]
+        if "teacher_weights" in config_params: args.teacher_weights = config_params["teacher_weights"]
+        if "kd_temp" in config_params: args.kd_temp = float(config_params["kd_temp"])
+        if "kd_alpha" in config_params: args.kd_alpha = float(config_params["kd_alpha"])
+        
+        if "max_epoch" in config_params: args.max_epoch = int(config_params["max_epoch"])
+        if "patience" in config_params: args.patience = int(config_params["patience"])
+        if "learning_rate" in config_params: args.learning_rate = float(config_params["learning_rate"])
+        if "weight_decay" in config_params: args.weight_decay = float(config_params["weight_decay"])
+        if "sim_weight" in config_params: args.sim_weight = float(config_params["sim_weight"])
+        if "var_weight" in config_params: args.var_weight = float(config_params["var_weight"])
+        if "cov_weight" in config_params: args.cov_weight = float(config_params["cov_weight"])
+
+        # 2. Safely filter Model kwargs using inspect to prevent constructor crashes
+        valid_keys = inspect.signature(ModelClass.__init__).parameters.keys()
+        for k, v in config_params.items():
+            if k in valid_keys:
+                model_kwargs[k] = v
+                
+        # 3. Safely isolate routing configuration (e.g. lane_id)
+        current_lane = config_params.get("lane_id", "default_lane")
+    else:
+        current_lane = "default_lane"
+
+    # Dataset Initialization
+    train_dataset = TriModalPredictiveDataset(data_dir=args.data_dir, split="train", mask_ratio=config_params.get("mask_ratio", 0.30) if os.path.exists(args.params) else 0.30)
     eval_dataset = TriModalPredictiveDataset(data_dir=args.data_dir, split="eval", mask_ratio=0.0)
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
     eval_loader = DataLoader(eval_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
     NUM_CLASSES = train_dataset.num_classes
+    model_kwargs["num_classes"] = NUM_CLASSES
 
-    ModelClass = getattr(models, args.model)
-    model_kwargs = {"num_classes": NUM_CLASSES, "backbone_name": args.backbone}
-    model_kwargs.update(json.loads(args.params))
+    # Model Instantiation
     model = ModelClass(**model_kwargs).to(DEVICE)
-    
     is_latent_model = (args.model == "TriModalLatentPredictiveNetwork")
     
     # --------------------------------------------------------------------------------
@@ -509,12 +583,22 @@ def main():
     summary(model, input_size=[(BATCH_SIZE, 4, 480, 640), (BATCH_SIZE, 1, 480, 640)], col_names=["input_size", "output_size", "num_params", "mult_adds"], depth=4)
     print("="*75)
     
-    manager = ExperimentManager(model_instance=model, backbone=args.backbone, data_domain=args.data_domain)
+    # --------------------------------------------------------------------------------
+    # EXPERIMENT ROUTING & STATE MACHINE
+    # --------------------------------------------------------------------------------
+    # Appends the lane_id to isolate specific timelines (e.g. distillation) from the standard path
+    experiment_id = f"{args.backbone}_{current_lane}" if current_lane != "default_lane" else args.backbone
+    
+    manager = ExperimentManager(model_instance=model, backbone=experiment_id, data_domain=args.data_domain)
     state = manager.detect_state()
-    if state is None: return 
+    
+    if state is None: 
+        print(f"\n[SYSTEM] State machine exited. Pipeline for {experiment_id} is already complete.")
+        return 
         
     run_dir, phase = state["run_dir"], state["phase"]
 
+    # Trigger distinct phase behaviors
     if phase == "hpo":
         best_score = run_hpo_phase(run_dir, state["inherit_weights"], ModelClass, model_kwargs, train_loader, eval_loader, NUM_CLASSES, DEVICE)
         with open(os.path.join(run_dir, "results.json"), 'w') as f: json.dump({"phase": phase, "best_hpo_mIoU": best_score}, f, indent=4)
@@ -525,16 +609,24 @@ def main():
         with open(os.path.join(run_dir, "results.json"), 'w') as f: json.dump({"phase": phase, "artifact": onnx_file}, f, indent=4)
         return
 
-    MAX_EPOCHS = 150 if phase == "baseline" else (300 if phase == "hero" else 200)
-    PATIENCE = 25 if phase == "baseline" else 40
+    # Apply Hyperparameter Overrides
+    MAX_EPOCHS = getattr(args, 'max_epoch', 150 if phase == "baseline" else (300 if phase == "hero" else 200))
+    PATIENCE = getattr(args, 'patience', 25 if phase == "baseline" else 40)
 
     print(f"\n🚀 PHASE: {phase.upper()} | EPOCHS: {MAX_EPOCHS} | PATIENCE: {PATIENCE}")
     print(f"📈 [MONITORING] run: tensorboard --logdir={os.path.join(run_dir, 'logs')}\n")
 
-    optimizer, scheduler, criterion, latent_criterion, alpha, beta = build_phase_config(phase, model, MAX_EPOCHS, manager.model_dir, NUM_CLASSES, is_latent_model)
+    optimizer, scheduler, criterion, latent_criterion, alpha, beta = build_phase_config(
+        phase, model, MAX_EPOCHS, manager.model_dir, NUM_CLASSES, is_latent_model,
+        custom_lr=getattr(args, 'learning_rate', None),
+        custom_wd=getattr(args, 'weight_decay', None),
+        custom_sim=getattr(args, 'sim_weight', 25.0),
+        custom_var=getattr(args, 'var_weight', 25.0),
+        custom_cov=getattr(args, 'cov_weight', 15.0)
+    )
+    
     scaler = GradScaler(DEVICE.type)
 
-    # Push the loss modules (and their registered buffers) to the GPU
     criterion = criterion.to(DEVICE)
     latent_criterion = latent_criterion.to(DEVICE)
     
@@ -547,10 +639,12 @@ def main():
 
     writer = SummaryWriter(log_dir=os.path.join(run_dir, "logs"))
 
+    # --------------------------------------------------------------------------------
+    # CORE TRAINING LOOP
+    # --------------------------------------------------------------------------------
     for epoch in range(state["start_epoch"], MAX_EPOCHS):
         model.train()
         train_loss, train_seg_loss, train_physics_loss, train_kd_loss = 0.0, 0.0, 0.0, 0.0
-        
         train_sim, train_var, train_cov = 0.0, 0.0, 0.0 
         
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [Train]")
@@ -572,12 +666,12 @@ def main():
                     loss_phys = masked_mse_loss(pred_therm, therm_target, block_mask)
                     loss = loss_seg + (alpha * loss_phys) + (beta * criterion(aux_therm_seg, seg_mask))
                 
+                # Apply Knowledge Distillation Soft Targets
                 if teacher_model is not None:
                     with torch.no_grad():
-                        if is_latent_model:
-                            teacher_seg = teacher_model(rgbd, therm_masked)
-                        else:
-                            teacher_seg, _ = teacher_model(rgbd, therm_masked)
+                        teacher_outputs = teacher_model(rgbd, therm_masked)
+                        # Standardize extraction to prevent KL Divergence crash
+                        teacher_seg = teacher_outputs[0] if isinstance(teacher_outputs, tuple) else teacher_outputs
                     
                     loss_kd = knowledge_distillation_loss(pred_seg, teacher_seg, temperature=args.kd_temp)
                     loss = (1 - args.kd_alpha) * loss + (args.kd_alpha * loss_kd)
@@ -600,6 +694,9 @@ def main():
             
         scheduler.step()
         
+        # --------------------------------------------------------------------------------
+        # VALIDATION EVALUATION
+        # --------------------------------------------------------------------------------
         model.eval()
         val_loss, batches = 0.0, 0
         val_iou_tracker = IoUMetric(NUM_CLASSES, DEVICE)
@@ -623,6 +720,7 @@ def main():
         avg_val_loss = val_loss / batches
         avg_val_miou = val_iou_tracker.get_miou()
         
+        # Apply DCW scaling during later phases
         if phase == "hero":
             criterion.update_dynamic_weights(val_iou_tracker.get_per_class_iou())
         
@@ -718,7 +816,6 @@ def main():
                 therm_input = therm_masked[b].unsqueeze(0)
                 
                 # Lifted RGB extraction to safely overlay Epistemic Uncertainty
-                # even if no classes trigger the Grad-CAM loop.
                 rgb_tensor = rgbd_input[0, :3, :, :].clone().cpu()
                 mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
                 std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -756,9 +853,7 @@ def main():
     print(f"{'OOD Stress mIoU (Higher ↑)':<25} | {metrics['base']['ood']:<20.4f} | {metrics['tta']['ood']:<20.4f}")
     print("="*75 + "\n")
 
-    # =========================================================================
-    # --- MISSING STATE-MACHINE HANDOFF LOGIC ---
-    # =========================================================================
+    # State-Machine Handoff Logic
     results_payload = {
         "model_architecture": model.__class__.__name__,
         "phase": phase,
