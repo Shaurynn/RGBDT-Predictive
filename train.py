@@ -415,8 +415,8 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
             
         train_loader.dataset.mask_ratio = mask_ratio 
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
-        criterion = FocalDiceLoss(num_classes, gamma=gamma, dice_weight=dice)
-        latent_criterion = LatentRegularizationLoss()
+        criterion = FocalDiceLoss(num_classes, gamma=gamma, dice_weight=dice).to(device)
+        latent_criterion = LatentRegularizationLoss().to(device)
         scaler = GradScaler(device.type)
         
         best_miou = 0.0
