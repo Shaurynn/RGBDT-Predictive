@@ -58,6 +58,9 @@ class FocalDiceLoss(nn.Module):
         self.dynamic_dice_weights = torch.clamp(self.dynamic_dice_weights, min=1.0, max=10.0)
 
     def forward(self, inputs, targets):
+        # UPCAST & CLAMP: Prevent extreme logit spreads from deep architectures
+        inputs = torch.clamp(inputs.float(), min=-100.0, max=100.0)
+        
         ce_loss = F.cross_entropy(inputs, targets, reduction='none', ignore_index=self.ignore_index, weight=self.ce_weights)
         pt = torch.exp(-ce_loss)
         focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
@@ -87,8 +90,11 @@ class FocalDiceLoss(nn.Module):
 
 def masked_mse_loss(preds, targets, mask):
     """Legacy Generative Loss for Pixel-Space Reconstruction."""
-    # UPCAST FIX: Force FP32 to prevent .sum() overflow in autocast (max FP16 is 65,504)
-    diff = (preds.float() - targets.float()) ** 2
+    # UPCAST & CLAMP FIX
+    preds = torch.clamp(preds.float(), min=-1000.0, max=1000.0)
+    targets = torch.clamp(targets.float(), min=-1000.0, max=1000.0)
+    
+    diff = (preds - targets) ** 2
     return (diff * mask.float()).sum() / (mask.float().sum() + 1e-8)
 
 class LatentRegularizationLoss(nn.Module):
@@ -106,9 +112,13 @@ class LatentRegularizationLoss(nn.Module):
         B, C, H, W = z_pred.shape
         
         # UPCAST FIX: Flatten spatial dimensions and force FP32.
-        # Computing covariance on millions of elements in FP16 guarantees an 'inf' overflow.
         x = z_pred.permute(0, 2, 3, 1).reshape(-1, C).float()
         y = z_target.permute(0, 2, 3, 1).reshape(-1, C).float()
+
+        # DEFUSE THE EXPLOSION: Hard-clamp the latent space to prevent 
+        # deep-backbone variance from exceeding limits when squared.
+        x = torch.clamp(x, min=-1000.0, max=1000.0)
+        y = torch.clamp(y, min=-1000.0, max=1000.0)
 
         # 1. Invariance (Similarity)
         sim_loss = F.mse_loss(x, y)
@@ -125,7 +135,8 @@ class LatentRegularizationLoss(nn.Module):
         cov_x = (x_centered.T @ x_centered) / (x.shape[0] - 1)
         cov_y = (y_centered.T @ y_centered) / (y.shape[0] - 1)
         
-        cov_loss = (self.off_diagonal(cov_x).pow_(2).sum() / C) + (self.off_diagonal(cov_y).pow_(2).sum() / C)
+        # FIX: Changed in-place .pow_(2) to .pow(2) for gradient safety
+        cov_loss = (self.off_diagonal(cov_x).pow(2).sum() / C) + (self.off_diagonal(cov_y).pow(2).sum() / C)
         
         total_latent_loss = (self.sim_weight * sim_loss) + (self.var_weight * var_loss) + (self.cov_weight * cov_loss)
         
@@ -349,8 +360,8 @@ def build_phase_config(phase, model, max_epochs, model_dir, num_classes, is_late
                        custom_lr=None, custom_wd=None, custom_sim=25.0, custom_var=25.0, custom_cov=15.0):
     """Constructs the exact optimizer, scheduler, and loss environment for the active phase."""
     
-    # Defaults (Overridden by HPO or JSON params)
-    lr, gamma, dice, opt_type, momentum, weight_decay = 0.0753, 1.6627, 0.6250, "AdamW", 0.9685, 0.0003
+    # FIX: Lowered AdamW learning rate from 0.0753 to 0.00006 for ViT stability
+    lr, gamma, dice, opt_type, momentum, weight_decay = 0.00006, 1.6627, 0.6250, "AdamW", 0.9685, 0.0003
     
     # Apply direct JSON overrides (crucial for Knowledge Distillation specific tuning)
     if custom_lr is not None: lr = custom_lr
@@ -424,7 +435,8 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
         criterion = FocalDiceLoss(num_classes, gamma=gamma, dice_weight=dice).to(device)
         latent_criterion = LatentRegularizationLoss().to(device)
         
-        scaler = GradScaler(device.type)
+        # FIX: Disable GradScaler when using bfloat16 to prevent artificial gradient explosion
+        scaler = GradScaler(device.type, enabled=False)
         
         best_miou = 0.0
         for epoch in range(30): 
@@ -434,7 +446,8 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
                 therm_target, seg_mask, block_mask = batch['therm_target'].to(device), batch['seg_mask'].to(device), batch['block_mask'].to(device)
 
                 optimizer.zero_grad()
-                with autocast(device_type=device.type):
+                # FIX: Set dtype to torch.bfloat16
+                with autocast(device_type=device.type, dtype=torch.bfloat16):
                     if is_latent_model:
                         pred_seg, z_pred, z_target = model(rgbd, therm_masked, therm_target)
                         loss_seg = criterion(pred_seg, seg_mask)
@@ -456,7 +469,8 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
             with torch.no_grad():
                 for batch in eval_loader:
                     rgbd, therm_masked, seg_mask = batch['rgbd'].to(device), batch['therm_masked'].to(device), batch['seg_mask'].to(device)
-                    with autocast(device_type=device.type):
+                    # FIX: Set dtype to torch.bfloat16
+                    with autocast(device_type=device.type, dtype=torch.bfloat16):
                         outputs = model(rgbd, therm_masked)
                         logits = outputs if not isinstance(outputs, tuple) else outputs[0]
                     val_iou_tracker.update(logits, seg_mask)
@@ -632,7 +646,8 @@ def main():
         custom_cov=getattr(args, 'cov_weight', 15.0)
     )
     
-    scaler = GradScaler(DEVICE.type)
+    # FIX: Disable GradScaler when using bfloat16 to prevent artificial gradient explosion
+    scaler = GradScaler(DEVICE.type, enabled=False)
 
     criterion = criterion.to(DEVICE)
     latent_criterion = latent_criterion.to(DEVICE)
@@ -660,7 +675,8 @@ def main():
             therm_target, seg_mask, block_mask = batch['therm_target'].to(DEVICE), batch['seg_mask'].to(DEVICE), batch['block_mask'].to(DEVICE)
             
             optimizer.zero_grad()
-            with autocast(device_type=DEVICE.type):
+            # FIX: Set dtype to torch.bfloat16
+            with autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
                 if is_latent_model:
                     pred_seg, z_pred, z_target = model(rgbd, therm_masked, therm_target)
                     loss_seg = criterion(pred_seg, seg_mask)
@@ -712,7 +728,8 @@ def main():
                 rgbd, therm_masked = batch['rgbd'].to(DEVICE), batch['therm_masked'].to(DEVICE)
                 therm_target, seg_mask, block_mask = batch['therm_target'].to(DEVICE), batch['seg_mask'].to(DEVICE), batch['block_mask'].to(DEVICE)
                 
-                with autocast(device_type=DEVICE.type):
+                # FIX: Set dtype to torch.bfloat16
+                with autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
                     if is_latent_model:
                         pred_seg = model(rgbd, therm_masked) 
                         loss = criterion(pred_seg, seg_mask)
@@ -789,7 +806,8 @@ def main():
         rgbd, therm_masked, seg_mask = batch['rgbd'].to(DEVICE), batch['therm_masked'].to(DEVICE), batch['seg_mask'].to(DEVICE)
         
         # Base Evaluation
-        with torch.no_grad(), autocast(device_type=DEVICE.type):
+        # FIX: Set dtype to torch.bfloat16
+        with torch.no_grad(), autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
             outputs_base = model(rgbd, therm_masked)
             logits_base = outputs_base[0] if isinstance(outputs_base, tuple) else outputs_base
             
@@ -804,7 +822,8 @@ def main():
         var_map = None
         # TTA Evaluation (Only runs if the flag is NOT triggered)
         if not args.disable_tta:
-            with torch.no_grad(), autocast(device_type=DEVICE.type):
+            # FIX: Set dtype to torch.bfloat16
+            with torch.no_grad(), autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
                 logits_tta, var_map = tta_model(rgbd, therm_masked)
                 logits_ood_tta, _ = tta_model(apply_ood_noise(rgbd), apply_ood_noise(therm_masked))
                 
