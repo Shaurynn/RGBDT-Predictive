@@ -87,14 +87,14 @@ class FocalDiceLoss(nn.Module):
 
 def masked_mse_loss(preds, targets, mask):
     """Legacy Generative Loss for Pixel-Space Reconstruction."""
-    diff = (preds - targets) ** 2
-    return (diff * mask).sum() / (mask.sum() + 1e-8)
+    # UPCAST FIX: Force FP32 to prevent .sum() overflow in autocast (max FP16 is 65,504)
+    diff = (preds.float() - targets.float()) ** 2
+    return (diff * mask.float()).sum() / (mask.float().sum() + 1e-8)
 
 class LatentRegularizationLoss(nn.Module):
     """
     The VICReg Triad (Variance-Invariance-Covariance).
-    Physically prevents representation collapse in the latent space without relying
-    on an EMA momentum teacher network.
+    Physically prevents representation collapse in the latent space.
     """
     def __init__(self, sim_weight=25.0, var_weight=25.0, cov_weight=15.0):
         super().__init__()
@@ -104,9 +104,11 @@ class LatentRegularizationLoss(nn.Module):
 
     def forward(self, z_pred, z_target):
         B, C, H, W = z_pred.shape
-        # Flatten spatial dimensions to evaluate channel distributions
-        x = z_pred.permute(0, 2, 3, 1).reshape(-1, C)
-        y = z_target.permute(0, 2, 3, 1).reshape(-1, C)
+        
+        # UPCAST FIX: Flatten spatial dimensions and force FP32.
+        # Computing covariance on millions of elements in FP16 guarantees an 'inf' overflow.
+        x = z_pred.permute(0, 2, 3, 1).reshape(-1, C).float()
+        y = z_target.permute(0, 2, 3, 1).reshape(-1, C).float()
 
         # 1. Invariance (Similarity)
         sim_loss = F.mse_loss(x, y)
@@ -119,8 +121,10 @@ class LatentRegularizationLoss(nn.Module):
         # 3. Covariance (Decorrelation)
         x_centered = x - x.mean(dim=0)
         y_centered = y - y.mean(dim=0)
+        
         cov_x = (x_centered.T @ x_centered) / (x.shape[0] - 1)
         cov_y = (y_centered.T @ y_centered) / (y.shape[0] - 1)
+        
         cov_loss = (self.off_diagonal(cov_x).pow_(2).sum() / C) + (self.off_diagonal(cov_y).pow_(2).sum() / C)
         
         total_latent_loss = (self.sim_weight * sim_loss) + (self.var_weight * var_loss) + (self.cov_weight * cov_loss)
@@ -415,8 +419,11 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
             
         train_loader.dataset.mask_ratio = mask_ratio 
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+        
+        # HPO FIX: Explicitly push dynamically created loss modules to the device
         criterion = FocalDiceLoss(num_classes, gamma=gamma, dice_weight=dice).to(device)
         latent_criterion = LatentRegularizationLoss().to(device)
+        
         scaler = GradScaler(device.type)
         
         best_miou = 0.0
