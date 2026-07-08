@@ -16,13 +16,14 @@ The detection of structural defects utilizing high-resolution sensors (e.g., Bau
 This repository is strictly for deploying the O(N) TriModal Latent Predictive Network (TMLPN). All legacy artifacts have been isolated in the `deprecated/` directory.
 
 RGBDT-Predictive/
-├── assets/                  # High-resolution diagnostic Grad-CAM heatmaps and telemetry logs.
-├── dataset.py               # Optimized MM5 dataloader for aligned RGB-D-T triplets.
-├── models.py                # Dual 'mit_b1' SegFormer encoders, GCMA Fusion, and Latent Predictor.
-├── pyproject.toml           # Project metadata and top-level dependency declarations.
-├── README.md                # Theoretical mapping and hardware defense.
-├── train.py                 # The TMLPN execution engine, VICReg logic, and TTA diagnostics.
-└── uv.lock                  # Deterministic lockfile for exact environment reproduction.
+
+├── assets/                 
+├── dataset.py              
+├── models.py              
+├── pyproject.toml        
+├── README.md               
+├── train.py                
+└── uv.lock                 
 
 ---
 
