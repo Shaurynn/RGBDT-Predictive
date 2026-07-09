@@ -449,7 +449,7 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
                 # Mixed-Precision Engine
                 with autocast(device_type=device.type, dtype=torch.bfloat16):
                     if is_latent_model:
-                        pred_seg, z_pred, z_target = model(rgbd, therm_masked, therm_target)
+                        pred_seg, z_pred, z_target = model(rgbd, therm_masked, therm_target, block_mask)
                         loss_seg = criterion(pred_seg, seg_mask)
                         # FIX: The updated LatentRegularizationLoss now returns a single stabilized scalar
                         loss_phys = latent_criterion(z_pred, z_target)

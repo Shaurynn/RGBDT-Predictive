@@ -81,31 +81,37 @@ class SpatialReductionCrossAttention(nn.Module):
 class SpatialJEPAPredictor(nn.Module):
     """
     A mathematically compliant JEPA Predictor. 
-    Utilizes 2D Positional Encodings and Depthwise Separable Convolutions to spatially 
-    infer masked thermal representations from surrounding contextual geometry.
+    Utilizes 2D Positional Encodings, a learnable MASK token, and Depthwise Separable Convolutions 
+    to selectively infer masked thermal targets from the surrounding contextual geometry.
     """
     def __init__(self, embed_dim, hidden_dim=1024):
         super().__init__()
         self.pos_embed = PositionalEncoding2D(embed_dim)
         
+        # The learnable representation of "missing" physical data
+        self.mask_token = nn.Parameter(torch.zeros(1, embed_dim, 1, 1))
+        
         self.predictor = nn.Sequential(
-            # Spatial Inference via Depthwise 3x3 Convolution
             nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1, groups=embed_dim, bias=False),
             nn.BatchNorm2d(embed_dim),
             nn.GELU(),
-            
-            # Pointwise Expansion
             nn.Conv2d(embed_dim, hidden_dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(hidden_dim),
             nn.GELU(),
-            
-            # Projection back to Target Dimension
             nn.Conv2d(hidden_dim, embed_dim, kernel_size=1)
         )
 
-    def forward(self, context_embedding):
-        # Inject geometry awareness so the convolution knows *where* it is predicting
-        x = self.pos_embed(context_embedding)
+    def forward(self, context_embedding, block_mask):
+        B, C, H, W = context_embedding.shape
+        
+        # Downsample the high-res binary block mask to match the latent feature map dimensions
+        mask_resized = F.interpolate(block_mask, size=(H, W), mode='nearest')
+        
+        # Erase contextual bleed in the masked regions and inject the learnable mask token
+        masked_context = context_embedding * (1.0 - mask_resized) + (self.mask_token * mask_resized)
+        
+        # Inject geometry awareness so the convolution knows *where* the mask tokens are located
+        x = self.pos_embed(masked_context)
         return self.predictor(x)
 
 # ====================================================================================
@@ -178,38 +184,28 @@ class TriModalLatentPredictiveNetwork(nn.Module):
         if hasattr(model, 'stem'): model.stem.proj = new_conv
         else: model.patch_embed1.proj = new_conv
 
-    def forward(self, rgbd, therm_masked, therm_target=None):
-        """
-        The JEPA state machine. 
-        If therm_target is provided, executes the full self-supervised dual-encoder pass.
-        If therm_target is None (Inference/Deployment), bypasses Target Encoder entirely.
-        """
+    def forward(self, rgbd, therm_masked, therm_target=None, block_mask=None):
         # --- 1. CONTEXT ENCODING (The Observable World) ---
         rgbd_features = self.rgbd_encoder(rgbd)
         therm_context_features = self.therm_encoder(therm_masked)
         
-        # Extract the highest semantic level from the hierarchy
         z_rgbd = rgbd_features[-1] 
         z_therm_ctx = therm_context_features[-1]
         
-        # Intermediate Fusion 
         z_context = self.fusion_head(z_rgbd, z_therm_ctx)
         
-        # Downstream Structural Prediction
         seg_logits = self.decode_head(z_context)
-        # Upsample back to native resolution (H, W)
         seg_logits = F.interpolate(seg_logits, size=rgbd.shape[2:], mode='bilinear', align_corners=False)
 
-        # --- 2. DEPLOYMENT SHORT-CIRCUIT ---
-        if therm_target is None:
+        if therm_target is None or block_mask is None:
             return seg_logits
 
-        # --- 3. TARGET ENCODING (The Pristine Physics) ---
-        with torch.no_grad(): # Explicit Stop-Gradient ensures the target encoder is locked
+        # --- 2. TARGET ENCODING (The Pristine Physics) ---
+        with torch.no_grad():
             therm_target_features = self.therm_encoder(therm_target)
             z_target = therm_target_features[-1]
             
-        # --- 4. LATENT INFERENCE ---
-        z_pred = self.latent_predictor(z_context)
+        # --- 3. LATENT INFERENCE (True JEPA Target Selectivity) ---
+        z_pred = self.latent_predictor(z_context, block_mask)
         
         return seg_logits, z_pred, z_target

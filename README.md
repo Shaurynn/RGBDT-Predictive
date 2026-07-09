@@ -64,11 +64,11 @@ While the generative TMPN architecture successfully aligned multimodal features,
 > Figure 1: Comprehensive pipeline of the updated TriModal Latent Predictive Network, detailing the intermediate-fusion SRMA topology, the new Spatial Latent Predictor, and the stabilized VICReg regularization engine.
 The TMLPN formally adapts the Joint-Embedding Predictive Architecture (JEPA) [5] for cross-modal structural evaluation. To ensure rigorous adherence to the theoretical framework and preserve spatial reasoning, the architecture is defined by the following strict topological mappings:
 
- * The Context (x): The observable information the model is permitted to evaluate. In TMLPN, this is the pristine RGB-D geometry tensor combined with an artificially masked Thermal tensor.
- * The Target (y): The uncorrupted physical ground truth the model is attempting to predict. In TMLPN, this is the pristine, unmasked Thermal tensor.
- * The Context Encoder ($E_\theta$): The composite network responsible for processing the observable world. In TMLPN, this comprises the mit_b1 RGB-D encoder, the Thermal encoder processing the masked input, and the Spatial Reduction Modality Attention (SRMA) fusion head that binds them.
- * The Target Encoder ($E_{target}$): The network that generates the "ground truth" latent signature. In TMLPN, this is the isolated Thermal encoder processing the unmasked target tensor, governed by a strict `.detach()` operation to lock the weights during prediction.
- * The Predictor ($P_\phi$): The neural module that infers the Target embedding based solely on the Context embedding. In TMLPN, this is the Spatial Latent Predictor utilizing depthwise separable convolutions and positional encodings to perform genuine spatial inference.
+* The Context (x): The observable information the model is permitted to evaluate. In TMLPN, this is the pristine RGB-D geometry tensor combined with an artificially masked Thermal tensor.
+* The Target (y): The uncorrupted physical ground truth the model is attempting to predict. In TMLPN, this is the pristine, unmasked Thermal tensor.
+* The Context Encoder ($E_\theta$): The composite network responsible for processing the observable world. In TMLPN, this comprises the mit_b1 RGB-D encoder, the Thermal encoder processing the masked input, and the Spatial Reduction Modality Attention (SRMA) fusion head that binds them.
+* The Target Encoder ($E_{target}$): The network that generates the "ground truth" latent signature. In TMLPN, this is the isolated Thermal encoder processing the unmasked target tensor, governed by a strict `.detach()` operation to lock the weights during prediction.
+* The Predictor ($P_\phi$): The neural module that infers the Target embedding based solely on the Context embedding. In TMLPN, this is the Spatial Latent Predictor utilizing depthwise separable convolutions and positional encodings to perform genuine spatial inference.
 
 ### 6.1 The Latent Regularization Engine (The VICReg Triad)
 
@@ -96,34 +96,34 @@ Furthermore, early epochs demonstrated a sharp spike in Covariance (peaking at ~
 > ![TMLPN Optuna Dashboard](assets/Optuna_TMLPN.png)
 > Figure 3: Optuna Parallel Coordinate Plot demonstrating convergence on an aggressive masking ratio of 42.7% during the HPO phase.
 
-### 7.2 Deep Convergence & The Microtune Polish
+### 7.2 Deep Convergence & The Microtune Polish (TBA)
 
 Following a 30-trial Bayesian optimization sweep (using Optuna as shown in Figure 3), the architecture achieved deep convergence during a long-horizon Hero phase. To finalize spatial boundaries, a Microtune phase shifted the learning rate into a microscopic 10⁻⁵ to 10⁻⁷ cooling schedule, anchoring the latent space.
 
 To determine the architectural limits of the MM5 dataset, the training pipeline was executed sequentially across the entire mit Vision Transformer series, from the shallow `mit_b1` through the heavy `mit_b5`.
 
- #### Hero Phase: Global Convergence
- | Architecture | Parameters | Base Validation mIoU | TTA Validation mIoU |
- | :--- | :--- | :--- | :--- |
- | mit_b1 | 13.7M | 0.7311 | 0.7262 |
- | mit_b2 | 24.2M | 0.7531 | 0.7473 |
- | mit_b3 | 44.0M | 0.7923 | 0.7851 |
- | mit_b4 | 60.8M | 0.7896 | 0.7969 |
- | mit_b5 | 81.4M | 0.7829 | 0.7870 |
+#### Hero Phase: Global Convergence
+| Architecture | Parameters | Base Validation mIoU | TTA Validation mIoU |
+| :--- | :--- | :--- | :--- |
+| mit_b1 | 13.7M | 0.7311 | 0.7262 |
+| mit_b2 | 24.2M | 0.7531 | 0.7473 |
+| mit_b3 | 44.0M | 0.7923 | 0.7851 |
+| mit_b4 | 60.8M | 0.7896 | 0.7969 |
+| mit_b5 | 81.4M | 0.7829 | 0.7870 |
 
- #### Microtune Phase: Spatial Boundary Refinement
- | Architecture | Parameters | Base Validation mIoU | TTA Validation mIoU |
- | :--- | :--- | :--- | :--- |
- | mit_b1 | 13.7M | 0.7301 | 0.7265 |
- | mit_b2 | 24.2M | 0.7501 | 0.7444 |
- | mit_b3 | 44.0M | 0.7946 | 0.7866 |
- | mit_b4 | 60.8M | 0.7960 | 0.8014 |
- | mit_b5 | 81.4M | 0.7827 | 0.7865 |
+#### Microtune Phase: Spatial Boundary Refinement
+| Architecture | Parameters | Base Validation mIoU | TTA Validation mIoU |
+| :--- | :--- | :--- | :--- |
+| mit_b1 | 13.7M | 0.7301 | 0.7265 |
+| mit_b2 | 24.2M | 0.7501 | 0.7444 |
+| mit_b3 | 44.0M | 0.7946 | 0.7866 |
+| mit_b4 | 60.8M | 0.7960 | 0.8014 |
+| mit_b5 | 81.4M | 0.7827 | 0.7865 |
 
 > ![TMLPN mIoU metrics](assets/TMLPN_mit_b1-5_mIoU.png)
 > Figure 4: mIoU of the TMLPN Hero and Microtune Phases. The microscopic learning rate gently cools the Covariance and Total Train Loss (top) while the Validation mIoU (bottom) remains highly stable.
 
- ### 7.3 Discussion: Scaling and Multi-Modal Behaviors
+ ### 7.3 Discussion: Scaling and Multi-Modal Behaviors (TBA)
 
  The empirical results across the hierarchical transformer scales reveal critical insights into multi-modal representation learning:
 
@@ -136,9 +136,9 @@ To determine the architectural limits of the MM5 dataset, the training pipeline 
  3. The Microtune Refinement Margin
  The impact of the Microtune phase—using highly decayed learning rates and Dynamic Class-Weighting (DCW)—is heavily dependent on the backbone's starting capacity. For smaller models (`mit_b1`, `mit_b2`), forcing the network to heavily penalize minority class failures slightly destabilized the global representations, causing a negligible drop in overall mIoU. However, the high-capacity `mit_b3` and `mit_b4` models successfully absorbed the DCW penalty, utilizing their deeper feature maps to refine spatial boundaries and push the total mIoU higher.
 
-### 7.4 Explainability: Tightening Spatial Boundaries
+### 7.4 Explainability: Tightening Spatial Boundaries (TBA)
 
-Semantic Grad-CAM and Epistemic Uncertainty mapping applied to identical input geometry at the conclusion of the Microtune run demonstrate razor-sharp, object-centric hotspots.
+Semantic Grad-CAM and Epistemic Uncertainty mapping applied to identical input geometry at the conclusion of the Microtune run demonstrate razor-sharp, object-centric hotspots, refined heavily by the spatial predictor component.
 
 > ![TMLPN Grad-CAM](assets/batch2_img4_class6_gradcam.png)
 >
@@ -148,83 +148,78 @@ Semantic Grad-CAM and Epistemic Uncertainty mapping applied to identical input g
 >
 > Figure 6: The Epistemic Uncertainty map captures the model's spatial hesitation during Test-Time Augmentation (TTA).
 
-### 7.5 Interpreting the Uncertainty Maps: Grid Artifacts & Boundary Hesitation
+### 7.5 Interpreting the Uncertainty Maps: Grid Artifacts & Boundary Hesitation (TBA)
 
 The Epistemic Uncertainty map evaluates cross-modal agreement and spatial confidence by measuring the prediction variance across multiple TTA orientations. The visual artifacts rendered on these maps are highly indicative of the underlying Vision Transformer mechanics:
 
-1. The "Waffle" Pattern: The faint grid structure visible across the heatmap traces the rigid 4x4 patch grid of the mit_b1 backbone. As TTA horizontally and vertically flips the input, the physical features are forced into different patch alignments, causing sub-pixel variance that mathematically highlights the Transformer's internal grid.
+1. The "Waffle" Pattern: The faint grid structure visible across the heatmap traces the rigid 4x4 patch grid of the mit_bx backbone. As TTA horizontally and vertically flips the input, the physical features are forced into different patch alignments, causing sub-pixel variance that mathematically highlights the Transformer's internal grid.
 2. Glowing Object Boundaries: Epistemic uncertainty naturally peaks at the transition points between classes. The intense "halos" hugging the perimeters of defects indicate that the model is highly confident about the interior of the defect, but is hesitating on the microscopic classification of the boundary line during TTA flips.
 3. Corner Flares (Spatial Quantization Error): Bright flares appearing strictly at the 4-way intersections of the patch grid indicate Spatial Quantization Error. The network is fragmenting its attention across four distinct patch tokens to understand a microscopic physical feature (or high-frequency sensor noise), causing the variance to spike at those exact coordinates.
 
 ---
 
- ## 8. Architectural Trade-Offs & Theoretical Defenses
+## 8. Architectural Trade-Offs & Theoretical Defenses
 
- ### 8.1 Intermediate vs. Early Fusion Topology
- A common theoretical critique of multimodal perception engines is the assumption of "early-fusion," where heterogeneous sensors (RGB, Depth, Thermal) are concatenated into a single backbone input. Naive early-fusion ignores the distinct statistical variances of each modality, resulting in catastrophic feature dilution.
+### 8.1 Intermediate vs. Early Fusion Topology
+A common theoretical critique of multimodal perception engines is the assumption of "early-fusion," where heterogeneous sensors (RGB, Depth, Thermal) are concatenated into a single backbone input. Naive early-fusion ignores the distinct statistical variances of each modality, resulting in catastrophic feature dilution.
 
- TMLPN explicitly avoids this by utilizing an intermediate-fusion topology. The RGB-D and Thermal domains are processed by completely isolated Vision Transformer encoders. Before the feature maps are permitted to interact in the fusion head, they pass through independent normalization streams, applying dedicated 1×1 convolutions and 2D Batch Normalization to explicitly balance the statistical variance.
+TMLPN explicitly avoids this by utilizing an intermediate-fusion topology. The RGB-D and Thermal domains are processed by completely isolated Vision Transformer encoders. Before the feature maps are permitted to interact in the fusion head, they pass through independent normalization streams, applying dedicated 1×1 convolutions and 2D Batch Normalization to explicitly balance the statistical variance.
 
- ### 8.2 The Upgraded SRMA vs Global GCMA Bottleneck
- The Critique: Pre-update, the Global Context Modality Attention (GCMA) head pooled spatial information from the thermal modality down to a single global scalar bias. This mathematically destroyed spatial locality for cross-modal interaction, a severe limitation for dense prediction tasks like semantic segmentation.
+### 8.2 The Upgraded SRMA vs Global GCMA Bottleneck
+We redesigned the fusion head from a previous global conditioning mechanism to a Spatial Reduction Modality Attention (SRMA) mechanism. Rather than pooling all spatial information to a $1 \times 1$ vector, we utilize a Spatial Reduction Ratio ($R$) to downsample the Thermal feature map while preserving localized correspondences. This upgrade enables the RGB-D Queries to attend to distinct, localized thermal anomalies, balancing the edge efficiency requirement against the need for high-fidelity spatial awareness. This successfully reductions cross-attention complexity to linear time O(N) while preserving spatial locality for segmentation.
 
- The Defense (Upgraded Architecture): We have entirely redesigned the fusion head from a global conditioning mechanism to a Spatial Reduction Modality Attention (SRMA) mechanism. Rather than pooling all spatial information to a $1 \times 1$ vector, we utilize a Spatial Reduction Ratio ($R$) to downsample the Thermal feature map while preserving localized correspondences. This upgrade enables the RGB-D Queries to attend to distinct, localized thermal anomalies, balancing the edge efficiency requirement against the need for high-fidelity spatial awareness. This successfully reductions cross-attention complexity to linear time O(N) while preserving spatial locality for segmentation.
+Documented Limitation (The Information Bottleneck): With a reduction ratio of R=8, the thermal feature map's information capacity is mathematically reduced by a factor of 64. While the SRMA output is projected back to the original resolution, the true thermal information content remains bounded by the reduced resolution, operating similarly to bilinear upsampling constraints.
 
- ### 8.3 SRMA pooling vs. Latent Perceiver Blocks
- The Upgrade: The new SRMA head replaces standard cross-attention to solve the memory bus bottleneck long beforeGPU ALU limits are reached on shared-memory edge Linux SoCs. The upgraded SRMA head achieves linear runtime O(N) while preserving the high-resolution RGB-D spatial grid as the Queries and pooling the context as spatially reduced Keys/Values, allowing the network to retain the sub-pixel boundary mapping required for structural segmentation.
+### 8.3 Target-Selective Spatial Inductive Biases
+The predictive engine has been upgraded to a mathematically compliant Spatial Latent Predictor. By ingesting the exact binary block mask used on the input data, replacing obscured regions with a learnable `[MASK]` token, and applying 2D Sinusoidal Positional Encodings, the depthwise separable convolutions perform genuine spatial inference—predicting the target block directly from the surrounding context block.
 
- ### 8.4 Spatial Inductive Biases in the JEPA Predictor
- The Critique: The previous "Predictor" was merely a Stack of $1 \times 1$ point-wise Multi-Layer Perceptrons (MLPs). Lacking spatial inductive biases, it was mathematically incapable of spatially predicting masked thermal content from surrounding context. It was merely performing non-linear feature regression, violating a core principle of Joint-Embedding Predictive Architectures (Assran et al. [5]).
+### 8.4 Stop-Gradient Heuristics and Explicit Covariance Regularization
+Many self-supervised frameworks utilize an Exponential Moving Average (EMA) teacher network to prevent representation collapse in the target encoder. TMLPN abandons the EMA framework entirely, utilizing identical shared weights for the Context and Target encoders governed solely by a strict Stop-Gradient (`.detach()`) operation.
 
- The Defense (Upgraded Architecture): We have replaced the $1 \times 1$ MLP stack with a mathematically compliant Spatial Latent Predictor. This upgraded engine incorporates 2D Sinusoidal Positional Encodings to grant the network explicit geometric awareness of where it is predicting. Following this, Depthwise Separable $3 \times 3$ Convolutions replace the point-wise operations, physically allowing the network to "look" at surrounding unmasked context to infer the missing spatial information. This fulfills the key predictive objective of a true JEPA, forecasting missing information over spatially distinct targets rather than merely projecting feature statistics.
+By explicitly enforcing the VICReg constraints, TMLPN proves that mathematically regularizing the variance and covariance of the embedding manifold physically prevents rank collapse. Excision of the EMA teacher network significantly reduces VRAM consumption during training without sacrificing manifold stability.
 
- ### 8.5 Stop-Gradient Heuristics and Explicit Covariance Regularization
- Many self-supervised frameworks utilize an Exponential Moving Average (EMA) teacher network to prevent representation collapse in the target encoder. TMLPN abandons the EMA framework entirely, utilizing identical shared weights for the Context and Target encoders governed solely by a strict Stop-Gradient (`.detach()`) operation.
+### 8.5 Numerical Recalibration of the VICReg Loss
+We have entirely excised brute-force clamping logic. We recalibrated the covariance weight back to standard literature limits (0.01) and injected a mathematical LayerNorm operation immediately prior to the covariance calculation to naturally constrain exponential variance.
 
- By explicitly enforcing the VICReg constraints [6], TMLPN proves that mathematically regularizing the variance and covariance of the embedding manifold physically prevents rank collapse. Excision of the EMA teacher network significantly reduces VRAM consumption during training without sacrificing manifold stability.
+### 8.6 Mitigating Imbalance and Asymptotic Limits (DCW & KD)
+Industrial defect datasets exhibit extreme class imbalance. To overcome this without unbalancing the VICReg latent space, TMLPN utilizes a Dynamic Class-Weighting Schedule (DCW). By tracking an Exponential Moving Average (EMA) of the validation IoU for each class, the downstream Dice penalty is exponentially scaled on the fly specifically for lagging minority classes:
 
- ### 8.6 Numerical Recalibration of the VICReg Loss
- The Critique: The previous configuration set the covariance weight (`cov_weight`) to 15.0, which is several orders of magnitude too large for ImageNet-scale representations, overwhelming the gradient signal and indicating fundamental instability in the loss landscape. To combat this, the pipeline was forced to implement aggressive numerical clamping (`torch.clamp(x, min=-1000.0, max=1000.0)`) and disable mixed precision.
+$$W_c = \text{EMA}\left(W_c, \exp(\tau \cdot (1 - \text{IoU}_c))\right)$$
 
- The Defense (Upgraded Training): We have entirely excised the brute-force clamping logic. Instead, we have recalibrated the `cov_weight` back to standard literature limits (dropping it from 15.0 down to 0.01). To constraint feature statistics naturally, we inject a mathematical LayerNorm operation immediately prior to the covariance calculation. This normalizes the feature statistics mathematically rather than brute-forcing them with gradient clamps. Since the loss landscape is now mathematically stable, we have safely re-enabled the standard PyTorch mixed-precision scaler (`GradScaler(enabled=True)`), leading to faster training times and reduced VRAM overhead.
-
- ### 8.7 Correcting Scientific Terminology
- The Critique: Legacy documentation utilized metaphorical language like "structural thermodynamics" and "physics-aware prediction" without embedding any actual partial differential equations or physical thermodynamic constraints into the loss function.
-
- The Defense (Final Reframing): We have scrubbed metaphorical "thermodynamics" language from this README. The upgraded methodology is reframed correctly as "multi-modal latent feature consistency" and "multi-modal domain manifold traversal," which accurately reflects the data-driven reality of the architecture.
-
- ### 8.8 Mitigating Imbalance and Asymptotic Limits (DCW & KD)
- Industrial defect datasets exhibit extreme class imbalance. To overcome this without unbalancing the VICReg latent space, TMLPN utilizes a Dynamic Class-Weighting Schedule (DCW) [7]. By tracking an Exponential Moving Average (EMA) of the validation IoU for each class, the downstream Dice penalty is exponentially scaled on the fly specifically for lagging minority classes:
-
-$$W_c = EMA( W_c, e^[τ * (1 - IoU_c)] )$$
- To break representational capacity ceilings, the pipeline integrates a Knowledge Distillation (KD) engine [9]. By forcing the lightweight Student to minimize the Kullback-Leibler (KL) Divergence against a massive 82M-parameter Teacher's soft probabilities ("Dark Knowledge"), the edge-deployed model inherits advanced stochastic noise suppression while perfectly retaining its 14M-parameter high-speed footprint.
+To break representational capacity ceilings, the pipeline integrates a Knowledge Distillation (KD) engine. By forcing the lightweight Student to minimize the Kullback-Leibler (KL) Divergence against a massive 82M-parameter Teacher's soft probabilities ("Dark Knowledge"), the edge-deployed model inherits advanced stochastic noise suppression while perfectly retaining its 14M-parameter high-speed footprint.
 
 $$L_{KD} = \tau^2 \text{KL}\left( \sigma\left(\frac{z_{student}}{\tau}\right) \parallel \sigma\left(\frac{z_{teacher}}{\tau}\right) \right)$$
 
- ---
+### 8.7 Future Work: Systematic Ablation Studies
+To definitively quantify the independent contributions of this architecture, future work includes comprehensive ablation studies evaluating:
+1. The impact of varying SRMA reduction ratios (R=4, 8, 16) on the thermal information bottleneck.
+2. Joint-training interference (Segmentation loss vs. isolated VICReg pre-training).
+3. Thermal modality contribution vs. RGB-D baselines.
 
- ## 9. Key Concepts & Technical Glossary
+---
 
- For researchers and engineers adapting this repository, the architecture relies heavily on the following foundational concepts:
+## 9. Key Concepts & Technical Glossary
 
- * Joint-Embedding Predictive Architectures (JEPA): A self-supervised paradigm that forces a Context Encoder and a Target Encoder to align their outputs in an abstract latent space, now fully implemented via spatial prediction. (Meta AI: I-JEPA)
- * VICReg (Variance-Invariance-Covariance): The mathematical regularization triad used to physically stabilize the latent manifold without an EMA teacher network, preventing representation collapse. (VICReg Paper)
- * Hierarchical Vision Transformers (SegFormer): The underlying architecture of the modality-isolated encoders, utilizing an overlap-patching mechanism to process high-resolution geometry without losing 2D grid structure. (SegFormer Paper)
- * Depthwise Separable Convolutions & 2D Positional Encodings: The core components of the new Spatial Latent Predictor, enabling genuine geometric aware spatial inference.
- * Spatial Reduction Modality Attention (SRMA): The updated fusion head that reduction the cross-attention O(N²) bottleneck to linear runtime O(N) by spatially downsampling the Key/Value modality while preserving localized correspondences.
- * Knowledge Distillation (KL Divergence): The model compression strategy used to transfer the complex inter-class similarities of a massive workstation model into a lightweight edge-deployable footprint. (Distilling Knowledge)
- * Test-Time Augmentation (TTA) Uncertainty: The mathematical evaluation of spatial hesitation and out-of-distribution (OOD) anomalies by measuring prediction variance across augmented orientations. (Bayesian Deep Learning Uncertainties)
- * ONNX Opset 18: The required graph compilation protocol that natively preserves dynamic tensor operations (like spatial reduction axes) for clean TensorRT transitions. (ONNX Concepts)
+For researchers and engineers adapting this repository, the architecture relies heavily on the following foundational concepts:
 
- ---
+* Joint-Embedding Predictive Architectures (JEPA): A self-supervised paradigm that forces a Context Encoder and a Target Encoder to align their outputs in an abstract latent space, now fully implemented via spatial prediction. (Meta AI: I-JEPA)
+* VICReg (Variance-Invariance-Covariance): The mathematical regularization triad used to physically stabilize the latent manifold without an EMA teacher network, preventing representation collapse. (VICReg Paper)
+* Hierarchical Vision Transformers (SegFormer): The underlying architecture of the modality-isolated encoders, utilizing an overlap-patching mechanism to process high-resolution geometry without losing 2D grid structure. (SegFormer Paper)
+* Depthwise Separable Convolutions & 2D Positional Encodings: The core components of the new Spatial Latent Predictor, enabling genuine geometric aware spatial inference.
+* Spatial Reduction Modality Attention (SRMA): The updated fusion head that reduction the cross-attention O(N²) bottleneck to linear runtime O(N) by spatially downsampling the Key/Value modality while preserving localized correspondences.
+* Knowledge Distillation (KL Divergence): The model compression strategy used to transfer the complex inter-class similarities of a massive workstation model into a lightweight edge-deployable footprint. (Distilling Knowledge)
+* Test-Time Augmentation (TTA) Uncertainty: The mathematical evaluation of spatial hesitation and out-of-distribution (OOD) anomalies by measuring prediction variance across augmented orientations. (Bayesian Deep Learning Uncertainties)
+* ONNX Opset 18: The required graph compilation protocol that natively preserves dynamic tensor operations (like spatial reduction axes) for clean TensorRT transitions. (ONNX Concepts)
 
- ## 10. Conclusion & Edge Deployment
+---
 
- By abandoning pixel-space generation, the TriModal Latent Predictive Network establishes a vastly more efficient methodology for multimodal defect detection. The empirical scaling behavior dictates a highly specific deployment strategy to balance maximum predictive fidelity against strict edge hardware constraints.
+## 10. Conclusion & Edge Deployment
 
- The `mit_b4` architecture represents the undeniable peak of this pipeline. Achieving over 80% mIoU, it serves as the ultimate offline "Teacher" network, perfectly capturing complex non-linear thermal manifolds from RGB-D inputs. However, its 60.8M parameter mass is too intensive for real-time robotic inference.
+By abandoning pixel-space generation, the TriModal Latent Predictive Network establishes a vastly more efficient methodology for multimodal defect detection. The empirical scaling behavior dictates a highly specific deployment strategy to balance maximum predictive fidelity against strict edge hardware constraints.
 
- To achieve true edge autonomy, we utilize the lightweight `mit_b1` backbone (13.7M parameters) as the active "Student." Utilizing Knowledge Distillation, we transfer the inter-class dark knowledge from the `mit_b4` Teacher down into the `mit_b1` framework. For isolated industrial deployment, this optimized asymmetric graph is serialized to an ONNX artifact (opset_version=18). By deploying this distilled TensorRT engine onto a Jetson Orin Nano functioning as a companion computer aboard a UAV or rover, the system achieves sub-pixel structural segmentation and real-time autonomous thermal predictions directly at the sensor source.
+The `mit_b4` architecture represents the undeniable peak of this pipeline. Achieving over 80% mIoU, it serves as the ultimate offline "Teacher" network, perfectly capturing complex non-linear thermal manifolds from RGB-D inputs. However, its 60.8M parameter mass is too intensive for real-time robotic inference.
+
+To achieve true edge autonomy, we utilize the lightweight `mit_b1` backbone (13.7M parameters) as the active "Student." Utilizing Knowledge Distillation, we transfer the inter-class dark knowledge from the `mit_b4` Teacher down into the `mit_b1` framework. For isolated industrial deployment, this optimized asymmetric graph is serialized to an ONNX artifact (opset_version=18). By deploying this distilled TensorRT engine onto a Jetson Orin Nano functioning as a companion computer aboard a UAV or rover, the system achieves sub-pixel structural segmentation and real-time autonomous thermal predictions directly at the sensor source.
 
 ---
 
