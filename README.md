@@ -120,7 +120,7 @@ To determine the architectural limits of the MM5 dataset, the training pipeline 
  | mit_b4 | 60.8M | 0.7960 | 0.8014 |
  | mit_b5 | 81.4M | 0.7827 | 0.7865 |
 
-> ![TMLPN Microtune Dynamics](assets/TMLPN_mit_b1-5_mIoU.png)
+> ![TMLPN mIoU metrics](assets/TMLPN_mit_b1-5_mIoU.png)
 > Figure 4: mIoU of the TMLPN Hero and Microtune Phases. The microscopic learning rate gently cools the Covariance and Total Train Loss (top) while the Validation mIoU (bottom) remains highly stable.
 
  ### 7.3 Discussion: Scaling and Multi-Modal Behaviors
@@ -140,8 +140,9 @@ To determine the architectural limits of the MM5 dataset, the training pipeline 
 
 Semantic Grad-CAM and Epistemic Uncertainty mapping applied to identical input geometry at the conclusion of the Microtune run demonstrate razor-sharp, object-centric hotspots.
 
-> ![TMLPN Microtune Grad-CAM](assets/batch2_img4_class6_gradcam.png) 
-> ![TMLPN Microtune Epistemic Uncertainty](assets/batch2_img4_epistemic_uncertainty.png) 
+> ![TMLPN Grad-CAM](assets/batch2_img4_class6_gradcam.png) 
+> ![TMLPN Epistemic Uncertainty](assets/batch2_img4_epistemic_uncertainty.png) 
+
 > Figure 5: Final TMLPN Diagnostics. Top: The Grad-CAM heatmap reveals object-centric hotspots that strictly adhere to physical mass. Bottom: The Epistemic Uncertainty map captures the model's spatial hesitation during Test-Time Augmentation (TTA).
 
 ### 7.5 Interpreting the Uncertainty Maps: Grid Artifacts & Boundary Hesitation
