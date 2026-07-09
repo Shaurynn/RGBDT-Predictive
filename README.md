@@ -104,10 +104,15 @@ The isolated, finetuned architecture is optimized and serialized to an ONNX arti
 ## References
 
 [1] Vaswani, A., et al. (2017). Attention Is All You Need. NeurIPS.
+
 [2] Xie, E., et al. (2021). SegFormer: Simple and Efficient Design for Semantic Segmentation with Transformers. NeurIPS.
+
 [3] Sudre, C. H., et al. (2017). Generalised Dice overlap as a deep learning loss function for highly unbalanced segmentations. DLMIA.
+
 [4] Assran, M., et al. (2023). Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture. CVPR.
+
 [5] Huang, Y., et al. (2020). Dynamic Weighting for Imbalanced Semantic Segmentation.
+
 [6] Hinton, G., Vinyals, O., & Dean, J. (2015). Distilling the Knowledge in a Neural Network. NIPS Deep Learning Workshop.
 
 ---
