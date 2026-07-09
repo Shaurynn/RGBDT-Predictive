@@ -10,3 +10,4 @@ documents/
 __pycache__/
 .vscode/
 configs/
+dataset/
