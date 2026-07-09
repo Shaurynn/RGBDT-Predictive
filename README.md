@@ -141,9 +141,10 @@ To determine the architectural limits of the MM5 dataset, the training pipeline 
 Semantic Grad-CAM and Epistemic Uncertainty mapping applied to identical input geometry at the conclusion of the Microtune run demonstrate razor-sharp, object-centric hotspots.
 
 > ![TMLPN Grad-CAM](assets/batch2_img4_class6_gradcam.png) 
-> ![TMLPN Epistemic Uncertainty](assets/batch2_img4_epistemic_uncertainty.png) 
+> Figure 5: The Grad-CAM heatmap reveals object-centric hotspots that strictly adhere to physical mass. 
 
-> Figure 5: Final TMLPN Diagnostics. Top: The Grad-CAM heatmap reveals object-centric hotspots that strictly adhere to physical mass. Bottom: The Epistemic Uncertainty map captures the model's spatial hesitation during Test-Time Augmentation (TTA).
+> ![TMLPN Epistemic Uncertainty](assets/batch2_img4_epistemic_uncertainty.png) 
+> Figure 6: The Epistemic Uncertainty map captures the model's spatial hesitation during Test-Time Augmentation (TTA).
 
 ### 7.5 Interpreting the Uncertainty Maps: Grid Artifacts & Boundary Hesitation
 
