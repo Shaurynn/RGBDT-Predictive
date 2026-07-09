@@ -60,7 +60,7 @@ While the generative TMPN architecture successfully aligned multimodal features,
 
 ## 5. Mathematical Mapping to the JEPA Framework
 
-> ![TMLPN Architecture](assets/TMLPN_Architecture_Diagram_v02.jpg)
+> ![TMLPN Architecture](assets/TMLPN_Architecture_Diagram.jpg)
 > Figure 1: Comprehensive pipeline of the updated TriModal Latent Predictive Network, detailing the intermediate-fusion SRMA topology, the new Spatial Latent Predictor, and the stabilized VICReg regularization engine.
 The TMLPN formally adapts the Joint-Embedding Predictive Architecture (JEPA) [5] for cross-modal structural evaluation. To ensure rigorous adherence to the theoretical framework and preserve spatial reasoning, the architecture is defined by the following strict topological mappings:
 
