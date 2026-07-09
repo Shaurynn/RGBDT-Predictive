@@ -10,36 +10,38 @@ import segmentation_models_pytorch as smp
 
 class PositionalEncoding2D(nn.Module):
     """
-    Injects spatial awareness into the latent manifold. 
-    Critical for JEPA predictors to understand geometric relationships when inferring masked regions.
+    Injects spatial awareness via concatenated feature mapping to preserve directional specificity.
     """
     def __init__(self, channels):
         super().__init__()
         self.channels = channels
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, channels, 2).float() / channels))
+        # Half channels for X, half for Y to maintain dimension stability upon concatenation
+        half_dim = channels // 2
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, half_dim, 2).float() / half_dim))
         self.register_buffer('inv_freq', inv_freq)
+        
+        # Projection layer to fuse the concatenated positional features back to the target embedding dimension
+        self.proj = nn.Conv2d(channels * 2, channels, kernel_size=1, bias=False)
 
     def forward(self, tensor):
         B, C, H, W = tensor.shape
         pos_x = torch.arange(W, device=tensor.device).type(self.inv_freq.type())
         pos_y = torch.arange(H, device=tensor.device).type(self.inv_freq.type())
 
-        # Generate frequencies for each axis
-        sin_inp_x = torch.einsum("i,j->ij", pos_x, self.inv_freq) # [W, C/2]
-        sin_inp_y = torch.einsum("i,j->ij", pos_y, self.inv_freq) # [H, C/2]
+        sin_inp_x = torch.einsum("i,j->ij", pos_x, self.inv_freq)
+        sin_inp_y = torch.einsum("i,j->ij", pos_y, self.inv_freq)
 
-        # 1. Create the base X and Y embeddings: Shape [W, C] and [H, C]
         emb_x = torch.cat((sin_inp_x.sin(), sin_inp_x.cos()), dim=-1) 
         emb_y = torch.cat((sin_inp_y.sin(), sin_inp_y.cos()), dim=-1)
         
-        # 2. Correctly align and broadcast to a shared [H, W, C] spatial grid
-        emb_x = emb_x.unsqueeze(0).expand(H, W, C) # Broadcast X across the height
-        emb_y = emb_y.unsqueeze(1).expand(H, W, C) # Broadcast Y across the width
+        emb_x = emb_x.unsqueeze(0).expand(H, W, -1) 
+        emb_y = emb_y.unsqueeze(1).expand(H, W, -1) 
         
-        # 3. Sum the frequencies, permute to [C, H, W], and broadcast to the Batch size
-        emb = (emb_x + emb_y).permute(2, 0, 1).unsqueeze(0).expand(B, C, H, W)
+        # Concatenate X and Y, reshape to [B, C, H, W]
+        emb = torch.cat([emb_x, emb_y], dim=-1).permute(2, 0, 1).unsqueeze(0).expand(B, -1, H, W)
         
-        return tensor + emb
+        # Concatenate positional embeddings with features and project back to original dimensions
+        return self.proj(torch.cat([tensor, emb], dim=1))
 
 # ====================================================================================
 # --- 2. FUSION & PREDICTION HEADS ---
@@ -87,21 +89,24 @@ class SpatialReductionCrossAttention(nn.Module):
 
 class SpatialJEPAPredictor(nn.Module):
     """
-    A mathematically compliant JEPA Predictor. 
-    Utilizes 2D Positional Encodings, a learnable MASK token, and Depthwise Separable Convolutions 
-    to selectively infer masked thermal targets from the surrounding contextual geometry.
+    A mathematically compliant Predictor. 
+    Utilizes stacked Depthwise Separable Convolutions to expand the receptive field 
+    to 5x5, allowing deeper spatial context to inform the masked region inference.
     """
     def __init__(self, embed_dim, hidden_dim=1024):
         super().__init__()
         self.pos_embed = PositionalEncoding2D(embed_dim)
-        
-        # The learnable representation of "missing" physical data
         self.mask_token = nn.Parameter(torch.zeros(1, embed_dim, 1, 1))
         
         self.predictor = nn.Sequential(
+            # Stacked 3x3 Depthwise Convolutions expand effective receptive field to 5x5
             nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1, groups=embed_dim, bias=False),
             nn.BatchNorm2d(embed_dim),
             nn.GELU(),
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, padding=1, groups=embed_dim, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.GELU(),
+            # Pointwise Expansion
             nn.Conv2d(embed_dim, hidden_dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(hidden_dim),
             nn.GELU(),
@@ -110,20 +115,12 @@ class SpatialJEPAPredictor(nn.Module):
 
     def forward(self, context_embedding, block_mask):
         B, C, H, W = context_embedding.shape
-        
-        # FIX: Dimensional Safeguard. Ensure the mask is a 4D float tensor [B, C, H, W]
-        # before pushing it through the interpolation engine.
-        if block_mask.dim() == 3:
-            block_mask = block_mask.unsqueeze(1)
+        if block_mask.dim() == 3: block_mask = block_mask.unsqueeze(1)
         block_mask = block_mask.float()
         
-        # Downsample the high-res binary block mask to match the latent feature map dimensions
         mask_resized = F.interpolate(block_mask, size=(H, W), mode='nearest')
-        
-        # Erase contextual bleed in the masked regions and inject the learnable mask token
         masked_context = context_embedding * (1.0 - mask_resized) + (self.mask_token * mask_resized)
         
-        # Inject geometry awareness so the convolution knows *where* the mask tokens are located
         x = self.pos_embed(masked_context)
         return self.predictor(x)
 

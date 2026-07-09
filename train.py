@@ -470,8 +470,8 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
                     if is_latent_model:
                         pred_seg, z_pred, z_target = model(rgbd, therm_masked, therm_target, block_mask)
                         loss_seg = criterion(pred_seg, seg_mask)
-                        # FIX: The updated LatentRegularizationLoss now returns a single stabilized scalar
-                        loss_phys = latent_criterion(z_pred, z_target)
+                        # FIX: Unpack the 4-tuple returned by the updated LatentRegularizationLoss
+                        loss_phys, _, _, _ = latent_criterion(z_pred, z_target)
                         loss = loss_seg + (alpha * loss_phys)
                     else:
                         # Legacy Generative TMPN logic (preserved)
@@ -698,8 +698,8 @@ def main():
             rgbd, therm_masked = batch['rgbd'].to(DEVICE), batch['therm_masked'].to(DEVICE)
             therm_target, seg_mask, block_mask = batch['therm_target'].to(DEVICE), batch['seg_mask'].to(DEVICE), batch['block_mask'].to(DEVICE)
             
-            optimizer.zero_grad()
-            # FIX: Set dtype to torch.bfloat16
+            optimizer.zero_grad(set_to_none=True)
+            
             with autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
                 if is_latent_model:
                     pred_seg, z_pred, z_target = model(rgbd, therm_masked, therm_target, block_mask)
@@ -713,20 +713,18 @@ def main():
                     loss_phys = masked_mse_loss(pred_therm, therm_target, block_mask)
                     loss = loss_seg + (alpha * loss_phys) + (beta * criterion(aux_therm_seg, seg_mask))
                 
-                # Apply Knowledge Distillation Soft Targets
                 if teacher_model is not None:
                     with torch.no_grad():
                         teacher_outputs = teacher_model(rgbd, therm_masked)
-                        # Standardize extraction to prevent KL Divergence crash
                         teacher_seg = teacher_outputs[0] if isinstance(teacher_outputs, tuple) else teacher_outputs
                     
                     loss_kd = knowledge_distillation_loss(pred_seg, teacher_seg, temperature=args.kd_temp)
                     loss = (1 - args.kd_alpha) * loss + (args.kd_alpha * loss_kd)
                     train_kd_loss += loss_kd.item()
                     
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            # Explicit standard backpropagation (BFloat16 natively handles dynamic range)
+            loss.backward()
+            optimizer.step()
             
             train_loss += loss.item()
             train_seg_loss += loss_seg.item()
@@ -742,22 +740,23 @@ def main():
         scheduler.step()
         
         # --------------------------------------------------------------------------------
-        # VALIDATION EVALUATION
+        # VALIDATION EVALUATION (Optimized VRAM Transfers)
         # --------------------------------------------------------------------------------
         model.eval()
         val_loss, batches = 0.0, 0
         val_iou_tracker = IoUMetric(NUM_CLASSES, DEVICE)
         with torch.no_grad():
             for batch in eval_loader:
+                # Load strictly what is required for inference
                 rgbd, therm_masked = batch['rgbd'].to(DEVICE), batch['therm_masked'].to(DEVICE)
-                therm_target, seg_mask, block_mask = batch['therm_target'].to(DEVICE), batch['seg_mask'].to(DEVICE), batch['block_mask'].to(DEVICE)
+                seg_mask = batch['seg_mask'].to(DEVICE)
                 
-                # FIX: Set dtype to torch.bfloat16
                 with autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
                     if is_latent_model:
                         pred_seg = model(rgbd, therm_masked) 
                         loss = criterion(pred_seg, seg_mask)
                     else:
+                        therm_target, block_mask = batch['therm_target'].to(DEVICE), batch['block_mask'].to(DEVICE)
                         pred_seg, pred_therm = model(rgbd, therm_masked)
                         loss = criterion(pred_seg, seg_mask) + (alpha * masked_mse_loss(pred_therm, therm_target, block_mask))
                     
