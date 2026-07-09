@@ -77,6 +77,7 @@ Because the Target Encoder is locked via a Stop-Gradient, the network must be ph
 * Similarity Loss (Invariance): The primary MSE objective. Forces the prediction of the Context Encoder to match the Target Encoder's output.
 * Variance Loss (Anti-Collapse): A hinge loss enforcing standard deviation ≥ 1.0 across the predicted latent batch, preventing points from collapsing into a singularity.
 * Covariance Loss (The Decorrelator): Penalizes off-diagonal elements in the covariance matrix, forcing all 512 channels of the backbone to learn unique, orthogonal features [6].
+
 $$L_{cov} = \frac{1}{C} \sum_{i \neq j} \left( \frac{Z_i^T Z_j}{N-1} \right)^2$$
 
 ---
@@ -139,8 +140,8 @@ To determine the architectural limits of the MM5 dataset, the training pipeline 
 
 Semantic Grad-CAM and Epistemic Uncertainty mapping applied to identical input geometry at the conclusion of the Microtune run demonstrate razor-sharp, object-centric hotspots.
 
-> ![TMLPN Microtune Grad-CAM](assets/batch2_img4_class6_gradcam.png)
-> ![TMLPN Microtune Epistemic Uncertainty](assets/batch2_img4_epistemic_uncertainty.png)
+> ![TMLPN Microtune Grad-CAM](assets/batch2_img4_class6_gradcam.png) 
+> ![TMLPN Microtune Epistemic Uncertainty](assets/batch2_img4_epistemic_uncertainty.png) 
 > Figure 5: Final TMLPN Diagnostics. Top: The Grad-CAM heatmap reveals object-centric hotspots that strictly adhere to physical mass. Bottom: The Epistemic Uncertainty map captures the model's spatial hesitation during Test-Time Augmentation (TTA).
 
 ### 7.5 Interpreting the Uncertainty Maps: Grid Artifacts & Boundary Hesitation
@@ -181,6 +182,7 @@ Industrial defect datasets exhibit extreme class imbalance. To overcome this wit
 $$W_c = EMA( W_c, e^[τ * (1 - IoU_c)] )$$ 
 
 To break representational capacity ceilings, the pipeline integrates a Knowledge Distillation (KD) engine [9]. By forcing the lightweight Student to minimize the Kullback-Leibler (KL) Divergence against a massive 82M-parameter Teacher's soft probabilities ("Dark Knowledge"), the edge-deployed model inherits advanced stochastic noise suppression while perfectly retaining its 14M-parameter high-speed footprint.
+
 $$L_{KD} = \tau^2 \text{KL}\left( \sigma\left(\frac{z_{student}}{\tau}\right) \parallel \sigma\left(\frac{z_{teacher}}{\tau}\right) \right)$$
 
 ---
