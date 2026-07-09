@@ -99,53 +99,54 @@ def masked_mse_loss(preds, targets, mask):
 
 class LatentRegularizationLoss(nn.Module):
     """
-    The VICReg Triad (Variance-Invariance-Covariance).
-    Physically prevents representation collapse in the latent space.
+    The mathematically stabilized VICReg Triad.
+    Physically prevents Representation Collapse without using an EMA teacher.
     """
-    def __init__(self, sim_weight=25.0, var_weight=25.0, cov_weight=15.0):
+    def __init__(self, sim_weight=25.0, var_weight=25.0, cov_weight=0.01, eps=1e-4):
         super().__init__()
         self.sim_weight = sim_weight
         self.var_weight = var_weight
-        self.cov_weight = cov_weight
-
-    def forward(self, z_pred, z_target):
-        B, C, H, W = z_pred.shape
-        
-        # UPCAST FIX: Flatten spatial dimensions and force FP32.
-        x = z_pred.permute(0, 2, 3, 1).reshape(-1, C).float()
-        y = z_target.permute(0, 2, 3, 1).reshape(-1, C).float()
-
-        # DEFUSE THE EXPLOSION: Hard-clamp the latent space to prevent 
-        # deep-backbone variance from exceeding limits when squared.
-        x = torch.clamp(x, min=-1000.0, max=1000.0)
-        y = torch.clamp(y, min=-1000.0, max=1000.0)
-
-        # 1. Invariance (Similarity)
-        sim_loss = F.mse_loss(x, y)
-        
-        # 2. Variance (Anti-Collapse)
-        std_x = torch.sqrt(x.var(dim=0) + 1e-4)
-        std_y = torch.sqrt(y.var(dim=0) + 1e-4)
-        var_loss = torch.mean(F.relu(1 - std_x)) + torch.mean(F.relu(1 - std_y))
-
-        # 3. Covariance (Decorrelation)
-        x_centered = x - x.mean(dim=0)
-        y_centered = y - y.mean(dim=0)
-        
-        cov_x = (x_centered.T @ x_centered) / (x.shape[0] - 1)
-        cov_y = (y_centered.T @ y_centered) / (y.shape[0] - 1)
-        
-        # FIX: Changed in-place .pow_(2) to .pow(2) for gradient safety
-        cov_loss = (self.off_diagonal(cov_x).pow(2).sum() / C) + (self.off_diagonal(cov_y).pow(2).sum() / C)
-        
-        total_latent_loss = (self.sim_weight * sim_loss) + (self.var_weight * var_loss) + (self.cov_weight * cov_loss)
-        
-        return total_latent_loss, sim_loss, var_loss, cov_loss
+        self.cov_weight = cov_weight # Reduced to standard academic ranges (0.01)
+        self.eps = eps
 
     def off_diagonal(self, x):
         n, m = x.shape
         assert n == m
         return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
+    def forward(self, z_pred, z_target):
+        B, C, H, W = z_pred.shape
+        N = B * H * W
+        
+        # Flatten spatial dimensions: [N, C]
+        z_pred = z_pred.permute(0, 2, 3, 1).reshape(N, C)
+        z_target = z_target.permute(0, 2, 3, 1).reshape(N, C)
+
+        # 1. Invariance (Similarity) Loss
+        sim_loss = F.mse_loss(z_pred, z_target)
+
+        # 2. Mathematical Bounding via LayerNorm
+        # Explicitly prevents exponential variance, allowing us to remove torch.clamp()
+        z_pred_norm = F.layer_norm(z_pred, (C,))
+        z_target_norm = F.layer_norm(z_target, (C,))
+
+        # Mean-centering
+        z_pred_centered = z_pred_norm - z_pred_norm.mean(dim=0)
+        z_target_centered = z_target_norm - z_target_norm.mean(dim=0)
+
+        # 3. Variance Loss
+        std_pred = torch.sqrt(z_pred_centered.var(dim=0) + self.eps)
+        std_target = torch.sqrt(z_target_centered.var(dim=0) + self.eps)
+        var_loss = torch.mean(F.relu(1.0 - std_pred)) + torch.mean(F.relu(1.0 - std_target))
+
+        # 4. Covariance Loss (Decorrelator)
+        cov_pred = (z_pred_centered.T @ z_pred_centered) / (N - 1)
+        cov_target = (z_target_centered.T @ z_target_centered) / (N - 1)
+        
+        cov_loss = (self.off_diagonal(cov_pred).pow(2).sum() / C) + \
+                   (self.off_diagonal(cov_target).pow(2).sum() / C)
+
+        return (self.sim_weight * sim_loss) + (self.var_weight * var_loss) + (self.cov_weight * cov_loss)
 
 def knowledge_distillation_loss(student_logits, teacher_logits, temperature=4.0):
     """
@@ -434,9 +435,8 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
         # HPO FIX: Explicitly push dynamically created loss modules to the device
         criterion = FocalDiceLoss(num_classes, gamma=gamma, dice_weight=dice).to(device)
         latent_criterion = LatentRegularizationLoss().to(device)
-        
-        # FIX: Disable GradScaler when using bfloat16 to prevent artificial gradient explosion
-        scaler = GradScaler(device.type, enabled=False)
+
+        scaler = GradScaler(device.type, enabled=True)
         
         best_miou = 0.0
         for epoch in range(30): 
@@ -446,19 +446,22 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
                 therm_target, seg_mask, block_mask = batch['therm_target'].to(device), batch['seg_mask'].to(device), batch['block_mask'].to(device)
 
                 optimizer.zero_grad()
-                # FIX: Set dtype to torch.bfloat16
+                # Mixed-Precision Engine
                 with autocast(device_type=device.type, dtype=torch.bfloat16):
                     if is_latent_model:
                         pred_seg, z_pred, z_target = model(rgbd, therm_masked, therm_target)
                         loss_seg = criterion(pred_seg, seg_mask)
-                        loss_phys, _, _, _ = latent_criterion(z_pred, z_target)
+                        # FIX: The updated LatentRegularizationLoss now returns a single stabilized scalar
+                        loss_phys = latent_criterion(z_pred, z_target)
                         loss = loss_seg + (alpha * loss_phys)
                     else:
+                        # Legacy Generative TMPN logic (preserved)
                         pred_seg, pred_therm, aux_therm_seg = model(rgbd, therm_masked)
                         loss_seg = criterion(pred_seg, seg_mask)
                         loss_phys = masked_mse_loss(pred_therm, therm_target, block_mask)
                         loss = loss_seg + (alpha * loss_phys) + (beta * criterion(aux_therm_seg, seg_mask))
                         
+                # Standard scaled backpropagation
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -471,6 +474,8 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
                     rgbd, therm_masked, seg_mask = batch['rgbd'].to(device), batch['therm_masked'].to(device), batch['seg_mask'].to(device)
                     # FIX: Set dtype to torch.bfloat16
                     with autocast(device_type=device.type, dtype=torch.bfloat16):
+                        # By passing only rgbd and therm_masked, therm_target defaults to None, 
+                        # cleanly bypassing the Target Encoder during inference.
                         outputs = model(rgbd, therm_masked)
                         logits = outputs if not isinstance(outputs, tuple) else outputs[0]
                     val_iou_tracker.update(logits, seg_mask)
