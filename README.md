@@ -246,8 +246,10 @@ If you utilize this pipeline, the underlying architecture, or the data, please c
 
 Primary Publication:
 > Brenner, M., Reyes, N. H., Susnjak, T., & Barczak, A. L. C. (2026). MM5: Multimodal image capture and dataset generation for RGB, depth, thermal, UV, and NIR. Information Fusion, 126, 103516.
+
 > DOI: https:doi.org/10.1016/j.inffus.2025.103516
 
 Dataset:
 > Brenner, M., Reyes, N., Susnjak, T., & Barczak, A. (2025). MM5: Multimodal Image Dataset. figshare. Dataset.
+
 > DOI: https:doi.org/10.6084/m9.figshare.28722164
