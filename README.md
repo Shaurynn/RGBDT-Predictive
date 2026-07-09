@@ -1,13 +1,13 @@
 # TriModal Perception Architectures for Structural Defect Detection: The MM-JEPA Paradigm
 
 Abstract
-Structural defect detection in industrial and agricultural environments requires robust multimodal integration. In this repository, we document the evolution of spatial perception engines for RGB, Depth, and Thermal sensors—captured via specialized Baumer GigE sensor arrays—built upon a patched `mit_b1` Vision Transformer backbone. Recognizing the theoretical limitations of pixel-space generative networks, this architecture introduces the Multimodal Joint-Embedding Predictive Architecture (MM-JEPA). By decoupling representation learning from downstream segmentation, the framework utilizes pure self-supervised prediction in the latent space to build a robust structural foundation model. This allows for rapid supervised fine-tuning and deployment on edge computational devices.
+Structural defect detection in industrial and agricultural environments requires robust multimodal integration. In this repository, we document the evolution of spatial perception engines for RGB, Depth, and Thermal sensors built upon a patched `mit_b1` Vision Transformer backbone. Recognizing the theoretical limitations of pixel-space generative networks, this architecture introduces the Multimodal Joint-Embedding Predictive Architecture (MM-JEPA). By decoupling representation learning from downstream segmentation, the framework utilizes pure self-supervised prediction in the latent space to build a robust structural foundation model. This allows for rapid supervised fine-tuning and deployment on edge computational devices.
 
 ---
 
 ## 1. Introduction
 
-The integration of high-resolution, unaligned multimodal sensors poses a unique challenge. Early iterations of this architecture utilized generative pixel-space decoders for thermal representation. However, reconstructing pixel-space values forces the network to map irrelevant high-frequency noise, leading to mathematical instability. To address this, we transitioned to Latent Space Prediction, building upon recent advancements in self-supervised architectures (e.g., Meta AI's I-JEPA). This repository completely deprecates the legacy generative network in favor of a 2-Phase MM-JEPA paradigm, executing genuine target-selective spatial inference via pure mathematical modeling.
+The integration of high-resolution, unaligned multimodal sensors poses a unique challenge. Early iterations of this architecture utilized generative pixel-space decoders. However, reconstructing pixel-space values forces the network to map irrelevant high-frequency noise. To address this, we transitioned to Latent Space Prediction, building upon recent advancements in self-supervised architectures (e.g., Meta AI's I-JEPA). This repository completely deprecates the legacy generative network in favor of a 2-Phase MM-JEPA paradigm, executing genuine target-selective spatial inference via mathematically rigorous spatial constraints.
 
 ---
 
@@ -22,7 +22,6 @@ To ensure strict academic reproducibility of our evaluation benchmarks, all nece
 ---
 
 ## 3. Core Repository Structure
-
 ```
 RGBDT-Predictive/
 ├── assets/
@@ -45,17 +44,26 @@ To build a true foundation model of the physical environment, the network must d
 
 To satisfy the theoretical mandates of the Joint-Embedding Predictive Architecture, the network executes the following mathematical constraints:
 
-* **Unified Same-Modal Inference:** The Context and Target Encoders operate on identical architectural modalities. The Baumer GigE sensor streams (RGB, Depth, Thermal) are fused into a unified 5-channel block. The network is forced to predict masked properties from the *same* multimodal manifold.
-* **The Information Bottleneck:** The Predictor module is explicitly isolated from the block mask tensor. It infers the missing spatial data relying strictly on the context latent space and pure additive 2D Positional Encodings, guaranteeing that the network does not receive the "answer key" prior to inference.
-* **EMA Momentum Teacher:** The framework prevents Representation Collapse without relying on loss regularizers. The Target Encoder is governed strictly by an Exponential Moving Average (EMA) update schedule, maintaining a smooth, historically stable target manifold.
+* **Unified Same-Modal Inference:** The Context and Target Encoders operate on identical architectural modalities. The sensor streams are fused into a unified 5-channel block. The network is forced to predict masked properties from the *same* multimodal manifold.
+* **Multi-Block Masking Strategy:** Standard JEPA avoids single-block occlusion. The architecture samples 4 independent overlapping blocks with varying scales (0.15–0.20) and aspect ratios (0.75–1.5) to force multi-scale semantic reasoning.
+* **Target-Conditioned Spatial Predictor:** The Predictor module is explicitly conditioned on the target region. By concatenating the contextual feature map, the target mask, and pure 2D Positional Encodings, the CNN explicitly knows *where* to predict without relying on unconstrained additive degradation.
+* **EMA Momentum Teacher:** The Target Encoder is governed strictly by an Exponential Moving Average (EMA) update schedule, maintaining a smooth, historically stable target manifold to prevent representation collapse.
+
+
 
 $$\theta_{target} \leftarrow \tau \theta_{target} + (1 - \tau) \theta_{context}$$
 
+
+
 ### 4.2 The Latent Predictive Objective
 
-The Spatial Latent Predictor minimizes the Mean Squared Error (MSE) strictly within the coordinate bounds of the masked patches.
+The Spatial Latent Predictor minimizes the Mean Squared Error (MSE) strictly within the coordinate bounds of the predicted target blocks.
 
-$$\mathcal{L}_{JEPA} = \frac{1}{N_{mask}} \sum_{i \in mask} \| s_{\phi}(z_{context})_i - z_{target, i} \|_2^2$$
+
+
+$$\mathcal{L}_{JEPA} = \frac{1}{N_{target}} \sum_{i \in target} \| P_{\psi}(z_{context}, pos)_i - z_{target, i} \|_2^2$$
+
+
 
 ---
 
@@ -63,11 +71,13 @@ $$\mathcal{L}_{JEPA} = \frac{1}{N_{mask}} \sum_{i \in mask} \| s_{\phi}(z_{conte
 
 Following deep convergence in Phase 1, the Context Encoder possesses a pre-trained understanding of structural defects and thermodynamic boundaries—learned entirely without human annotation. Phase 2 transitions to the task of semantic segmentation.
 
-### 5.1 Downstream Architecture & Transfer Learning
+### 5.1 Downstream Architecture & Lightweight Decoder Fine-Tuning
 
-The pre-trained weights from Phase 1 (`jepa_context_encoder.pt`) are injected into the downstream network. The encoder backbone is frozen (Linear Probing), and a lightweight multi-layer perceptron (MLP) decoding head is attached to process the downstream semantic annotations using an optimized Focal Dice objective.
+The pre-trained weights from Phase 1 (`jepa_context_encoder.pt`) are injected into the downstream network. The encoder backbone is temporarily frozen, and a lightweight multi-layer perceptron (MLP) decoding head is attached to process the downstream semantic annotations using an optimized Focal Dice objective.
 
-### 5.2 Deep Convergence & Evaluation [PENDING]
+*Architectural Limitation:* Initializing the 5-channel unified stream directly from 3-channel SMP ImageNet weights creates an inherent limitation via channel truncation/randomization for the extra depth and thermal channels. The "ImageNet pretraining" is therefore only partially effective on initialization, making Phase 1 pre-training critical for aligning multimodal modalities.
+
+### 5.2 Evaluation Benchmarks [PENDING]
 
 The downstream execution engine (`train_downstream.py`) utilizes a multi-phase state machine governed by Bayesian optimization (Optuna).
 
@@ -78,8 +88,6 @@ The downstream execution engine (`train_downstream.py`) utilizes a multi-phase s
 Industrial defect datasets exhibit extreme class imbalance. To overcome this, the downstream engine utilizes a Dynamic Class-Weighting Schedule (DCW). By tracking an Exponential Moving Average of the validation IoU, the downstream Dice penalty is exponentially scaled on the fly for lagging minority classes.
 
 To break representational capacity ceilings during edge deployment, the pipeline integrates a Knowledge Distillation (KD) engine. By forcing the lightweight `mit_b1` Student to minimize the Kullback-Leibler (KL) Divergence against a massive Teacher's soft probabilities ("Dark Knowledge"), the edge-deployed model inherits advanced stochastic noise suppression.
-
-$$\mathcal{L}_{KD} = \tau^2 \text{KL}\left( \sigma\left(\frac{z_{student}}{\tau}\right) \parallel \sigma\left(\frac{z_{teacher}}{\tau}\right) \right)$$
 
 ---
 

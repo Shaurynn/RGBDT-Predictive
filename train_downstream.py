@@ -230,36 +230,42 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
     return study.best_value
 
 def main():
+    parser = argparse.ArgumentParser(description="Phase 2: Downstream Supervised Semantic Segmentation")
+    parser.add_argument("--backbone", type=str, default="mit_b1", help="Vision Transformer backbone")
+    parser.add_argument("--data_dir", type=str, default="dataset/MM5", help="Path to MM5 dataset")
+    parser.add_argument("--batch_size", type=int, default=6, help="Batch size for finetuning")
+    parser.add_argument("--teacher_weights", type=str, default=None, help="Path to teacher weights for KD")
+    parser.add_argument("--teacher_backbone", type=str, default="mit_b4", help="Teacher backbone architecture")
+    args = parser.parse_args()
+
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    BATCH_SIZE = 6 
     NUM_CLASSES = 10
     
-    train_dataset = DownstreamSegmentationDataset(data_dir="dataset/MM5", split="train")
-    eval_dataset = DownstreamSegmentationDataset(data_dir="dataset/MM5", split="eval")
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    eval_loader = DataLoader(eval_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+    train_dataset = DownstreamSegmentationDataset(data_dir=args.data_dir, split="train")
+    eval_dataset = DownstreamSegmentationDataset(data_dir=args.data_dir, split="eval")
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
     
-    model = models.TMLPN_Downstream(num_classes=NUM_CLASSES, backbone_name='mit_b1').to(DEVICE)
+    model = models.TMLPN_Downstream(num_classes=NUM_CLASSES, backbone_name=args.backbone).to(DEVICE)
     
     # KNOWLEDGE DISTILLATION (Optional Teacher)
     teacher_model = None
-    teacher_weights_path = "weights/best_teacher_mit_b4.pt" # Example path
-    if os.path.exists(teacher_weights_path):
-        teacher_model = models.TMLPN_Downstream(num_classes=NUM_CLASSES, backbone_name='mit_b4').to(DEVICE)
-        teacher_model.load_state_dict(torch.load(teacher_weights_path))
+    if args.teacher_weights and os.path.exists(args.teacher_weights):
+        teacher_model = models.TMLPN_Downstream(num_classes=NUM_CLASSES, backbone_name=args.teacher_backbone).to(DEVICE)
+        teacher_model.load_state_dict(torch.load(args.teacher_weights))
         teacher_model.eval()
         for p in teacher_model.parameters(): p.requires_grad = False
     
-    manager = ExperimentManager(model_instance=model, backbone='mit_b1')
+    manager = ExperimentManager(model_instance=model, backbone=args.backbone)
     state = manager.detect_state()
     if state is None: return 
     run_dir, phase = state["run_dir"], state["phase"]
 
     # INJECT PHASE 1 WEIGHTS IF IN BASELINE
     if phase == "baseline" and not state["is_resume"]:
-        pt_weights = "weights/jepa_context_encoder.pt"
+        pt_weights = f"weights/jepa_context_encoder_{args.backbone}.pt"
         if os.path.exists(pt_weights):
-            print("[*] Injecting Phase 1 MM-JEPA Foundation Weights")
+            print(f"[*] Injecting Phase 1 MM-JEPA Foundation Weights: {pt_weights}")
             model.context_encoder.load_state_dict(torch.load(pt_weights))
             # Freeze the Context Backbone to evaluate strict linear probing
             for param in model.context_encoder.parameters():
