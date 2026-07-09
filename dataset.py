@@ -114,56 +114,6 @@ class TriModalPredictiveDataset(Dataset):
         masked_thermal = masked_thermal * (1.0 - mask)
         
         return masked_thermal, mask
-    
-    # def _apply_block_mask(self, thermal_tensor: torch.Tensor, seg_mask: torch.Tensor, max_retries: int = 25) -> tuple:
-    #     """
-    #     Applies an Object-Aware Block Mask to the thermal tensor.
-    #     Uses rejection sampling to ensure the masked region covers actual object classes.
-    #     """
-    #     C, H, W = thermal_tensor.shape
-    #     mask = torch.zeros((1, H, W), dtype=torch.float32)
-        
-    #     # Calculate block dimensions based on the mask_ratio
-    #     mask_area = int(H * W * self.mask_ratio)
-    #     block_h = int(np.sqrt(mask_area * (H / W)))
-    #     block_w = int(mask_area / block_h)
-        
-    #     # Ensure block doesn't exceed image dimensions
-    #     block_h = min(block_h, H - 1)
-    #     block_w = min(block_w, W - 1)
-        
-    #     best_top, best_left = 0, 0
-    #     max_overlap = -1
-        
-    #     # --- REJECTION SAMPLING LOOP ---
-    #     for _ in range(max_retries):
-    #         top = np.random.randint(0, H - block_h)
-    #         left = np.random.randint(0, W - block_w)
-            
-    #         # FIX: seg_mask is already 2D [H, W], standard slicing works perfectly
-    #         target_region = seg_mask[top:top + block_h, left:left + block_w]
-            
-    #         # Count pixels that belong to actual objects (assuming 0 is background and 255 is ignore)
-    #         valid_pixels = ((target_region > 0) & (target_region != 255)).sum().item()
-            
-    #         # Keep track of the best placement
-    #         if valid_pixels > max_overlap:
-    #             max_overlap = valid_pixels
-    #             best_top = top
-    #             best_left = left
-                
-    #         # If we find a block where at least 15% of the pixels are object class, accept it immediately
-    #         if valid_pixels > (block_h * block_w * 0.15):
-    #             break
-                
-    #     # Apply the mask using the optimized coordinates
-    #     mask[:, best_top:best_top + block_h, best_left:best_left + block_w] = 1.0
-        
-    #     # Create the input tensor by zeroing out the masked region (pre-normalization)
-    #     masked_thermal = thermal_tensor.clone()
-    #     masked_thermal = masked_thermal * (1.0 - mask)
-        
-    #     return masked_thermal, mask
 
     def _simulate_vertical_parallax(self, thermal_image: np.ndarray, max_shift: int = 40) -> np.ndarray:
         """
@@ -224,8 +174,19 @@ class TriModalPredictiveDataset(Dataset):
         
         # 4. Convert to Tensors for V2 Augmentations
         rgb_t = TF.to_tensor(rgb)       
-        depth_t = torch.from_numpy(depth.astype(np.float32)).unsqueeze(0) / 1000.0
-        therm_t = torch.from_numpy(therm.astype(np.float32)).unsqueeze(0) / 65535.0
+        
+        # Ensure depth bounds are validated at runtime rather than relying on strict 1000mm assumptions
+        depth_np = depth.astype(np.float32)
+        depth_max = depth_np.max()
+        depth_scale = max(1000.0, depth_max) if depth_max > 0 else 1.0
+        depth_t = torch.from_numpy(depth_np).unsqueeze(0) / depth_scale
+        
+        # Ensure thermal bounds are dynamic rather than assuming strict 16-bit (65535) cameras
+        therm_np = therm.astype(np.float32)
+        therm_max = therm_np.max()
+        therm_scale = max(65535.0, therm_max) if therm_max > 0 else 1.0
+        therm_t = torch.from_numpy(therm_np).unsqueeze(0) / therm_scale
+        
         gt_t = torch.as_tensor(gt_mask, dtype=torch.long)
         
         # Wrap the mask to force NEAREST interpolation and prevent class blending
