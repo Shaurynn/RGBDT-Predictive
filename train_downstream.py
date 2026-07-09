@@ -46,26 +46,48 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
         if alpha is None:
             self.register_buffer('alpha', torch.ones(num_classes))
         else:
-            self.register_buffer('alpha', torch.tensor(alpha, dtype=torch.float32))
+            alpha_t = torch.tensor(alpha, dtype=torch.float32)
+            if alpha_t.size(0) != num_classes:
+                alpha_t = alpha_t[:num_classes] if alpha_t.size(0) > num_classes else torch.cat([alpha_t, torch.ones(num_classes - alpha_t.size(0))])
+            self.register_buffer('alpha', alpha_t)
             
         if global_gdl_weights is None:
             self.register_buffer('gdl_weights', torch.ones(num_classes))
         else:
-            self.register_buffer('gdl_weights', torch.tensor(global_gdl_weights, dtype=torch.float32))
+            gdl_t = torch.tensor(global_gdl_weights, dtype=torch.float32)
+            if gdl_t.size(0) != num_classes:
+                gdl_t = gdl_t[:num_classes] if gdl_t.size(0) > num_classes else torch.cat([gdl_t, torch.ones(num_classes - gdl_t.size(0))])
+            self.register_buffer('gdl_weights', gdl_t)
 
     def forward(self, inputs, targets):
         inputs = torch.clamp(inputs.float(), min=-20.0, max=20.0)
         
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none', ignore_index=self.ignore_index)
+        # --- Sanitize Targets for Cross-Entropy ---
+        # Map any illegal/out-of-bound indices temporarily to 0 and explicitly 
+        # mark them via valid_mask / ignore settings to prevent CUDA assert crashes.
+        illegal_mask = (targets < 0) | (targets >= self.num_classes)
+        ce_targets = targets.clone()
+        ce_targets[illegal_mask & (targets != self.ignore_index)] = 0
+        
+        # --- 1. Protected Alpha-Balanced Focal Loss ---
+        ce_loss = F.cross_entropy(inputs, ce_targets, reduction='none', ignore_index=self.ignore_index)
+        
+        # Zero out loss contributions from truly illegal targets that escaped ignore_index
+        ce_loss = ce_loss.clone()
+        ce_loss[illegal_mask & (targets != self.ignore_index)] = 0.0
+        
         ce_loss_safe = torch.clamp(ce_loss, min=0.0, max=50.0)
         pt = torch.exp(-ce_loss_safe)
         
-        valid_mask = (targets != self.ignore_index)
+        valid_mask = (targets != self.ignore_index) & (~illegal_mask)
         alpha_t = torch.ones_like(targets, dtype=torch.float32)
-        alpha_t[valid_mask] = self.alpha[targets[valid_mask]]
+        
+        safe_targets = torch.clamp(targets, min=0, max=self.num_classes - 1)
+        alpha_t[valid_mask] = self.alpha[safe_targets[valid_mask]]
         
         focal_loss = (alpha_t * (1 - pt) ** self.gamma * ce_loss).mean()
 
+        # --- 2. Global Generalized Dice Loss (GDL) ---
         valid_inputs = inputs.permute(0, 2, 3, 1)[valid_mask] 
         valid_targets = targets[valid_mask]                   
         
@@ -73,13 +95,14 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
             dice_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
         else:
             inputs_soft = F.softmax(valid_inputs, dim=1)
-            targets_one_hot = F.one_hot(valid_targets, num_classes=self.num_classes).float()
+            safe_valid_targets = torch.clamp(valid_targets, min=0, max=self.num_classes - 1)
+            targets_one_hot = F.one_hot(safe_valid_targets, num_classes=self.num_classes).float()
             
             intersection = (inputs_soft * targets_one_hot).sum(dim=0)
             ground_truth_volume = targets_one_hot.sum(dim=0)
             pred_volume = inputs_soft.sum(dim=0)
             
-            w = self.gdl_weights.to(inputs.device)
+            w = self.gdl_weights[:self.num_classes].to(inputs.device)
             present_classes = w > 0
             
             if present_classes.sum() > 0:
@@ -90,6 +113,76 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
                 dice_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
 
         return focal_loss + (self.base_dice_weight * dice_loss)
+# class AlphaBalancedFocalGDLLoss(nn.Module):
+#     def __init__(self, num_classes, alpha=None, global_gdl_weights=None, gamma=2.0, dice_weight=1.0, ignore_index=255, eps=1e-6):
+#         super().__init__()
+#         self.num_classes = num_classes
+#         self.gamma = gamma
+#         self.base_dice_weight = dice_weight
+#         self.ignore_index = ignore_index
+#         self.eps = eps
+        
+#         if alpha is None:
+#             self.register_buffer('alpha', torch.ones(num_classes))
+#         else:
+#             alpha_t = torch.tensor(alpha, dtype=torch.float32)
+#             if alpha_t.size(0) != num_classes:
+#                 alpha_t = alpha_t[:num_classes] if alpha_t.size(0) > num_classes else torch.cat([alpha_t, torch.ones(num_classes - alpha_t.size(0))])
+#             self.register_buffer('alpha', alpha_t)
+            
+#         if global_gdl_weights is None:
+#             self.register_buffer('gdl_weights', torch.ones(num_classes))
+#         else:
+#             gdl_t = torch.tensor(global_gdl_weights, dtype=torch.float32)
+#             if gdl_t.size(0) != num_classes:
+#                 gdl_t = gdl_t[:num_classes] if gdl_t.size(0) > num_classes else torch.cat([gdl_t, torch.ones(num_classes - gdl_t.size(0))])
+#             self.register_buffer('gdl_weights', gdl_t)
+
+#     def forward(self, inputs, targets):
+#         inputs = torch.clamp(inputs.float(), min=-20.0, max=20.0)
+        
+#         # --- 1. Protected Alpha-Balanced Focal Loss ---
+#         ce_loss = F.cross_entropy(inputs, targets, reduction='none', ignore_index=self.ignore_index)
+#         ce_loss_safe = torch.clamp(ce_loss, min=0.0, max=50.0)
+#         pt = torch.exp(-ce_loss_safe)
+        
+#         valid_mask = (targets != self.ignore_index)
+#         alpha_t = torch.ones_like(targets, dtype=torch.float32)
+        
+#         # Clamp indices strictly between 0 and num_classes - 1 to prevent device-side assertion failures
+#         safe_targets = torch.clamp(targets, min=0, max=self.num_classes - 1)
+#         alpha_t[valid_mask] = self.alpha[safe_targets[valid_mask]]
+        
+#         focal_loss = (alpha_t * (1 - pt) ** self.gamma * ce_loss).mean()
+
+#         # --- 2. Global Generalized Dice Loss (GDL) ---
+#         valid_inputs = inputs.permute(0, 2, 3, 1)[valid_mask] 
+#         valid_targets = targets[valid_mask]                   
+        
+#         if valid_targets.numel() == 0:
+#             dice_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
+#         else:
+#             inputs_soft = F.softmax(valid_inputs, dim=1)
+            
+#             # Secure bounds for one_hot indices against negative values or over-limit classes
+#             safe_valid_targets = torch.clamp(valid_targets, min=0, max=self.num_classes - 1)
+#             targets_one_hot = F.one_hot(safe_valid_targets, num_classes=self.num_classes).float()
+            
+#             intersection = (inputs_soft * targets_one_hot).sum(dim=0)
+#             ground_truth_volume = targets_one_hot.sum(dim=0)
+#             pred_volume = inputs_soft.sum(dim=0)
+            
+#             w = self.gdl_weights[:self.num_classes].to(inputs.device)
+#             present_classes = w > 0
+            
+#             if present_classes.sum() > 0:
+#                 numerator = 2.0 * (w[present_classes] * intersection[present_classes]).sum()
+#                 denominator = (w[present_classes] * (ground_truth_volume[present_classes] + pred_volume[present_classes])).sum()
+#                 dice_loss = 1.0 - (numerator / (denominator + self.eps))
+#             else:
+#                 dice_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
+
+#         return focal_loss + (self.base_dice_weight * dice_loss)
 
 def knowledge_distillation_loss(student_logits, teacher_logits, temperature=4.0):
     soft_targets = F.softmax(teacher_logits / temperature, dim=1)
@@ -105,12 +198,23 @@ class IoUMetric:
         
     def update(self, logits, targets, ignore_index=255):
         preds = torch.argmax(logits, dim=1)
-        valid_mask = targets != ignore_index
+        # Filter out ignore_index and enforce strict in-bounds range [0, num_classes - 1]
+        valid_mask = (
+            (targets != ignore_index) & 
+            (targets >= 0) & (targets < self.num_classes) & 
+            (preds >= 0) & (preds < self.num_classes)
+        )
         preds = preds[valid_mask]
         targets = targets[valid_mask]
         if targets.numel() == 0: return
+        
         bins = targets * self.num_classes + preds
         bincount = torch.bincount(bins, minlength=self.num_classes**2)
+        
+        # Safeguard: trim bincount if unexpected outlier indices slip through
+        if bincount.numel() > self.num_classes**2:
+            bincount = bincount[:self.num_classes**2]
+            
         conf_matrix = bincount.reshape(self.num_classes, self.num_classes)
         intersection = torch.diag(conf_matrix)
         union = conf_matrix.sum(dim=1) + conf_matrix.sum(dim=0) - intersection
@@ -126,6 +230,36 @@ class IoUMetric:
         valid_classes = self.unions > 0
         if valid_classes.sum() == 0: return 0.0
         return self.get_per_class_iou()[valid_classes].mean().item()
+# class IoUMetric:
+#     def __init__(self, num_classes, device):
+#         self.num_classes = num_classes
+#         self.device = device
+#         self.intersections = torch.zeros(num_classes, device=device)
+#         self.unions = torch.zeros(num_classes, device=device)
+        
+#     def update(self, logits, targets, ignore_index=255):
+#         preds = torch.argmax(logits, dim=1)
+#         valid_mask = targets != ignore_index
+#         preds = preds[valid_mask]
+#         targets = targets[valid_mask]
+#         if targets.numel() == 0: return
+#         bins = targets * self.num_classes + preds
+#         bincount = torch.bincount(bins, minlength=self.num_classes**2)
+#         conf_matrix = bincount.reshape(self.num_classes, self.num_classes)
+#         intersection = torch.diag(conf_matrix)
+#         union = conf_matrix.sum(dim=1) + conf_matrix.sum(dim=0) - intersection
+#         self.intersections += intersection
+#         self.unions += union
+        
+#     def get_per_class_iou(self):
+#         ious = self.intersections / torch.clamp(self.unions, min=1.0)
+#         ious[self.unions == 0] = 1.0 
+#         return ious
+        
+#     def get_miou(self):
+#         valid_classes = self.unions > 0
+#         if valid_classes.sum() == 0: return 0.0
+#         return self.get_per_class_iou()[valid_classes].mean().item()
 
 class TTAWrapper(nn.Module):
     def __init__(self, model):
@@ -385,8 +519,14 @@ def main():
         pt_weights = os.path.join("weights", dataset_name, f"jepa_context_encoder_{cfg['backbone']}.pt")
         if os.path.exists(pt_weights):
             print(f"[*] Injecting Phase 1 MM-JEPA Foundation Weights: {pt_weights}")
-            # Use strict=False to accommodate the newly added dt_alignment projection layer
-            model.context_encoder.load_state_dict(torch.load(pt_weights), strict=False)
+            # # Use strict=False to accommodate the newly added dt_alignment projection layer
+            # model.context_encoder.load_state_dict(torch.load(pt_weights), strict=False)
+            # Explicitly call PyTorch's base nn.Module load_state_dict to bypass SMP's signature restriction
+            torch.nn.Module.load_state_dict(
+                model.context_encoder, 
+                torch.load(pt_weights), 
+                strict=False
+            )
             for param in model.context_encoder.parameters():
                 param.requires_grad = False
 
@@ -437,14 +577,42 @@ def main():
         if os.path.exists(checkpoint_path):
             print(f"\n[*] CRITICAL: Resuming interrupted run from {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            
+            # Load model state safely
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            
+            # Resilient optimizer and scaler loading with graceful fallback
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except ValueError as e:
+                print(f"\n[!] WARNING: Optimizer state dict size mismatch detected ({e}).")
+                print("[*] Re-initializing optimizer for current parameter configuration. Momentum buffers reset.")
+                
+            try:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            except Exception as e:
+                print(f"[!] WARNING: Could not restore GradScaler state ({e}). Initializing fresh scaler.")
+                
             start_epoch = checkpoint['epoch']
             state["best_miou"] = checkpoint['best_miou']
+            
             print(f"[*] Successfully restored state. Resuming strictly at Epoch {start_epoch + 1}")
         else:
             print("\n[!] WARNING: JSON state indicated resume, but no checkpoint.pt found. Starting from Epoch 1.")
+    # start_epoch = 0
+    # if state["is_resume"]:
+    #     checkpoint_path = os.path.join(run_dir, "checkpoint.pt")
+    #     if os.path.exists(checkpoint_path):
+    #         print(f"\n[*] CRITICAL: Resuming interrupted run from {checkpoint_path}")
+    #         checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+    #         model.load_state_dict(checkpoint['model_state_dict'])
+    #         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    #         scaler.load_state_dict(checkpoint['scaler_state_dict'])
+    #         start_epoch = checkpoint['epoch']
+    #         state["best_miou"] = checkpoint['best_miou']
+    #         print(f"[*] Successfully restored state. Resuming strictly at Epoch {start_epoch + 1}")
+    #     else:
+    #         print("\n[!] WARNING: JSON state indicated resume, but no checkpoint.pt found. Starting from Epoch 1.")
 
     for epoch in range(start_epoch, MAX_EPOCHS):
         model.train()
@@ -520,6 +688,13 @@ def main():
                     
                     overlay = 0.5 * rgb_vis + 0.5 * heatmap_color
                     writer.add_image("Explainability/GradCAM_Defect_Focus", overlay.transpose(2, 0, 1), epoch)
+
+                    vis_dir = os.path.join(run_dir, "visualizations")
+                    os.makedirs(vis_dir, exist_ok=True)
+                    # Convert RGB back to BGR for OpenCV saving and scale to 0-255 uint8
+                    bgr_save = cv2.cvtColor(np.uint8(255 * np.clip(overlay, 0, 1)), cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(os.path.join(vis_dir, f"gradcam_epoch_{epoch+1}.png"), bgr_save)
+                    
                     logged_image = True
         
         avg_val_loss = val_loss / len(eval_loader)
@@ -546,6 +721,14 @@ def main():
             
         with open(os.path.join(run_dir, "state.json"), 'w') as f: 
             json.dump(state, f, indent=4)
+            
+    results_path = os.path.join(run_dir, "results.json")
+    with open(results_path, 'w') as f:
+        json.dump({
+            "phase": phase, 
+            "best_mIoU": state.get("best_miou", 0.0)
+        }, f, indent=4)
+    print(f"[*] Phase '{phase}' completed successfully. Results recorded to {results_path}")
 
 if __name__ == '__main__':
     enforce_reproducibility()
