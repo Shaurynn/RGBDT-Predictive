@@ -27,6 +27,7 @@ To ensure strict academic reproducibility of the 0.8014 TTA mIoU benchmark, all 
 
 This repository is strictly for deploying the O(N) TriModal Latent Predictive Network (TMLPN). All legacy artifacts have been isolated in the `deprecated/` directory.
 
+```
 RGBDT-Predictive/
 ├── assets/
 ├── dataset.py
@@ -35,6 +36,7 @@ RGBDT-Predictive/
 ├── README.md
 ├── train.py
 └── uv.lock
+```
 
 ---
 
