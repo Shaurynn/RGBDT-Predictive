@@ -47,23 +47,24 @@ To satisfy the theoretical mandates of the Joint-Embedding Predictive Architectu
 * **Unified Same-Modal Inference:** The Context and Target Encoders operate on identical architectural modalities. The sensor streams are fused into a unified 5-channel block. The network is forced to predict masked properties from the *same* multimodal manifold.
 * **Multi-Block Masking Strategy:** Standard JEPA avoids single-block occlusion. The architecture samples 4 independent overlapping blocks with varying scales (0.15–0.20) and aspect ratios (0.75–1.5) to force multi-scale semantic reasoning.
 * **Target-Conditioned Spatial Predictor:** The Predictor module is explicitly conditioned on the target region. By concatenating the contextual feature map, the target mask, and pure 2D Positional Encodings, the CNN explicitly knows *where* to predict without relying on unconstrained additive degradation.
+  * *Architectural Defense of the CNN Predictor:* Standard implementations of I-JEPA utilize isotropic Vision Transformers (e.g., ViT-Huge) and sequence-based Transformer predictors. However, flattening high-resolution 2D spatial maps into a 1D sequence introduces an $\mathcal{O}(N^2)$ self-attention bottleneck that is mathematically incompatible with bounded edge-hardware deployment. Because TMLPN utilizes a hierarchical encoder (`mit_b1`), which preserves the 2D grid structure essential for downstream dense semantic segmentation, the predictor must operate natively in 2D space. Aligning with recent literature on hierarchical masked modeling (e.g., ConvNeXt-V2, CNN-JEPA), TMLPN employs a fully convolutional predictor utilizing Token Replacement to perform genuine, target-selective spatial inference.
 * **EMA Momentum Teacher:** The Target Encoder is governed strictly by an Exponential Moving Average (EMA) update schedule, maintaining a smooth, historically stable target manifold to prevent representation collapse.
-
-
 
 $$\theta_{target} \leftarrow \tau \theta_{target} + (1 - \tau) \theta_{context}$$
 
+### 4.2 The Latent Predictive Objective & Context Consistency
 
+Standard implementations of JEPA utilize sparse Transformer predictors that strictly process masked tokens. While mathematically elegant, sparse tensor routing fragments memory coalescing in TensorRT engines, resulting in severe latency penalties on bounded edge hardware. 
 
-### 4.2 The Latent Predictive Objective
+To optimize throughput for edge inference, TMLPN utilizes a dense CNN predictor that processes the entire spatial map. To counteract the representational drift inherent in dense prediction networks, the architecture employs two mitigations:
 
-The Spatial Latent Predictor minimizes the Mean Squared Error (MSE) strictly within the coordinate bounds of the predicted target blocks.
+1. **Residual Target Inference:** The predictor utilizes a strict residual connection ($\hat{z} = z_{context} + P_\psi(grid)$). This anchors the prediction to the observable world, forcing the convolutional layers to learn only the target spatial delta and naturally preserving context representations.
+2. **Dual-Objective Latent Loss:** The network evaluates the dense output via a unified loss function. Masked coordinates are optimized via the primary Target Inference Loss, while visible context coordinates are optimized via a down-weighted Context Consistency Loss. This auxiliary objective acts as a BYOL-style alignment mechanism, explicitly enforcing representational consistency between the online network and the EMA target manifold across the entire spatial grid.
 
+$$\mathcal{L}_{Total} = \mathcal{L}_{Target} + \alpha \mathcal{L}_{Context}$$
+$$\mathcal{L}_{Total} = \frac{1}{|M|} \sum_{i \in M} \| \hat{z}_i - z_{target, i} \|_2^2 + \alpha \frac{1}{|C|} \sum_{j \in C} \| \hat{z}_j - z_{target, j} \|_2^2$$
 
-
-$$\mathcal{L}_{JEPA} = \frac{1}{N_{target}} \sum_{i \in target} \| P_{\psi}(z_{context}, pos)_i - z_{target, i} \|_2^2$$
-
-
+*(Where $M$ represents the masked coordinates, $C$ represents the visible context coordinates, and $\alpha = 0.1$ prevents the consistency objective from overpowering the primary inference task).*
 
 ---
 
@@ -71,11 +72,13 @@ $$\mathcal{L}_{JEPA} = \frac{1}{N_{target}} \sum_{i \in target} \| P_{\psi}(z_{c
 
 Following deep convergence in Phase 1, the Context Encoder possesses a pre-trained understanding of structural defects and thermodynamic boundaries—learned entirely without human annotation. Phase 2 transitions to the task of semantic segmentation.
 
-### 5.1 Downstream Architecture & Lightweight Decoder Fine-Tuning
+### 5.1 Downstream Architecture & Multi-Scale Fine-Tuning
 
-The pre-trained weights from Phase 1 (`jepa_context_encoder.pt`) are injected into the downstream network. The encoder backbone is temporarily frozen, and a lightweight multi-layer perceptron (MLP) decoding head is attached to process the downstream semantic annotations using an optimized Focal Dice objective.
+The pre-trained weights from Phase 1 (`jepa_context_encoder.pt`) are injected into the downstream network. The encoder backbone is temporarily frozen, and a decoding head is attached to process the downstream semantic annotations using an optimized Focal Dice objective.
 
-*Architectural Limitation:* Initializing the 5-channel unified stream directly from 3-channel SMP ImageNet weights creates an inherent limitation via channel truncation/randomization for the extra depth and thermal channels. The "ImageNet pretraining" is therefore only partially effective on initialization, making Phase 1 pre-training critical for aligning multimodal modalities.
+**Modality-Specific Tokenizers:** Initializing a multi-channel stream directly from 3-channel ImageNet weights inherently creates representational interference. To mitigate this, TMLPN physically isolates modality ingestion at the stem. The network utilizes a custom `ModalityIsolatedPatchEmbed` module: the RGB stream inherits pristine, unmodified 3-channel ImageNet kernels, while the Depth and Thermal streams are processed by independent, Kaiming-initialized convolutional filters. These features are fused strictly via summation within the latent embedding dimension, completely eliminating low-level kernel corruption.
+
+**The Multi-Scale All-MLP Decoder:** Relying strictly on the deepest latent feature map (e.g., $1/32$ resolution) destroys high-frequency spatial details crucial for microscopic defect segmentation. However, utilizing heavy transposed convolution decoders (e.g., U-Net topologies) violates edge-hardware latency constraints. To synthesize sub-pixel spatial boundaries with deep thermodynamic semantics, the downstream architecture adopts a Multi-Scale All-MLP Decoder. By projecting the $1/4$, $1/8$, $1/16$, and $1/32$ hierarchical feature grids to a unified embedding dimension, upsampling them to a common $1/4$ resolution, and concatenating them, the network achieves razor-sharp boundary delineation while maintaining a strict, edge-compliant computational footprint.
 
 ### 5.2 Evaluation Benchmarks [PENDING]
 
@@ -83,11 +86,24 @@ The downstream execution engine (`train_downstream.py`) utilizes a multi-phase s
 
 *Note: The architecture is currently undergoing empirical evaluation across the `mit` Vision Transformer series (`mit_b1` through `mit_b5`). Quantitative milestones, including Base Validation mIoU, Test-Time Augmentation (TTA) robustness, and Expected Calibration Error (ECE), will be populated upon the conclusion of the training cycle.*
 
-### 5.3 Mitigating Imbalance and Asymptotic Limits (DCW & KD)
+### 5.3 Mitigating Imbalance and Asymptotic Limits ($\alpha$-Balancing & GDL)
 
-Industrial defect datasets exhibit extreme class imbalance. To overcome this, the downstream engine utilizes a Dynamic Class-Weighting Schedule (DCW). By tracking an Exponential Moving Average of the validation IoU, the downstream Dice penalty is exponentially scaled on the fly for lagging minority classes.
+Industrial defect datasets exhibit extreme foreground-background class imbalance. To overcome this without resorting to static heuristics or unvalidated inter-epoch validation shifting, the downstream engine utilizes a bipartite loss objective rooted in formal imbalance mitigation literature:
+
+**1. $\alpha$-Balanced Focal Loss:**
+To mitigate the dominance of the background class, the primary segmentation objective is governed by the $\alpha$-balanced variant of Focal Loss (Lin et al., 2017). The parameter $\alpha$ explicitly weights classes according to their empirical dataset frequencies (computed via Median Frequency Balancing), ensuring mathematical suppression of the background without arbitrary tuning.
+
+$$\mathcal{L}_{Focal} = - \alpha_t (1 - p_t)^\gamma \log(p_t)$$
+
+**2. Generalized Dice Loss (GDL):**
+To address intra-batch scale variance between large structural components and microscopic defects, TMLPN utilizes Generalized Dice Loss (Sudre et al., 2017). GDL computes dynamic weights strictly within the forward pass by scaling each class's intersection by the inverse square of its volume ($w_c = 1 / (\sum g_{nc})^2$). This mathematically guarantees that microscopic defects receive massive gradient scaling naturally, eliminating the requirement for unvalidated momentum heuristics or temperature parameters, and strictly preserving the Markovian property of Stochastic Gradient Descent.
+
+$$\mathcal{L}_{GDL} = 1 - 2 \frac{\sum_{c=1}^C w_c \sum_{n=1}^N p_{nc} g_{nc}}{\sum_{c=1}^C w_c \sum_{n=1}^N (p_{nc} + g_{nc})}$$
 
 To break representational capacity ceilings during edge deployment, the pipeline integrates a Knowledge Distillation (KD) engine. By forcing the lightweight `mit_b1` Student to minimize the Kullback-Leibler (KL) Divergence against a massive Teacher's soft probabilities ("Dark Knowledge"), the edge-deployed model inherits advanced stochastic noise suppression.
+
+**2. Dynamic Class-Weighting (DCW) as Class-Level OHEM:**
+While Focal Loss targets pixel-level hesitation, TMLPN targets class-level failure modes using a continuous Dynamic Class-Weighting (DCW) schedule (Huang et al., 2020). Operating as a differentiable, class-level analog to Online Hard Example Mining (OHEM) (Shrivastava et al., 2016), DCW tracks an Exponential Moving Average of the validation IoU. The downstream Dice penalty is exponentially scaled on the fly via $W_c = \exp(\tau \cdot (1 - \text{IoU}_c))$. This applies a smooth, non-linear amplification to lagging minority classes, prioritizing convergence on complex structural defects without inducing the gradient shocks common to discrete OHEM step-functions.
 
 ---
 

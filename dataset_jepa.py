@@ -17,8 +17,40 @@ class JEPAPretrainDataset(Dataset):
             next(reader) 
             for row in reader:
                 if row: self.image_files.append(row[0].replace('_rgb.png', '').replace('.png', '').replace('.jpg', ''))
+                
+        # Dynamically compute or cache the 5-channel mean and std
+        self.mean, self.std = self._compute_dataset_stats()
 
     def __len__(self): return len(self.image_files)
+    
+    def _compute_dataset_stats(self):
+        """Computes true empirical mean and std across the training split channels."""
+        channels_sum = torch.zeros(5, dtype=torch.float64)
+        channels_sq_sum = torch.zeros(5, dtype=torch.float64)
+        num_pixels = 0
+
+        # Quick single-pass calculation over file list
+        for base_name in self.image_files:
+            rgb = cv2.cvtColor(cv2.imread(os.path.join(self.data_dir, 'RGB', f"{base_name}.png")), cv2.COLOR_BGR2RGB)
+            depth = cv2.imread(os.path.join(self.data_dir, 'Depth', f"{base_name}.png"), cv2.IMREAD_ANYDEPTH)
+            therm = cv2.imread(os.path.join(self.data_dir, 'Thermal', f"{base_name}.png"), cv2.IMREAD_ANYDEPTH)
+            
+            rgb = cv2.resize(rgb, (self.image_size[1], self.image_size[0]))
+            depth = cv2.resize(depth, (self.image_size[1], self.image_size[0]), interpolation=cv2.INTER_NEAREST)
+            therm = cv2.resize(therm, (self.image_size[1], self.image_size[0]), interpolation=cv2.INTER_NEAREST)
+            
+            rgb_t = TF.to_tensor(rgb)
+            depth_t = torch.from_numpy(depth.astype(np.float32)).unsqueeze(0) / 10000.0
+            therm_t = torch.from_numpy(therm.astype(np.float32)).unsqueeze(0) / 65535.0
+            
+            x_5ch = torch.cat([rgb_t, depth_t, therm_t], dim=0) # [5, H, W]
+            channels_sum += x_5ch.sum(dim=(1, 2)).double()
+            channels_sq_sum += (x_5ch ** 2).sum(dim=(1, 2)).double()
+            num_pixels += (self.image_size[0] * self.image_size[1])
+
+        mean = channels_sum / num_pixels
+        std = torch.sqrt((channels_sq_sum / num_pixels) - (mean ** 2))
+        return mean.tolist(), std.tolist()
 
     def _generate_multiblock_mask(self, h, w, num_blocks=4):
         """
@@ -56,16 +88,17 @@ class JEPAPretrainDataset(Dataset):
         depth_t = torch.from_numpy(depth.astype(np.float32)).unsqueeze(0) / 10000.0 
         therm_t = torch.from_numpy(therm.astype(np.float32)).unsqueeze(0) / 65535.0 
         
-        # Dataset Empirical Normalization limits
-        rgb_t = TF.normalize(rgb_t, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        depth_t = TF.normalize(depth_t, mean=[0.5], std=[0.15]) 
-        therm_t = TF.normalize(therm_t, mean=[0.5], std=[0.25])
-        
+        # Unified 5-Channel Tensor [5, H, W]
         x_full = torch.cat([rgb_t, depth_t, therm_t], dim=0)
-        mask = self._generate_multiblock_mask(self.image_size[0], self.image_size[1])
-        x_visible = x_full * (1.0 - mask)
         
-        return {'x_full': x_full, 'x_visible': x_visible, 'mask': mask}
+        # Apply the dynamically computed 5-channel mean and std in one step
+        x_normalized = TF.normalize(x_full, mean=self.mean, std=self.std)
+        
+        # Apply mask generation to the normalized visible view
+        mask = self._generate_multiblock_mask(self.image_size[0], self.image_size[1])
+        x_visible = x_normalized * (1.0 - mask)
+        
+        return {'x_full': x_normalized, 'x_visible': x_visible, 'mask': mask}
 
 class DownstreamSegmentationDataset(Dataset):
     """Missing Dataset Class Restored for Phase 2 Downstream Fine-tuning."""
@@ -80,8 +113,40 @@ class DownstreamSegmentationDataset(Dataset):
             next(reader) 
             for row in reader:
                 if row: self.image_files.append(row[0].replace('_rgb.png', '').replace('.png', '').replace('.jpg', ''))
+                
+        # Dynamically compute or cache the 5-channel mean and std
+        self.mean, self.std = self._compute_dataset_stats()
 
     def __len__(self): return len(self.image_files)
+
+    def _compute_dataset_stats(self):
+        """Computes true empirical mean and std across the training split channels."""
+        channels_sum = torch.zeros(5, dtype=torch.float64)
+        channels_sq_sum = torch.zeros(5, dtype=torch.float64)
+        num_pixels = 0
+
+        # Quick single-pass calculation over file list
+        for base_name in self.image_files:
+            rgb = cv2.cvtColor(cv2.imread(os.path.join(self.data_dir, 'RGB', f"{base_name}.png")), cv2.COLOR_BGR2RGB)
+            depth = cv2.imread(os.path.join(self.data_dir, 'Depth', f"{base_name}.png"), cv2.IMREAD_ANYDEPTH)
+            therm = cv2.imread(os.path.join(self.data_dir, 'Thermal', f"{base_name}.png"), cv2.IMREAD_ANYDEPTH)
+            
+            rgb = cv2.resize(rgb, (self.image_size[1], self.image_size[0]))
+            depth = cv2.resize(depth, (self.image_size[1], self.image_size[0]), interpolation=cv2.INTER_NEAREST)
+            therm = cv2.resize(therm, (self.image_size[1], self.image_size[0]), interpolation=cv2.INTER_NEAREST)
+            
+            rgb_t = TF.to_tensor(rgb)
+            depth_t = torch.from_numpy(depth.astype(np.float32)).unsqueeze(0) / 10000.0
+            therm_t = torch.from_numpy(therm.astype(np.float32)).unsqueeze(0) / 65535.0
+            
+            x_5ch = torch.cat([rgb_t, depth_t, therm_t], dim=0) # [5, H, W]
+            channels_sum += x_5ch.sum(dim=(1, 2)).double()
+            channels_sq_sum += (x_5ch ** 2).sum(dim=(1, 2)).double()
+            num_pixels += (self.image_size[0] * self.image_size[1])
+
+        mean = channels_sum / num_pixels
+        std = torch.sqrt((channels_sq_sum / num_pixels) - (mean ** 2))
+        return mean.tolist(), std.tolist()
 
     def __getitem__(self, idx):
         base_name = self.image_files[idx]
@@ -95,11 +160,21 @@ class DownstreamSegmentationDataset(Dataset):
         therm = cv2.resize(therm, (self.image_size[1], self.image_size[0]), interpolation=cv2.INTER_NEAREST)
         gt_mask = cv2.resize(gt_mask, (self.image_size[1], self.image_size[0]), interpolation=cv2.INTER_NEAREST)
         
-        rgb_t = TF.normalize(TF.to_tensor(rgb), mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        depth_t = TF.normalize(torch.from_numpy(depth.astype(np.float32)).unsqueeze(0) / 10000.0, mean=[0.5], std=[0.15])
-        therm_t = TF.normalize(torch.from_numpy(therm.astype(np.float32)).unsqueeze(0) / 65535.0, mean=[0.5], std=[0.25])
+        # rgb_t = TF.normalize(TF.to_tensor(rgb), mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        # depth_t = TF.normalize(torch.from_numpy(depth.astype(np.float32)).unsqueeze(0) / 10000.0, mean=[0.5], std=[0.15])
+        # therm_t = TF.normalize(torch.from_numpy(therm.astype(np.float32)).unsqueeze(0) / 65535.0, mean=[0.5], std=[0.25])
+        rgb_t = TF.to_tensor(rgb)
+        depth_t = torch.from_numpy(depth.astype(np.float32)).unsqueeze(0) / 10000.0 
+        therm_t = torch.from_numpy(therm.astype(np.float32)).unsqueeze(0) / 65535.0 
+        
+        # Unified 5-Channel Tensor [5, H, W]
+        x_full = torch.cat([rgb_t, depth_t, therm_t], dim=0)
+        
+        # Apply the dynamically computed 5-channel mean and std
+        x_normalized = TF.normalize(x_full, mean=self.mean, std=self.std)
         
         gt_t = torch.as_tensor(gt_mask, dtype=torch.long)
         gt_t[gt_t == 255] = 255 
-        
-        return {'x_full': torch.cat([rgb_t, depth_t, therm_t], dim=0), 'seg_mask': gt_t}
+
+        # return {'x_full': torch.cat([rgb_t, depth_t, therm_t], dim=0), 'seg_mask': gt_t}        
+        return {'x_full': x_normalized, 'seg_mask': gt_t}

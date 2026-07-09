@@ -34,31 +34,41 @@ def enforce_reproducibility(seed=42):
 # --- LOSSES & METRICS (Restored from Original Pipeline) ---
 # ====================================================================================
 
-class FocalDiceLoss(nn.Module):
-    def __init__(self, num_classes, gamma=2.0, dice_weight=1.0, ignore_index=255):
+class AlphaBalancedFocalGDLLoss(nn.Module):
+    """
+    Alpha-Balanced Focal Loss combined with Generalized Dice Loss (GDL).
+    - Alpha Balancing suppresses background dominance via static empirical frequencies (Lin et al., 2017).
+    - Generalized Dice Loss handles dynamic weighting natively within the batch by scaling 
+      class intersections by the inverse square of their volume (Sudre et al., 2017).
+      This eliminates arbitrary momentum/temperature hyperparameters and preserves gradient stability.
+    """
+    def __init__(self, num_classes, alpha=None, gamma=2.0, dice_weight=1.0, ignore_index=255, eps=1e-6):
         super().__init__()
         self.num_classes = num_classes
         self.gamma = gamma
         self.base_dice_weight = dice_weight
         self.ignore_index = ignore_index
-        self.register_buffer('ce_weights', torch.ones(num_classes))
-        self.ce_weights[0] = 0.1 
-        self.register_buffer('dynamic_dice_weights', torch.ones(num_classes))
-
-    def update_dynamic_weights(self, per_class_iou, momentum=0.9, tau=2.0):
-        per_class_iou = per_class_iou.to(self.dynamic_dice_weights.device)
-        target_weights = torch.exp(tau * (1.0 - per_class_iou))
-        target_weights[0] = 1.0 
-        self.dynamic_dice_weights = (momentum * self.dynamic_dice_weights) + ((1.0 - momentum) * target_weights)
-        self.dynamic_dice_weights = torch.clamp(self.dynamic_dice_weights, min=1.0, max=10.0)
+        self.eps = eps
+        
+        if alpha is None:
+            self.register_buffer('alpha', torch.ones(num_classes))
+        else:
+            self.register_buffer('alpha', torch.tensor(alpha, dtype=torch.float32))
 
     def forward(self, inputs, targets):
         inputs = torch.clamp(inputs.float(), min=-100.0, max=100.0)
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none', ignore_index=self.ignore_index, weight=self.ce_weights)
+        
+        # --- 1. Alpha-Balanced Focal Loss ---
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none', ignore_index=self.ignore_index)
         pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
-
+        
         valid_mask = (targets != self.ignore_index)
+        alpha_t = torch.ones_like(targets, dtype=torch.float32)
+        alpha_t[valid_mask] = self.alpha[targets[valid_mask]]
+        
+        focal_loss = (alpha_t * (1 - pt) ** self.gamma * ce_loss).mean()
+
+        # --- 2. Generalized Dice Loss (GDL) ---
         valid_inputs = inputs.permute(0, 2, 3, 1)[valid_mask] 
         valid_targets = targets[valid_mask]                   
         
@@ -67,14 +77,23 @@ class FocalDiceLoss(nn.Module):
         else:
             inputs_soft = F.softmax(valid_inputs, dim=1)
             targets_one_hot = F.one_hot(valid_targets, num_classes=self.num_classes).float()
-            intersection = (inputs_soft * targets_one_hot).sum(dim=0)
-            denominator = inputs_soft.sum(dim=0) + targets_one_hot.sum(dim=0)
-            dice_raw = (2.0 * intersection + 1e-5) / (denominator + 1e-5) 
             
-            present_classes = targets_one_hot.sum(dim=0) > 0
+            # Compute intersection and volumes
+            intersection = (inputs_soft * targets_one_hot).sum(dim=0)
+            ground_truth_volume = targets_one_hot.sum(dim=0)
+            pred_volume = inputs_soft.sum(dim=0)
+            
+            # GDL Dynamic Weights: Inverse square of ground truth volume
+            # Adding epsilon prevents division by zero for absent classes in the batch
+            gdl_weights = 1.0 / (ground_truth_volume ** 2 + self.eps)
+            
+            # Filter out completely unrepresented classes to prevent noise inflation
+            present_classes = ground_truth_volume > 0
+            
             if present_classes.sum() > 0:
-                weighted_dice = (1.0 - dice_raw[present_classes]) * self.dynamic_dice_weights[present_classes]
-                dice_loss = weighted_dice.mean() / (self.dynamic_dice_weights[present_classes].mean() + 1e-8)
+                numerator = 2.0 * (gdl_weights[present_classes] * intersection[present_classes]).sum()
+                denominator = (gdl_weights[present_classes] * (ground_truth_volume[present_classes] + pred_volume[present_classes])).sum()
+                dice_loss = 1.0 - (numerator / (denominator + self.eps))
             else:
                 dice_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
 
@@ -152,9 +171,11 @@ def export_to_onnx(model, weights_path, run_dir, device):
 # --- PIPELINE MANAGEMENT & TRAINING ---
 # ====================================================================================
 class ExperimentManager:
-    def __init__(self, model_instance, backbone="mit_b1", base_dir="results"):
+    def __init__(self, model_instance, dataset="MM5", backbone="mit_b1", base_dir="results"):
         self.model_name = model_instance.__class__.__name__
-        self.model_dir = os.path.join(base_dir, self.model_name, backbone)
+        self.dataset = dataset
+        self.backbone = backbone
+        self.model_dir = os.path.join(base_dir, self.model_name, self.dataset,self.backbone)
         os.makedirs(self.model_dir, exist_ok=True)
         self.phase_sequence = ["baseline", "hpo", "hero", "microtune", "export"]
         
@@ -184,7 +205,7 @@ class ExperimentManager:
         state["is_resume"] = True
         return state
 
-def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_loader, eval_loader, num_classes, device):
+def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_loader, eval_loader, num_classes, empirical_alpha, device):
     def objective(trial):
         model = ModelClass(**model_kwargs).to(device)
         if inherit_weights and os.path.exists(inherit_weights): model.load_state_dict(torch.load(inherit_weights))
@@ -192,9 +213,16 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
         wd = trial.suggest_float("weight_decay", 1e-4, 1e-1, log=True)
         gamma = trial.suggest_float("gamma", 1.0, 4.0)
         dice = trial.suggest_float("dice_weight", 0.5, 2.0)
-        
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
-        criterion = FocalDiceLoss(num_classes, gamma=gamma, dice_weight=dice).to(device)
+        
+        # Inject the updated GDL loss and the dynamic alpha array into the HPO sweep
+        criterion = AlphaBalancedFocalGDLLoss(
+            num_classes=num_classes, 
+            alpha=empirical_alpha, 
+            gamma=gamma, 
+            dice_weight=dice
+        ).to(device)
+        
         scaler = GradScaler('cuda', enabled=True)
         
         best_miou = 0.0
@@ -229,22 +257,92 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
     with open(os.path.join(run_dir, "best_params.json"), "w") as f: json.dump(study.best_params, f, indent=4)
     return study.best_value
 
+def get_dynamic_class_count(data_dir):
+    """
+    Reads the absolute class count from the dataset manifest.
+    Removes hardcoded architectural assumptions.
+    """
+    class_file = os.path.join(data_dir, "classes.txt")
+    if not os.path.exists(class_file):
+        raise FileNotFoundError(
+            f"[!] CRITICAL: {class_file} not found. "
+            "A strict dataset manifest is required to dynamically set the architecture geometry."
+        )
+    with open(class_file, "r") as f:
+        num_classes = len([line for line in f if line.strip()])
+    print(f"[*] Dynamically detected {num_classes} classes from dataset manifest.")
+    return num_classes
+
+def compute_empirical_alpha(dataloader, num_classes, ignore_index=255, max_batches=100):
+    """
+    Dynamically computes the dataset class frequencies using Median Frequency Balancing.
+    Samples a subset of batches to prevent massive overhead during initialization.
+    """
+    print("\n[*] Dynamically computing empirical alpha weights from dataset distribution...")
+    pixel_counts = torch.zeros(num_classes, dtype=torch.float64)
+    
+    # Sample the dataloader to build a statistically significant distribution
+    for i, batch in enumerate(dataloader):
+        if i >= max_batches: break
+        targets = batch['seg_mask']
+        valid_mask = targets != ignore_index
+        valid_targets = targets[valid_mask]
+        
+        if valid_targets.numel() > 0:
+            counts = torch.bincount(valid_targets.flatten(), minlength=num_classes)
+            pixel_counts += counts.cpu()
+            
+    total_pixels = pixel_counts.sum()
+    if total_pixels == 0:
+        return torch.ones(num_classes).tolist()
+        
+    # 1. Calculate raw frequencies
+    frequencies = pixel_counts / total_pixels
+    
+    # 2. Extract median frequency (ignoring absent classes in the sample)
+    valid_freqs = frequencies[frequencies > 0]
+    median_freq = torch.median(valid_freqs) if len(valid_freqs) > 0 else 1.0
+    
+    # 3. Compute Alpha: Median Frequency Balancing
+    epsilon = 1e-5
+    alpha = median_freq / (frequencies + epsilon)
+    
+    # 4. Clamp to prevent exploding gradients on microscopic defect classes, 
+    # while allowing massive background classes to be heavily suppressed (e.g., 0.01)
+    alpha = torch.clamp(alpha, min=0.01, max=10.0)
+    
+    # Set completely absent classes in the sample to a neutral 1.0 weight
+    alpha[frequencies == 0] = 1.0 
+    
+    # Round for clean console output
+    alpha_list = [round(a, 4) for a in alpha.tolist()]
+    print(f"[*] Computed Dataset-Specific Alpha Weights: {alpha_list}\n")
+    return alpha_list
+
 def main():
     parser = argparse.ArgumentParser(description="Phase 2: Downstream Supervised Semantic Segmentation")
     parser.add_argument("--backbone", type=str, default="mit_b1", help="Vision Transformer backbone")
-    parser.add_argument("--data_dir", type=str, default="dataset/MM5", help="Path to MM5 dataset")
+    parser.add_argument("--dataset", type=str, default="MM5", help="Path to MM5 dataset")
     parser.add_argument("--batch_size", type=int, default=6, help="Batch size for finetuning")
     parser.add_argument("--teacher_weights", type=str, default=None, help="Path to teacher weights for KD")
     parser.add_argument("--teacher_backbone", type=str, default="mit_b4", help="Teacher backbone architecture")
     args = parser.parse_args()
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    NUM_CLASSES = 10
     
-    train_dataset = DownstreamSegmentationDataset(data_dir=args.data_dir, split="train")
-    eval_dataset = DownstreamSegmentationDataset(data_dir=args.data_dir, split="eval")
+    # --- 1. DYNAMIC GEOMETRY ---
+    # Fetch exact class count before instantiating any architectural components
+    data_dir = os.path.join("dataset", args.dataset)
+    NUM_CLASSES = get_dynamic_class_count(data_dir)
+    
+    train_dataset = DownstreamSegmentationDataset(data_dir=data_dir, split="train")
+    eval_dataset = DownstreamSegmentationDataset(data_dir=data_dir, split="eval")
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
     eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    
+    # --- 2. DYNAMIC LOSS STATISTICS ---
+    # Compute this immediately so both HPO and Hero phases share the exact same alpha distribution
+    empirical_alpha = compute_empirical_alpha(train_loader, NUM_CLASSES)
     
     model = models.TMLPN_Downstream(num_classes=NUM_CLASSES, backbone_name=args.backbone).to(DEVICE)
     
@@ -263,7 +361,7 @@ def main():
 
     # INJECT PHASE 1 WEIGHTS IF IN BASELINE
     if phase == "baseline" and not state["is_resume"]:
-        pt_weights = f"weights/jepa_context_encoder_{args.backbone}.pt"
+        pt_weights = os.path.join("weights", args.dataset, f"jepa_context_encoder_{args.backbone}.pt")
         if os.path.exists(pt_weights):
             print(f"[*] Injecting Phase 1 MM-JEPA Foundation Weights: {pt_weights}")
             model.context_encoder.load_state_dict(torch.load(pt_weights))
@@ -272,7 +370,18 @@ def main():
                 param.requires_grad = False
 
     if phase == "hpo":
-        score = run_hpo_phase(run_dir, state["inherit_weights"], models.TMLPN_Downstream, {"num_classes": NUM_CLASSES}, train_loader, eval_loader, NUM_CLASSES, DEVICE)
+        # Pass empirical_alpha into the HPO function
+        score = run_hpo_phase(
+            run_dir, 
+            state["inherit_weights"], 
+            models.TMLPN_Downstream, 
+            {"num_classes": NUM_CLASSES}, 
+            train_loader, 
+            eval_loader, 
+            NUM_CLASSES, 
+            empirical_alpha, 
+            DEVICE
+        )
         with open(os.path.join(run_dir, "results.json"), 'w') as f: json.dump({"phase": phase, "best_mIoU": score}, f)
         return
     elif phase == "export":
@@ -282,8 +391,12 @@ def main():
 
     MAX_EPOCHS = 150 if phase == "baseline" else (300 if phase == "hero" else 200)
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
-    criterion = FocalDiceLoss(num_classes=NUM_CLASSES).to(DEVICE)
     scaler = GradScaler('cuda', enabled=True)
+    
+    
+    empirical_alpha = compute_empirical_alpha(train_loader, NUM_CLASSES)   
+    criterion = AlphaBalancedFocalGDLLoss(num_classes=NUM_CLASSES, alpha=empirical_alpha).to(DEVICE)
+    
     writer = SummaryWriter(log_dir=os.path.join(run_dir, "logs"))
 
     for epoch in range(state["start_epoch"], MAX_EPOCHS):
