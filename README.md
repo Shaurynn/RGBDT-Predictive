@@ -76,6 +76,7 @@ Because the Target Encoder is locked via a Stop-Gradient, the network must be ph
 * Similarity Loss (Invariance): The primary MSE objective. Forces the prediction of the Context Encoder to match the Target Encoder's output.
 * Variance Loss (Anti-Collapse): A hinge loss enforcing standard deviation ≥ 1.0 across the predicted latent batch, preventing points from collapsing into a singularity.
 * Covariance Loss (The Decorrelator): Penalizes off-diagonal elements in the covariance matrix, forcing all 512 channels of the backbone to learn unique, orthogonal features [6].
+$$L_{cov} = \frac{1}{C} \sum_{i \neq j} \left( \frac{Z_i^T Z_j}{N-1} \right)^2$$
 
 ---
 
@@ -85,37 +86,63 @@ Because the Target Encoder is locked via a Stop-Gradient, the network must be ph
 
 During the unoptimized 150-epoch baseline run, the architecture exhibited expected self-supervised mathematical behaviors, notably a massive discrepancy between Total Training Loss (~40.0) and Validation Loss (~0.14). Because latent target generation is strictly an auxiliary training task [5], the Validation loop correctly bypassed the VICReg penalties to strictly evaluate the downstream segmentation cross-entropy error.
 
-Furthermore, early epochs demonstrated a sharp spike in Covariance (peaking at ~42.0 around Epoch 23). This is a known pathology in high-capacity architectures attempting to satisfy VICReg Variance constraints by duplicating features across channels (Dimensional Redundancy) [6]. By aggressively weighting the covariance penalty (cov_weight = 15.0), the network was forced to decorrelate its 512 channels, stabilizing the manifold.
+Furthermore, early epochs demonstrated a sharp spike in Covariance (peaking at ~42.0 around Epoch 23). This is a known pathology in high-capacity architectures attempting to satisfy VICReg Variance constraints by duplicating features across channels (Dimensional Redundancy) [6]. By aggressively weighting the covariance penalty (`cov_weight = 15.0`), the network was forced to decorrelate its 512 channels, stabilizing the manifold.
 
 > ![TMLPN Baseline Dynamics](assets/Tensorboard_TMLPN_Baseline.png)
 > Figure 2: Telemetry of the TMLPN Baseline Run. The top-left chart captures the exact moment the network hit the sledgehammer Covariance penalty (Epoch 23), successfully forcing the channels into orthogonal representations.
 
-### 7.2 Deep Convergence & The Microtune Polish
-
-Following a 30-trial Bayesian optimization sweep (Optuna), the architecture achieved deep convergence during a long-horizon Hero phase. To finalize spatial boundaries, a Microtune phase shifted the learning rate into a microscopic 10⁻⁵ to 10⁻⁷ cooling schedule, anchoring the latent space.
-
 > ![TMLPN Optuna Dashboard](assets/Optuna_TMLPN.png)
 > Figure 3: Optuna Parallel Coordinate Plot demonstrating convergence on an aggressive masking ratio of 42.7% during the HPO phase.
 
-| Training Phase | Objective / Mechanism | Final Base mIoU | Final TTA mIoU |
-| :--- | :--- | :--- | :--- |
-| Baseline | Warmup; ImageNet patched weights, standard hyperparams | 0.7248 | 0.7161 |
-| HPO | 30-Trial Optuna sweep. Peak mIoU: 0.7328 | - | - |
-| Hero | Deep convergence (Patience triggered at Epoch 96) | 0.7311 | 0.7262 |
-| Microtune | Cooling schedule + Spatial Polish | [Recorded in JSON] | [Recorded in JSON] |
+### 7.2 Deep Convergence & The Microtune Polish
 
-> ![TMLPN Microtune Dynamics](assets/Tensorboard_TMLPN_Microtune.png)
-> Figure 4: Telemetry of the TMLPN Microtune Phase. The microscopic learning rate gently cools the Covariance and Total Train Loss (top) while the Validation mIoU (bottom) remains highly stable.
+Following a 30-trial Bayesian optimization sweep (using Optuna as shown in Figure 3), the architecture achieved deep convergence during a long-horizon Hero phase. To finalize spatial boundaries, a Microtune phase shifted the learning rate into a microscopic 10⁻⁵ to 10⁻⁷ cooling schedule, anchoring the latent space.
 
-### 7.3 Explainability: Tightening Spatial Boundaries
+To determine the architectural limits of the MM5 dataset, the training pipeline was executed sequentially across the entire mit Vision Transformer series, from the shallow `mit_b1` through the heavy `mit_b5`.
+
+ #### Hero Phase: Global Convergence
+ | Architecture | Parameters | Base Validation mIoU | TTA Validation mIoU |
+ | :--- | :--- | :--- | :--- |
+ | mit_b1 | 13.7M | 0.7311 | 0.7262 |
+ | mit_b2 | 24.2M | 0.7531 | 0.7473 |
+ | mit_b3 | 44.0M | 0.7923 | 0.7851 |
+ | mit_b4 | 60.8M | 0.7896 | 0.7969 |
+ | mit_b5 | 81.4M | 0.7829 | 0.7870 |
+
+ #### Microtune Phase: Spatial Boundary Refinement
+ | Architecture | Parameters | Base Validation mIoU | TTA Validation mIoU |
+ | :--- | :--- | :--- | :--- |
+ | mit_b1 | 13.7M | 0.7301 | 0.7265 |
+ | mit_b2 | 24.2M | 0.7501 | 0.7444 |
+ | mit_b3 | 44.0M | 0.7946 | 0.7866 |
+ | mit_b4 | 60.8M | 0.7960 | 0.8014 |
+ | mit_b5 | 81.4M | 0.7827 | 0.7865 |
+
+> ![TMLPN Microtune Dynamics](assets/TMLPN_mit_b1-5_mIoU.png)
+> Figure 4: mIoU of the TMLPN Hero and Microtune Phases. The microscopic learning rate gently cools the Covariance and Total Train Loss (top) while the Validation mIoU (bottom) remains highly stable.
+
+ ### 7.3 Discussion: Scaling and Multi-Modal Behaviors
+
+ The empirical results across the hierarchical transformer scales reveal critical insights into multi-modal representation learning:
+
+ 1. The Capacity Saturation Point
+ Scaling from the lightweight `mit_b1` up to `mit_b5` exposes a clear performance ceiling within the MM5 dataset. The network achieves its absolute peak performance at the `mit_b4` scale following the Microtune phase (0.8014 TTA mIoU). Pushing the architecture further to `mit_b5` (81.4M parameters) results in a quantifiable regression, dropping back down to 0.7865. This indicates a saturation point where the dataset complexity can no longer support the massive parameter count, leading to mild overfitting or unmanageable exponential variance across the 40+ deeper transformer blocks.
+
+ 2. The TTA Inversion Phenomenon
+ The telemetry reveals a fascinating behavioral inversion regarding Test-Time Augmentation (TTA). For the lighter architectures (`mit_b1`, `mit_b2`, and `mit_b3`), applying TTA consistently lowers the mIoU. These shallower networks lack the capacity to confidently resolve the spatial hesitation introduced by geometric flipping, resulting in epistemic uncertainty. Conversely, the deeper `mit_b4` and `mit_b5` architectures experience a performance boost from TTA. Their highly parameterized multi-head self-attention mechanisms successfully synthesize the flipped orientations into a more robust, confident consensus prediction.
+
+ 3. The Microtune Refinement Margin
+ The impact of the Microtune phase—using highly decayed learning rates and Dynamic Class-Weighting (DCW)—is heavily dependent on the backbone's starting capacity. For smaller models (`mit_b1`, `mit_b2`), forcing the network to heavily penalize minority class failures slightly destabilized the global representations, causing a negligible drop in overall mIoU. However, the high-capacity `mit_b3` and `mit_b4` models successfully absorbed the DCW penalty, utilizing their deeper feature maps to refine spatial boundaries and push the total mIoU higher.
+
+### 7.4 Explainability: Tightening Spatial Boundaries
 
 Semantic Grad-CAM and Epistemic Uncertainty mapping applied to identical input geometry at the conclusion of the Microtune run demonstrate razor-sharp, object-centric hotspots.
 
-> ![TMLPN Microtune Grad-CAM](assets/TMLPN_Microtune_batch0_img1_class15_gradcam.png)
-> ![TMLPN Microtune Epistemic Uncertainty](assets/TMLPN_Microtune_batch0_img1_epistemic_uncertainty.png)
+> ![TMLPN Microtune Grad-CAM](assets/batch2_img4_class6_gradcam.png)
+> ![TMLPN Microtune Epistemic Uncertainty](assets/batch2_img4_epistemic_uncertainty.png)
 > Figure 5: Final TMLPN Diagnostics. Top: The Grad-CAM heatmap reveals object-centric hotspots that strictly adhere to physical mass. Bottom: The Epistemic Uncertainty map captures the model's spatial hesitation during Test-Time Augmentation (TTA).
 
-### 7.4 Interpreting the Uncertainty Maps: Grid Artifacts & Boundary Hesitation
+### 7.5 Interpreting the Uncertainty Maps: Grid Artifacts & Boundary Hesitation
 
 The Epistemic Uncertainty map evaluates cross-modal agreement and spatial confidence by measuring the prediction variance across multiple TTA orientations. The visual artifacts rendered on these maps are highly indicative of the underlying Vision Transformer mechanics:
 
@@ -153,6 +180,7 @@ Industrial defect datasets exhibit extreme class imbalance. To overcome this wit
 $$W_c = EMA( W_c, e^[τ * (1 - IoU_c)] )$$ 
 
 To break representational capacity ceilings, the pipeline integrates a Knowledge Distillation (KD) engine [9]. By forcing the lightweight Student to minimize the Kullback-Leibler (KL) Divergence against a massive 82M-parameter Teacher's soft probabilities ("Dark Knowledge"), the edge-deployed model inherits advanced stochastic noise suppression while perfectly retaining its 14M-parameter high-speed footprint.
+$$L_{KD} = \tau^2 \text{KL}\left( \sigma\left(\frac{z_{student}}{\tau}\right) \parallel \sigma\left(\frac{z_{teacher}}{\tau}\right) \right)$$
 
 ---
 
@@ -173,9 +201,11 @@ For researchers and engineers adapting this repository, the architecture relies 
 
 ## 10. Conclusion & Edge Deployment
 
-By abandoning pixel-space generation, the TriModal Latent Predictive Network establishes a vastly more efficient methodology for multimodal defect detection. The architecture successfully isolates structural thermodynamics from stochastic sensor noise, achieving rapid spatial convergence and immense confidence on sub-pixel boundaries.
+ By abandoning pixel-space generation, the TriModal Latent Predictive Network establishes a vastly more efficient methodology for multimodal defect detection. The empirical scaling behavior dictates a highly specific deployment strategy to balance maximum predictive fidelity against strict edge hardware constraints.
 
-For isolated industrial deployment running in Python 3.12 edge environments, the optimized TMLPN graph is serialized to an ONNX artifact (opset_version=18). With all generative decoders excised and the core intelligence distilled into a lightweight footprint, the model is strictly engineered for low-latency inference on robust ARM64 edge computers. By directly interfacing this TensorRT engine with industrial edge controllers, the system executes real-time autonomous thermal inspections directly at the sensor source.
+ The `mit_b4` architecture represents the undeniable peak of this pipeline. Achieving over 80% mIoU, it serves as the ultimate offline "Teacher" network, perfectly capturing complex non-linear thermal manifolds from RGB-D inputs. However, its 60.8M parameter mass is too intensive for real-time robotic inference.
+
+ To achieve true edge autonomy, we utilize the lightweight `mit_b1` backbone (13.7M parameters) as the active "Student." Utilizing Knowledge Distillation, we transfer the inter-class dark knowledge from the `mit_b4` Teacher down into the `mit_b1` framework. For isolated industrial deployment, this optimized asymmetric graph is serialized to an ONNX artifact (opset_version=18). By deploying this distilled TensorRT engine onto a Jetson Orin Nano functioning as a companion computer aboard a UAV or rover, the system achieves sub-pixel structural segmentation and real-time autonomous thermal predictions directly at the sensor source.
 
 ---
 
