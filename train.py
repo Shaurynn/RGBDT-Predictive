@@ -2,6 +2,7 @@ import os
 import glob
 import json
 import inspect
+import random
 import torch
 import cv2
 import optuna
@@ -20,6 +21,22 @@ from tqdm import tqdm
 from dataset import TriModalPredictiveDataset
 import models  
 
+def enforce_reproducibility(seed=42):
+    """
+    Enforces deterministic execution to satisfy academic reproducibility standards.
+    Locks PyTorch, NumPy, and Python RNG states.
+    """
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    
+    # Force deterministic CUDA algorithms
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
 # ====================================================================================
 # --- 1. CUSTOM LOSSES & ARCHITECTURE METRICS ---
 # ====================================================================================
@@ -126,7 +143,6 @@ class LatentRegularizationLoss(nn.Module):
         sim_loss = F.mse_loss(z_pred, z_target)
 
         # 2. Mathematical Bounding via LayerNorm
-        # Explicitly prevents exponential variance, allowing us to remove torch.clamp()
         z_pred_norm = F.layer_norm(z_pred, (C,))
         z_target_norm = F.layer_norm(z_target, (C,))
 
@@ -146,7 +162,10 @@ class LatentRegularizationLoss(nn.Module):
         cov_loss = (self.off_diagonal(cov_pred).pow(2).sum() / C) + \
                    (self.off_diagonal(cov_target).pow(2).sum() / C)
 
-        return (self.sim_weight * sim_loss) + (self.var_weight * var_loss) + (self.cov_weight * cov_loss)
+        total_vicreg_loss = (self.sim_weight * sim_loss) + (self.var_weight * var_loss) + (self.cov_weight * cov_loss)
+
+        # FIX: Return the individual components to satisfy the training loop unpacking (loss, sim, var, cov)
+        return total_vicreg_loss, sim_loss, var_loss, cov_loss
 
 def knowledge_distillation_loss(student_logits, teacher_logits, temperature=4.0):
     """
@@ -683,7 +702,7 @@ def main():
             # FIX: Set dtype to torch.bfloat16
             with autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
                 if is_latent_model:
-                    pred_seg, z_pred, z_target = model(rgbd, therm_masked, therm_target)
+                    pred_seg, z_pred, z_target = model(rgbd, therm_masked, therm_target, block_mask)
                     loss_seg = criterion(pred_seg, seg_mask)
                     
                     loss_phys, sim, var, cov = latent_criterion(z_pred, z_target)
@@ -900,4 +919,5 @@ def main():
     print("Run your training command again to automatically begin the next phase.\n")
 
 if __name__ == '__main__':
+    enforce_reproducibility(seed=42)
     main()

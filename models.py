@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-import timm
+import segmentation_models_pytorch as smp
 
 # ====================================================================================
 # --- 1. POSITIONAL ENCODING & SPATIAL COMPONENTS ---
@@ -24,14 +24,21 @@ class PositionalEncoding2D(nn.Module):
         pos_x = torch.arange(W, device=tensor.device).type(self.inv_freq.type())
         pos_y = torch.arange(H, device=tensor.device).type(self.inv_freq.type())
 
-        sin_inp_x = torch.einsum("i,j->ij", pos_x, self.inv_freq)
-        sin_inp_y = torch.einsum("i,j->ij", pos_y, self.inv_freq)
+        # Generate frequencies for each axis
+        sin_inp_x = torch.einsum("i,j->ij", pos_x, self.inv_freq) # [W, C/2]
+        sin_inp_y = torch.einsum("i,j->ij", pos_y, self.inv_freq) # [H, C/2]
 
-        emb_x = torch.cat((sin_inp_x.sin(), sin_inp_x.cos()), dim=-1).unsqueeze(1).repeat(1, H, 1)
-        emb_y = torch.cat((sin_inp_y.sin(), sin_inp_y.cos()), dim=-1).unsqueeze(2).repeat(1, 1, W)
+        # 1. Create the base X and Y embeddings: Shape [W, C] and [H, C]
+        emb_x = torch.cat((sin_inp_x.sin(), sin_inp_x.cos()), dim=-1) 
+        emb_y = torch.cat((sin_inp_y.sin(), sin_inp_y.cos()), dim=-1)
         
-        # [H, W, C] -> [B, C, H, W]
-        emb = (emb_x + emb_y).permute(2, 0, 1).unsqueeze(0).repeat(B, 1, 1, 1)
+        # 2. Correctly align and broadcast to a shared [H, W, C] spatial grid
+        emb_x = emb_x.unsqueeze(0).expand(H, W, C) # Broadcast X across the height
+        emb_y = emb_y.unsqueeze(1).expand(H, W, C) # Broadcast Y across the width
+        
+        # 3. Sum the frequencies, permute to [C, H, W], and broadcast to the Batch size
+        emb = (emb_x + emb_y).permute(2, 0, 1).unsqueeze(0).expand(B, C, H, W)
+        
         return tensor + emb
 
 # ====================================================================================
@@ -104,6 +111,12 @@ class SpatialJEPAPredictor(nn.Module):
     def forward(self, context_embedding, block_mask):
         B, C, H, W = context_embedding.shape
         
+        # FIX: Dimensional Safeguard. Ensure the mask is a 4D float tensor [B, C, H, W]
+        # before pushing it through the interpolation engine.
+        if block_mask.dim() == 3:
+            block_mask = block_mask.unsqueeze(1)
+        block_mask = block_mask.float()
+        
         # Downsample the high-res binary block mask to match the latent feature map dimensions
         mask_resized = F.interpolate(block_mask, size=(H, W), mode='nearest')
         
@@ -128,26 +141,27 @@ class TriModalLatentPredictiveNetwork(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         
-        # 1. Instantiate Backbones via timm
-        # We use strict feature extraction mode (features_only=True) to grab the multi-scale hierarchy
-        self.rgbd_encoder = timm.create_model(backbone_name, pretrained=True, features_only=True)
-        self.therm_encoder = timm.create_model(backbone_name, pretrained=True, features_only=True)
+        # 1. Instantiate Backbones via Segmentation Models PyTorch (SMP)
+        # SMP natively houses the 'mit_b1' series and automatically handles N-channel weight initialization.
+        self.rgbd_encoder = smp.encoders.get_encoder(
+            name=backbone_name,
+            in_channels=4,
+            weights='imagenet'
+        )
+        self.therm_encoder = smp.encoders.get_encoder(
+            name=backbone_name,
+            in_channels=1,
+            weights='imagenet'
+        )
         
-        # 2. Modify RGB-D Patch Embedding for 4-Channel Input (RGB + Depth)
-        self._adapt_4channel_patch_embed(self.rgbd_encoder)
+        # Extract the final channel dimension directly from the SMP encoder (e.g., 512 for mit_b1)
+        final_dim = self.rgbd_encoder.out_channels[-1]
         
-        # 3. Modify Thermal Patch Embedding for 1-Channel Input
-        self._adapt_1channel_patch_embed(self.therm_encoder)
-        
-        # Channel dimensions extracted from the final block of the specific mit_bX backbone
-        # mit_b1=512, mit_b2=512, mit_b3=512, mit_b4=512, mit_b5=512
-        final_dim = self.rgbd_encoder.feature_info[-1]['num_chs']
-        
-        # 4. Topology Engines
+        # 2. Topology Engines
         self.fusion_head = SpatialReductionCrossAttention(dim=final_dim, reduction_ratio=8)
         self.latent_predictor = SpatialJEPAPredictor(embed_dim=final_dim)
         
-        # 5. Semantic Segmentation Head (MLP Decoder based on SegFormer)
+        # 3. Semantic Segmentation Head (MLP Decoder based on SegFormer)
         self.decode_head = nn.Sequential(
             nn.Conv2d(final_dim, final_dim, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(final_dim),
@@ -156,56 +170,34 @@ class TriModalLatentPredictiveNetwork(nn.Module):
             nn.Conv2d(final_dim, num_classes, kernel_size=1)
         )
 
-    def _adapt_4channel_patch_embed(self, model):
-        """Mathematically sound weight initialization for RGB-D transition [He et al., 2016]."""
-        old_conv = model.stem.proj if hasattr(model, 'stem') else model.patch_embed1.proj
-        new_conv = nn.Conv2d(4, old_conv.out_channels, kernel_size=old_conv.kernel_size, 
-                             stride=old_conv.stride, padding=old_conv.padding, bias=(old_conv.bias is not None))
-        with torch.no_grad():
-            new_conv.weight[:, :3, :, :] = old_conv.weight
-            # Initialize depth channel as the mean of the RGB weights to preserve ImageNet statistics
-            new_conv.weight[:, 3:4, :, :] = old_conv.weight.mean(dim=1, keepdim=True)
-            if old_conv.bias is not None:
-                new_conv.bias = old_conv.bias
-                
-        if hasattr(model, 'stem'): model.stem.proj = new_conv
-        else: model.patch_embed1.proj = new_conv
-
-    def _adapt_1channel_patch_embed(self, model):
-        """Collapses 3-channel pretrained weights into a single thermal dimension."""
-        old_conv = model.stem.proj if hasattr(model, 'stem') else model.patch_embed1.proj
-        new_conv = nn.Conv2d(1, old_conv.out_channels, kernel_size=old_conv.kernel_size, 
-                             stride=old_conv.stride, padding=old_conv.padding, bias=(old_conv.bias is not None))
-        with torch.no_grad():
-            new_conv.weight[:, 0:1, :, :] = old_conv.weight.sum(dim=1, keepdim=True)
-            if old_conv.bias is not None:
-                new_conv.bias = old_conv.bias
-                
-        if hasattr(model, 'stem'): model.stem.proj = new_conv
-        else: model.patch_embed1.proj = new_conv
-
     def forward(self, rgbd, therm_masked, therm_target=None, block_mask=None):
         # --- 1. CONTEXT ENCODING (The Observable World) ---
+        # SMP encoders naturally return a list of spatial hierarchies
         rgbd_features = self.rgbd_encoder(rgbd)
         therm_context_features = self.therm_encoder(therm_masked)
         
+        # Extract the highest semantic level from the hierarchy
         z_rgbd = rgbd_features[-1] 
         z_therm_ctx = therm_context_features[-1]
         
+        # Intermediate Fusion 
         z_context = self.fusion_head(z_rgbd, z_therm_ctx)
         
+        # Downstream Structural Prediction
         seg_logits = self.decode_head(z_context)
+        # Upsample back to native resolution (H, W)
         seg_logits = F.interpolate(seg_logits, size=rgbd.shape[2:], mode='bilinear', align_corners=False)
 
+        # --- 2. DEPLOYMENT SHORT-CIRCUIT ---
         if therm_target is None or block_mask is None:
             return seg_logits
 
-        # --- 2. TARGET ENCODING (The Pristine Physics) ---
-        with torch.no_grad():
+        # --- 3. TARGET ENCODING (The Pristine Physics) ---
+        with torch.no_grad(): # Explicit Stop-Gradient ensures the target encoder is locked
             therm_target_features = self.therm_encoder(therm_target)
             z_target = therm_target_features[-1]
             
-        # --- 3. LATENT INFERENCE (True JEPA Target Selectivity) ---
+        # --- 4. LATENT INFERENCE (True JEPA Target Selectivity) ---
         z_pred = self.latent_predictor(z_context, block_mask)
         
         return seg_logits, z_pred, z_target
