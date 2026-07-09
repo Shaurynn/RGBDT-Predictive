@@ -141,8 +141,8 @@ class SpatialJEPAPredictor(nn.Module):
 class ModalityIsolatedPatchEmbed(nn.Module):
     """
     Physically isolates modality ingestion at the stem.
-    Integrates Learnable Physical Calibration Priors to recover absolute metric 
-    and radiometric scale lost during numerical dataset standardization.
+    Integrates Learnable Physical Calibration Priors and a 1x1 Alignment Projection 
+    to securely fuse unaligned sensor manifolds.
     """
     def __init__(self, original_proj):
         super().__init__()
@@ -162,53 +162,82 @@ class ModalityIsolatedPatchEmbed(nn.Module):
         if self.depth_therm_proj.bias is not None:
             nn.init.zeros_(self.depth_therm_proj.bias)
             
-        # --- Learnable Physical Calibration Priors ---
-        # Allows the network to dynamically recover physical scale (gamma) and shift (beta)
+        # --- 1. Learnable Physical Calibration Priors ---
         self.dt_scale = nn.Parameter(torch.ones(1, 2, 1, 1))
         self.dt_bias = nn.Parameter(torch.zeros(1, 2, 1, 1))
+        
+        # --- 2. The 1x1 Alignment Projection ---
+        # Aligns the Kaiming-initialized DT feature manifold with the 
+        # ImageNet-pretrained RGB manifold prior to additive fusion.
+        self.dt_alignment = nn.Conv2d(
+            in_channels=original_proj.out_channels,
+            out_channels=original_proj.out_channels,
+            kernel_size=1,
+            bias=False
+        )
+        # Dirac initialization ensures the layer starts as a stable identity mapping
+        nn.init.dirac_(self.dt_alignment.weight)
 
     def forward(self, x):
-        # Split 5-channel input into RGB (3ch) and Depth/Thermal (2ch)
         x_rgb = x[:, :3, :, :]
         x_dt = x[:, 3:, :, :]
         
-        # Dynamically recalibrate the physical streams prior to convolution
         x_dt_calibrated = (x_dt * self.dt_scale) + self.dt_bias
         
-        # Process separately and sum features within the latent embedding dimension
-        return self.rgb_proj(x_rgb) + self.depth_therm_proj(x_dt_calibrated)
+        dt_features = self.depth_therm_proj(x_dt_calibrated)
+        dt_aligned = self.dt_alignment(dt_features)
+        
+        # Additive fusion is now mathematically grounded across aligned vector spaces
+        return self.rgb_proj(x_rgb) + dt_aligned
     
 class MultimodalJEPA(nn.Module):
     def __init__(self, backbone_name='mit_b1'):
         super().__init__()
-        # Load strict 3-channel ImageNet weights
         self.context_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, weights='imagenet')
         
-        # Surgically replace the first overlap patch embedding projection with the isolated stems
         original_proj = self.context_encoder.patch_embed1.proj
         self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj)
         
         self.target_encoder = copy.deepcopy(self.context_encoder)
-        for p in self.target_encoder.parameters(): p.requires_grad = False
+        for p in self.target_encoder.parameters(): 
+            p.requires_grad = False
             
         self.predictor = SpatialJEPAPredictor(embed_dim=self.context_encoder.out_channels[-1])
+        
+        # --- The Learnable Encoder [MASK] Token ---
+        # 5-channel parameter representing missing data in the input space
+        self.encoder_mask_token = nn.Parameter(torch.zeros(1, 5, 1, 1))
+        nn.init.normal_(self.encoder_mask_token, std=0.02)
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.target_encoder.eval()
+        return self
 
     @torch.no_grad()
     def update_target_network(self, tau=0.996):
         for ctx_p, tgt_p in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
             tgt_p.data = tau * tgt_p.data + (1.0 - tau) * ctx_p.data
+            
+        for ctx_b, tgt_b in zip(self.context_encoder.buffers(), self.target_encoder.buffers()):
+            tgt_b.data = tau * tgt_b.data + (1.0 - tau) * ctx_b.data
 
     def forward(self, x_visible, x_full, high_res_mask):
-        z_context = self.context_encoder(x_visible)[-1]
+        B, C, H, W = x_full.shape
         
-        # Target execution remains pristine and deterministic
+        # Expand the 1-channel mask to the 5-channel input geometry
+        mask_expanded = high_res_mask.expand(-1, C, -1, -1)
+        
+        # --- Explicit Token Replacement ---
+        # Fills the zeroed-out regions of x_visible with the learnable mask token
+        x_context_input = x_visible + (self.encoder_mask_token * mask_expanded)
+        
+        z_context = self.context_encoder(x_context_input)[-1]
+        
         with torch.no_grad():
-            # Explicit .detach() severs the computational graph entirely, providing 
-            # an absolute mathematical guarantee against gradient leakage.
             z_target = self.target_encoder(x_full)[-1].detach()
             
-        B, C, H, W = z_context.shape
-        latent_mask = F.interpolate(high_res_mask, size=(H, W), mode='nearest')
+        latent_mask = F.interpolate(high_res_mask, size=z_context.shape[2:], mode='nearest')
         
         z_pred = self.predictor(z_context, latent_mask)
         return z_pred, z_target, latent_mask

@@ -45,7 +45,7 @@ def main():
         model.train()
         epoch_loss = 0.0
         
-        loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs} [Pre-Train]")
+        loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{cfg['epochs']} [Pre-Train]")
         for batch in loop:
             x_full = batch['x_full'].to(DEVICE)
             x_visible = batch['x_visible'].to(DEVICE)
@@ -106,10 +106,10 @@ def main():
             'target_encoder_state_dict': model.target_encoder.state_dict(),
             'predictor_state_dict': model.predictor.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'backbone': args.backbone
+            'backbone': cfg['backbone']
         }
-        torch.save(checkpoint, os.path.join(weight_dir, f"jepa_checkpoint_{args.backbone}.pt"))
-        torch.save(model.context_encoder.state_dict(), os.path.join(weight_dir, f"jepa_context_encoder_{args.backbone}.pt"))
+        torch.save(checkpoint, os.path.join(weight_dir, f"jepa_checkpoint_{cfg['backbone']}.pt"))
+        torch.save(model.context_encoder.state_dict(), os.path.join(weight_dir, f"jepa_context_encoder_{cfg['backbone']}.pt"))
 
 if __name__ == '__main__':
     main()

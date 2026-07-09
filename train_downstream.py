@@ -275,6 +275,7 @@ def get_dynamic_class_count(data_dir):
 def compute_dataset_statistics(dataloader, num_classes, ignore_index=255, max_batches=100):
     print("\n[*] Dynamically computing global dataset statistics (Laplace Smoothed)...")
     pseudo_count = 1.0
+    # Allow dynamic tracking of max indices if annotations exceed classes.txt length
     pixel_counts = torch.full((num_classes,), pseudo_count, dtype=torch.float64)
     
     for i, batch in enumerate(dataloader):
@@ -284,8 +285,21 @@ def compute_dataset_statistics(dataloader, num_classes, ignore_index=255, max_ba
         valid_targets = targets[valid_mask]
         
         if valid_targets.numel() > 0:
+            max_val = valid_targets.max().item()
+            if max_val >= pixel_counts.size(0):
+                # Dynamically expand tensor size if a larger label index is discovered in the split
+                new_size = max_val + 1
+                print(f"[!] WARNING: Encountered label index {max_val}, expanding statistics tensor from {pixel_counts.size(0)} to {new_size}")
+                expanded_counts = torch.full((new_size,), pseudo_count, dtype=torch.float64)
+                expanded_counts[:pixel_counts.size(0)] = pixel_counts
+                pixel_counts = expanded_counts
+                num_classes = new_size
+                
             counts = torch.bincount(valid_targets.flatten(), minlength=num_classes)
-            pixel_counts += counts.cpu()
+            # Ensure shape alignment if counts dimension grows
+            if counts.size(0) > pixel_counts.size(0):
+                counts = counts[:pixel_counts.size(0)]
+            pixel_counts[:counts.size(0)] += counts.cpu().double()
             
     total_pixels = pixel_counts.sum()
     frequencies = pixel_counts / total_pixels
@@ -297,8 +311,8 @@ def compute_dataset_statistics(dataloader, num_classes, ignore_index=255, max_ba
     alpha_list = [round(a, 4) for a in alpha.tolist()]
     gdl_list = [round(g, 4) for g in global_gdl_weights.tolist()]
     
-    print(f"[*] Computed Global Alpha Weights: {alpha_list}")
-    print(f"[*] Computed Global GDL Weights: {gdl_list}\n")
+    print(f"[*] Computed Global Alpha Weights ({len(alpha_list)} classes): {alpha_list}")
+    print(f"[*] Computed Global GDL Weights ({len(gdl_list)} classes): {gdl_list}\n")
     return alpha_list, gdl_list
 
 class SegmentationGradCAM:
