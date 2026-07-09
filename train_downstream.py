@@ -385,7 +385,8 @@ def main():
         pt_weights = os.path.join("weights", dataset_name, f"jepa_context_encoder_{cfg['backbone']}.pt")
         if os.path.exists(pt_weights):
             print(f"[*] Injecting Phase 1 MM-JEPA Foundation Weights: {pt_weights}")
-            model.context_encoder.load_state_dict(torch.load(pt_weights))
+            # Use strict=False to accommodate the newly added dt_alignment projection layer
+            model.context_encoder.load_state_dict(torch.load(pt_weights), strict=False)
             for param in model.context_encoder.parameters():
                 param.requires_grad = False
 
