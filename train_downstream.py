@@ -552,23 +552,70 @@ def main():
         return
 
     MAX_EPOCHS = cfg['epochs'].get(phase, cfg['epochs']['default'])
-    lr = cfg['learning_rates'].get(phase, cfg['learning_rates']['default'])
     
+    # --- 1. DEFAULT HYPERPARAMETERS (From YAML Config) ---
+    lr = cfg['learning_rates'].get(phase, cfg['learning_rates']['default'])
+    weight_decay = cfg.get('optimizer', {}).get('weight_decay', 1e-4)
+    gamma = 2.0
+    dice_weight = 1.0
+    
+    # --- 2. HPO INJECTION (Override defaults for Hero/Microtune) ---
+    if phase in ["hero", "microtune"] and state.get("inherit_weights"):
+        hpo_dir = os.path.dirname(state["inherit_weights"])
+        hpo_params_path = os.path.join(hpo_dir, "best_params.json")
+        
+        if os.path.exists(hpo_params_path):
+            print(f"\n[*] Injecting optimized hyperparameters from HPO phase: {hpo_params_path}")
+            with open(hpo_params_path, 'r') as f:
+                best_params = json.load(f)
+                
+            lr = best_params.get("lr", lr)
+            weight_decay = best_params.get("weight_decay", weight_decay)
+            gamma = best_params.get("gamma", gamma)
+            dice_weight = best_params.get("dice_weight", dice_weight)
+            
+            print(f"    -> LR: {lr:.2e} | WD: {weight_decay:.2e} | Gamma: {gamma:.2f} | Dice W: {dice_weight:.2f}")
+            
+            # Force the ultra-low learning rate for the final microtune phase, regardless of HPO
+            if phase == "microtune":
+                lr = cfg['learning_rates'].get('microtune', 1e-5)
+                print(f"[*] Microtune Phase: Overriding HPO learning rate to {lr:.2e} for end-to-end adjustment.")
+
     if phase == "microtune":
         print("[*] Microtune Phase: Unfreezing foundation backbone for end-to-end fine-tuning.")
         for param in model.parameters():
             param.requires_grad = True
 
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+    # --- 3. INSTANTIATE WITH INJECTED PARAMS ---
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=weight_decay)
     scaler = GradScaler('cuda', enabled=True)
     
     criterion = AlphaBalancedFocalGDLLoss(
         num_classes=NUM_CLASSES, 
         alpha=empirical_alpha, 
-        global_gdl_weights=global_gdl
+        global_gdl_weights=global_gdl,
+        gamma=gamma,
+        dice_weight=dice_weight
     ).to(DEVICE)
     
+    # --- NEW: MLOPS HYPERPARAMETER TRACKING ---
+    active_hparams = {
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "gamma": gamma,
+        "dice_weight": dice_weight,
+        "batch_size": cfg['batch_size'],
+        "kd_temperature": cfg.get('kd_temperature', 4.0)
+    }
+    
+    # Bind to the live state machine
+    state["hyperparameters"] = active_hparams
+    
     writer = SummaryWriter(log_dir=os.path.join(run_dir, "logs"))
+    
+    # Log cleanly to the TensorBoard "Text" tab
+    writer.add_text("Configuration/Hyperparameters", json.dumps(active_hparams, indent=4), 0)
+    
     cam_extractor = SegmentationGradCAM(model, model.decode_head.linear_pred)
 
     start_epoch = 0
@@ -726,6 +773,7 @@ def main():
     with open(results_path, 'w') as f:
         json.dump({
             "phase": phase, 
+            "hyperparameters": active_hparams,
             "best_mIoU": state.get("best_miou", 0.0)
         }, f, indent=4)
     print(f"[*] Phase '{phase}' completed successfully. Results recorded to {results_path}")
