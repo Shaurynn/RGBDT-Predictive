@@ -52,19 +52,29 @@ To satisfy the theoretical mandates of the Joint-Embedding Predictive Architectu
 
 $$\theta_{target} \leftarrow \tau \theta_{target} + (1 - \tau) \theta_{context}$$
 
-### 4.2 The Latent Predictive Objective & Context Consistency
+* **EMA Cosine Annealing and Target Isolation:**Early training epochs produce highly volatile context embeddings. Utilizing a static Exponential Moving Average (EMA) schedule (e.g., $\tau = 0.996$) forces the target network to absorb this chaotic initialization, risking representational collapse. TMLPN mitigates this via a Cosine Annealing Schedule, where the momentum parameter dynamically asymptotes from $0.996$ to $1.0$ over the total training steps, allowing the target manifold to stabilize as training concludes.
 
-Standard implementations of JEPA utilize sparse Transformer predictors that strictly process masked tokens. While mathematically elegant, sparse tensor routing fragments memory coalescing in TensorRT engines, resulting in severe latency penalties on bounded edge hardware. 
+$$\tau_i = 1 - (1 - \tau_{base}) \frac{\cos(\pi \cdot i / N) + 1}{2}$$
 
-To optimize throughput for edge inference, TMLPN utilizes a dense CNN predictor that processes the entire spatial map. To counteract the representational drift inherent in dense prediction networks, the architecture employs two mitigations:
+Furthermore, to prevent gradient leakage from external operational hooks or distributed training wrappers, the target network's outputs are explicitly severed from the computational graph via `.detach()`, providing a strict mathematical guarantee of isolation beyond standard `.eval()` and `no_grad()` contexts.
 
-1. **Residual Target Inference:** The predictor utilizes a strict residual connection ($\hat{z} = z_{context} + P_\psi(grid)$). This anchors the prediction to the observable world, forcing the convolutional layers to learn only the target spatial delta and naturally preserving context representations.
-2. **Dual-Objective Latent Loss:** The network evaluates the dense output via a unified loss function. Masked coordinates are optimized via the primary Target Inference Loss, while visible context coordinates are optimized via a down-weighted Context Consistency Loss. This auxiliary objective acts as a BYOL-style alignment mechanism, explicitly enforcing representational consistency between the online network and the EMA target manifold across the entire spatial grid.
+### 4.2 The Latent Predictive Objective & Variance Regularization
 
-$$\mathcal{L}_{Total} = \mathcal{L}_{Target} + \alpha \mathcal{L}_{Context}$$
-$$\mathcal{L}_{Total} = \frac{1}{|M|} \sum_{i \in M} \| \hat{z}_i - z_{target, i} \|_2^2 + \alpha \frac{1}{|C|} \sum_{j \in C} \| \hat{z}_j - z_{target, j} \|_2^2$$
+To optimize throughput for edge inference, TMLPN utilizes a dense CNN predictor that processes the entire spatial map. The resulting feature manifolds are optimized via a unified, three-part objective function designed to ensure gradient stability and prevent representational collapse:
 
-*(Where $M$ represents the masked coordinates, $C$ represents the visible context coordinates, and $\alpha = 0.1$ prevents the consistency objective from overpowering the primary inference task).*
+**1. $L_2$ Normalized Target Inference:** To prevent unbound gradient scaling as latent dimensions increase, both the predicted and target features are $L_2$-normalized along the channel dimension before MSE calculation. This projects the continuous multimodal representations onto a unit hypersphere, guaranteeing that the spatial prediction loss strictly measures cosine-equivalent directional alignment rather than arbitrary magnitude scaling.
+
+**2. Context Consistency:**
+A down-weighted auxiliary objective evaluated on the visible (unmasked) coordinates to explicitly enforce representational consistency across the spatial grid, neutralizing the representational drift inherent in dense convolutional prediction.
+
+**3. Variance Hinge Regularization:**
+While standard I-JEPA relies solely on EMA momentum to prevent representation collapse, high-dimensional unaligned multimodal data is highly susceptible to dimensional shrinkage. Rather than utilizing computationally hostile covariance mechanisms (e.g., SIGReg) which violate edge-hardware constraints, TMLPN integrates a lightweight Variance Hinge Penalty (adapted from VICReg). By explicitly penalizing the network if the channel-wise standard deviation $\sigma$ falls below $1.0$, the architecture mathematically guarantees a diverse, non-collapsed embedding space with minimal computational overhead.
+
+$$\mathcal{L}_{Total} = \mathcal{L}_{Target} + \alpha \mathcal{L}_{Context} + \lambda \mathcal{L}_{Var}$$
+
+$$\mathcal{L}_{Var} = \frac{1}{C} \sum_{c=1}^{C} \max(0, 1 - \sqrt{\text{Var}(z_{target}^{(c)}) + \epsilon})$$
+
+*(Where $\alpha = 0.1$ and $\lambda = 0.1$ balance consistency and spatial diversity without overpowering the primary target inference).*
 
 ---
 
@@ -104,6 +114,8 @@ To break representational capacity ceilings during edge deployment, the pipeline
 
 **2. Dynamic Class-Weighting (DCW) as Class-Level OHEM:**
 While Focal Loss targets pixel-level hesitation, TMLPN targets class-level failure modes using a continuous Dynamic Class-Weighting (DCW) schedule (Huang et al., 2020). Operating as a differentiable, class-level analog to Online Hard Example Mining (OHEM) (Shrivastava et al., 2016), DCW tracks an Exponential Moving Average of the validation IoU. The downstream Dice penalty is exponentially scaled on the fly via $W_c = \exp(\tau \cdot (1 - \text{IoU}_c))$. This applies a smooth, non-linear amplification to lagging minority classes, prioritizing convergence on complex structural defects without inducing the gradient shocks common to discrete OHEM step-functions.
+
+Algorithmic Stability in Bounded Edge-Hardware:Operating under strict memory constraints necessitates small batch sizes. This invalidates standard batch-wise Generalized Dice Loss (GDL), as structural defect classes are frequently absent from individual iterations, causing destructive gradient sparsity. TMLPN mitigates this via Global Volume Anchoring. Rather than scaling intersections dynamically per batch, GDL weights are anchored to the inverse square of the global dataset frequencies.Furthermore, arbitrary bounds on class-imbalance modifiers are replaced with Additive Laplace Smoothing. By injecting a uniform pseudo-count $\epsilon$ across the active pixel distribution prior to Median Frequency Balancing, theoretical limits are naturally bounded by the dataset's native volume. This provides mathematically rigorous suppression of the background class without resorting to unjustified heuristic clipping, while explicit tensor clamping within the Focal computation guarantees absolute safety against floating-point overflow during unaligned gradient shocks.
 
 ---
 

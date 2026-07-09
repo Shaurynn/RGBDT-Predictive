@@ -1,0 +1,40 @@
+# ==========================================
+# TMLPN Experiment Configuration
+# ==========================================
+
+dataset:
+  name: "MM5"
+  image_height: 480
+  image_width: 640
+  # Note: Metric caps (depth/thermal) are strictly handled via dataset metadata.json
+
+phase1_pretraining:
+  backbone: "mit_b1"
+  batch_size: 8
+  epochs: 100
+  optimizer:
+    lr: 1.0e-4
+    weight_decay: 0.04
+  jepa:
+    mask_ratio: 0.60
+    tau_base: 0.996
+
+phase2_downstream:
+  backbone: "mit_b1"
+  teacher_backbone: "mit_b4"
+  batch_size: 6
+  kd_temperature: 4.0
+  hpo:
+    n_trials: 30
+    lr_min: 1.0e-5
+    lr_max: 5.0e-3
+    wd_min: 1.0e-4
+    wd_max: 1.0e-1
+  epochs:
+    baseline: 30
+    hero: 300
+    microtune: 50
+    default: 200
+  learning_rates:
+    default: 1.0e-4
+    microtune: 1.0e-5

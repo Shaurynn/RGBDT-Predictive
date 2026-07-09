@@ -1,7 +1,6 @@
 import os
 import glob
 import json
-import inspect
 import random
 import torch
 import cv2
@@ -17,8 +16,9 @@ from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from dataset_jepa import DownstreamSegmentationDataset # (Must implement this in your dataset.py)
+from dataset_jepa import DownstreamSegmentationDataset
 import models  
+from config_utils import parse_with_config
 
 def enforce_reproducibility(seed=42):
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -31,18 +31,11 @@ def enforce_reproducibility(seed=42):
     torch.backends.cudnn.benchmark = False
 
 # ====================================================================================
-# --- LOSSES & METRICS (Restored from Original Pipeline) ---
+# --- LOSSES & METRICS ---
 # ====================================================================================
 
 class AlphaBalancedFocalGDLLoss(nn.Module):
-    """
-    Alpha-Balanced Focal Loss combined with Generalized Dice Loss (GDL).
-    - Alpha Balancing suppresses background dominance via static empirical frequencies (Lin et al., 2017).
-    - Generalized Dice Loss handles dynamic weighting natively within the batch by scaling 
-      class intersections by the inverse square of their volume (Sudre et al., 2017).
-      This eliminates arbitrary momentum/temperature hyperparameters and preserves gradient stability.
-    """
-    def __init__(self, num_classes, alpha=None, gamma=2.0, dice_weight=1.0, ignore_index=255, eps=1e-6):
+    def __init__(self, num_classes, alpha=None, global_gdl_weights=None, gamma=2.0, dice_weight=1.0, ignore_index=255, eps=1e-6):
         super().__init__()
         self.num_classes = num_classes
         self.gamma = gamma
@@ -54,13 +47,18 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
             self.register_buffer('alpha', torch.ones(num_classes))
         else:
             self.register_buffer('alpha', torch.tensor(alpha, dtype=torch.float32))
+            
+        if global_gdl_weights is None:
+            self.register_buffer('gdl_weights', torch.ones(num_classes))
+        else:
+            self.register_buffer('gdl_weights', torch.tensor(global_gdl_weights, dtype=torch.float32))
 
     def forward(self, inputs, targets):
-        inputs = torch.clamp(inputs.float(), min=-100.0, max=100.0)
+        inputs = torch.clamp(inputs.float(), min=-20.0, max=20.0)
         
-        # --- 1. Alpha-Balanced Focal Loss ---
         ce_loss = F.cross_entropy(inputs, targets, reduction='none', ignore_index=self.ignore_index)
-        pt = torch.exp(-ce_loss)
+        ce_loss_safe = torch.clamp(ce_loss, min=0.0, max=50.0)
+        pt = torch.exp(-ce_loss_safe)
         
         valid_mask = (targets != self.ignore_index)
         alpha_t = torch.ones_like(targets, dtype=torch.float32)
@@ -68,7 +66,6 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
         
         focal_loss = (alpha_t * (1 - pt) ** self.gamma * ce_loss).mean()
 
-        # --- 2. Generalized Dice Loss (GDL) ---
         valid_inputs = inputs.permute(0, 2, 3, 1)[valid_mask] 
         valid_targets = targets[valid_mask]                   
         
@@ -78,21 +75,16 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
             inputs_soft = F.softmax(valid_inputs, dim=1)
             targets_one_hot = F.one_hot(valid_targets, num_classes=self.num_classes).float()
             
-            # Compute intersection and volumes
             intersection = (inputs_soft * targets_one_hot).sum(dim=0)
             ground_truth_volume = targets_one_hot.sum(dim=0)
             pred_volume = inputs_soft.sum(dim=0)
             
-            # GDL Dynamic Weights: Inverse square of ground truth volume
-            # Adding epsilon prevents division by zero for absent classes in the batch
-            gdl_weights = 1.0 / (ground_truth_volume ** 2 + self.eps)
-            
-            # Filter out completely unrepresented classes to prevent noise inflation
-            present_classes = ground_truth_volume > 0
+            w = self.gdl_weights.to(inputs.device)
+            present_classes = w > 0
             
             if present_classes.sum() > 0:
-                numerator = 2.0 * (gdl_weights[present_classes] * intersection[present_classes]).sum()
-                denominator = (gdl_weights[present_classes] * (ground_truth_volume[present_classes] + pred_volume[present_classes])).sum()
+                numerator = 2.0 * (w[present_classes] * intersection[present_classes]).sum()
+                denominator = (w[present_classes] * (ground_truth_volume[present_classes] + pred_volume[present_classes])).sum()
                 dice_loss = 1.0 - (numerator / (denominator + self.eps))
             else:
                 dice_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
@@ -175,7 +167,7 @@ class ExperimentManager:
         self.model_name = model_instance.__class__.__name__
         self.dataset = dataset
         self.backbone = backbone
-        self.model_dir = os.path.join(base_dir, self.model_name, self.dataset,self.backbone)
+        self.model_dir = os.path.join(base_dir, self.model_name, self.dataset, self.backbone)
         os.makedirs(self.model_dir, exist_ok=True)
         self.phase_sequence = ["baseline", "hpo", "hero", "microtune", "export"]
         
@@ -205,20 +197,22 @@ class ExperimentManager:
         state["is_resume"] = True
         return state
 
-def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_loader, eval_loader, num_classes, empirical_alpha, device):
+def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_loader, eval_loader, num_classes, empirical_alpha, global_gdl, device, cfg_hpo):
     def objective(trial):
         model = ModelClass(**model_kwargs).to(device)
         if inherit_weights and os.path.exists(inherit_weights): model.load_state_dict(torch.load(inherit_weights))
-        lr = trial.suggest_float("lr", 1e-5, 5e-3, log=True)
-        wd = trial.suggest_float("weight_decay", 1e-4, 1e-1, log=True)
+        
+        lr = trial.suggest_float("lr", cfg_hpo['lr_min'], cfg_hpo['lr_max'], log=True)
+        wd = trial.suggest_float("weight_decay", cfg_hpo['wd_min'], cfg_hpo['wd_max'], log=True)
         gamma = trial.suggest_float("gamma", 1.0, 4.0)
         dice = trial.suggest_float("dice_weight", 0.5, 2.0)
+        
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
         
-        # Inject the updated GDL loss and the dynamic alpha array into the HPO sweep
         criterion = AlphaBalancedFocalGDLLoss(
             num_classes=num_classes, 
             alpha=empirical_alpha, 
+            global_gdl_weights=global_gdl,
             gamma=gamma, 
             dice_weight=dice
         ).to(device)
@@ -234,8 +228,20 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
                 with autocast('cuda', dtype=torch.bfloat16):
                     pred_seg = model(x_full)
                     loss = criterion(pred_seg, seg_mask)
+                
+                # Safe Gradient Scaling
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                is_valid_gradients = True
+                for param in model.parameters():
+                    if param.grad is not None and not torch.isfinite(param.grad).all():
+                        is_valid_gradients = False
+                        break
+                
+                if is_valid_gradients:
+                    scaler.step(optimizer)
                 scaler.update()
             
             model.eval()
@@ -253,35 +259,24 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
         return best_miou
 
     study = optuna.create_study(direction="maximize", pruner=optuna.pruners.HyperbandPruner())
-    study.optimize(objective, n_trials=30)
+    study.optimize(objective, n_trials=cfg_hpo['n_trials'])
     with open(os.path.join(run_dir, "best_params.json"), "w") as f: json.dump(study.best_params, f, indent=4)
     return study.best_value
 
 def get_dynamic_class_count(data_dir):
-    """
-    Reads the absolute class count from the dataset manifest.
-    Removes hardcoded architectural assumptions.
-    """
     class_file = os.path.join(data_dir, "classes.txt")
     if not os.path.exists(class_file):
-        raise FileNotFoundError(
-            f"[!] CRITICAL: {class_file} not found. "
-            "A strict dataset manifest is required to dynamically set the architecture geometry."
-        )
+        raise FileNotFoundError(f"[!] CRITICAL: {class_file} not found.")
     with open(class_file, "r") as f:
         num_classes = len([line for line in f if line.strip()])
     print(f"[*] Dynamically detected {num_classes} classes from dataset manifest.")
     return num_classes
 
-def compute_empirical_alpha(dataloader, num_classes, ignore_index=255, max_batches=100):
-    """
-    Dynamically computes the dataset class frequencies using Median Frequency Balancing.
-    Samples a subset of batches to prevent massive overhead during initialization.
-    """
-    print("\n[*] Dynamically computing empirical alpha weights from dataset distribution...")
-    pixel_counts = torch.zeros(num_classes, dtype=torch.float64)
+def compute_dataset_statistics(dataloader, num_classes, ignore_index=255, max_batches=100):
+    print("\n[*] Dynamically computing global dataset statistics (Laplace Smoothed)...")
+    pseudo_count = 1.0
+    pixel_counts = torch.full((num_classes,), pseudo_count, dtype=torch.float64)
     
-    # Sample the dataloader to build a statistically significant distribution
     for i, batch in enumerate(dataloader):
         if i >= max_batches: break
         targets = batch['seg_mask']
@@ -293,94 +288,106 @@ def compute_empirical_alpha(dataloader, num_classes, ignore_index=255, max_batch
             pixel_counts += counts.cpu()
             
     total_pixels = pixel_counts.sum()
-    if total_pixels == 0:
-        return torch.ones(num_classes).tolist()
-        
-    # 1. Calculate raw frequencies
     frequencies = pixel_counts / total_pixels
+    median_freq = torch.median(frequencies)
+    alpha = median_freq / frequencies
+    gdl_raw_weights = 1.0 / (frequencies ** 2)
+    global_gdl_weights = gdl_raw_weights / gdl_raw_weights.max()
     
-    # 2. Extract median frequency (ignoring absent classes in the sample)
-    valid_freqs = frequencies[frequencies > 0]
-    median_freq = torch.median(valid_freqs) if len(valid_freqs) > 0 else 1.0
-    
-    # 3. Compute Alpha: Median Frequency Balancing
-    epsilon = 1e-5
-    alpha = median_freq / (frequencies + epsilon)
-    
-    # 4. Clamp to prevent exploding gradients on microscopic defect classes, 
-    # while allowing massive background classes to be heavily suppressed (e.g., 0.01)
-    alpha = torch.clamp(alpha, min=0.01, max=10.0)
-    
-    # Set completely absent classes in the sample to a neutral 1.0 weight
-    alpha[frequencies == 0] = 1.0 
-    
-    # Round for clean console output
     alpha_list = [round(a, 4) for a in alpha.tolist()]
-    print(f"[*] Computed Dataset-Specific Alpha Weights: {alpha_list}\n")
-    return alpha_list
+    gdl_list = [round(g, 4) for g in global_gdl_weights.tolist()]
+    
+    print(f"[*] Computed Global Alpha Weights: {alpha_list}")
+    print(f"[*] Computed Global GDL Weights: {gdl_list}\n")
+    return alpha_list, gdl_list
+
+class SegmentationGradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.activations = None
+        self.gradients = None
+        self.target_layer.register_forward_hook(self.save_activation)
+        self.target_layer.register_full_backward_hook(self.save_gradient)
+
+    def save_activation(self, module, input, output):
+        self.activations = output
+
+    def save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
+
+    def generate_cam(self, input_tensor, target_class):
+        self.model.eval()
+        self.model.zero_grad()
+        logits = self.model(input_tensor)
+        target_logits = logits[:, target_class, :, :]
+        loss = target_logits.sum()
+        loss.backward(retain_graph=True)
+        pooled_gradients = torch.mean(self.gradients, dim=[0, 2, 3])
+        activations = self.activations.detach()
+        for i in range(activations.shape[1]):
+            activations[:, i, :, :] *= pooled_gradients[i]
+        heatmap = torch.mean(activations, dim=1).squeeze()
+        heatmap = F.relu(heatmap)
+        if torch.max(heatmap) > 0:
+            heatmap /= torch.max(heatmap)
+        return heatmap.cpu().numpy(), logits.detach()
 
 def main():
-    parser = argparse.ArgumentParser(description="Phase 2: Downstream Supervised Semantic Segmentation")
-    parser.add_argument("--backbone", type=str, default="mit_b1", help="Vision Transformer backbone")
-    parser.add_argument("--dataset", type=str, default="MM5", help="Path to MM5 dataset")
-    parser.add_argument("--batch_size", type=int, default=6, help="Batch size for finetuning")
-    parser.add_argument("--teacher_weights", type=str, default=None, help="Path to teacher weights for KD")
-    parser.add_argument("--teacher_backbone", type=str, default="mit_b4", help="Teacher backbone architecture")
-    args = parser.parse_args()
+    args, config = parse_with_config("Phase 2: Downstream Supervised Semantic Segmentation")
+    
+    # --- Extracted Configuration Parameters ---
+    cfg = config['phase2_downstream']
+    img_size = (config['dataset']['image_height'], config['dataset']['image_width'])
+    dataset_name = config['dataset']['name']
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # --- 1. DYNAMIC GEOMETRY ---
-    # Fetch exact class count before instantiating any architectural components
-    data_dir = os.path.join("dataset", args.dataset)
+    data_dir = os.path.join("dataset", dataset_name)
     NUM_CLASSES = get_dynamic_class_count(data_dir)
     
-    train_dataset = DownstreamSegmentationDataset(data_dir=data_dir, split="train")
-    eval_dataset = DownstreamSegmentationDataset(data_dir=data_dir, split="eval")
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    train_dataset = DownstreamSegmentationDataset(data_dir=data_dir, split="train", image_size=img_size)
+    eval_dataset = DownstreamSegmentationDataset(data_dir=data_dir, split="eval", image_size=img_size)
+    train_loader = DataLoader(train_dataset, batch_size=cfg['batch_size'], shuffle=True, num_workers=4)
+    eval_loader = DataLoader(eval_dataset, batch_size=cfg['batch_size'], shuffle=False, num_workers=4)
     
-    # --- 2. DYNAMIC LOSS STATISTICS ---
-    # Compute this immediately so both HPO and Hero phases share the exact same alpha distribution
-    empirical_alpha = compute_empirical_alpha(train_loader, NUM_CLASSES)
+    empirical_alpha, global_gdl = compute_dataset_statistics(train_loader, NUM_CLASSES)
     
-    model = models.TMLPN_Downstream(num_classes=NUM_CLASSES, backbone_name=args.backbone).to(DEVICE)
+    model = models.TMLPN_Downstream(num_classes=NUM_CLASSES, backbone_name=cfg['backbone']).to(DEVICE)
     
-    # KNOWLEDGE DISTILLATION (Optional Teacher)
     teacher_model = None
-    if args.teacher_weights and os.path.exists(args.teacher_weights):
-        teacher_model = models.TMLPN_Downstream(num_classes=NUM_CLASSES, backbone_name=args.teacher_backbone).to(DEVICE)
+    if getattr(args, 'teacher_weights', None) and os.path.exists(args.teacher_weights):
+        teacher_model = models.TMLPN_Downstream(num_classes=NUM_CLASSES, backbone_name=cfg['teacher_backbone']).to(DEVICE)
         teacher_model.load_state_dict(torch.load(args.teacher_weights))
         teacher_model.eval()
         for p in teacher_model.parameters(): p.requires_grad = False
     
-    manager = ExperimentManager(model_instance=model, backbone=args.backbone)
+    manager = ExperimentManager(model_instance=model, dataset=dataset_name, backbone=cfg['backbone'])
     state = manager.detect_state()
     if state is None: return 
     run_dir, phase = state["run_dir"], state["phase"]
 
-    # INJECT PHASE 1 WEIGHTS IF IN BASELINE
     if phase == "baseline" and not state["is_resume"]:
-        pt_weights = os.path.join("weights", args.dataset, f"jepa_context_encoder_{args.backbone}.pt")
+        pt_weights = os.path.join("weights", dataset_name, f"jepa_context_encoder_{cfg['backbone']}.pt")
         if os.path.exists(pt_weights):
             print(f"[*] Injecting Phase 1 MM-JEPA Foundation Weights: {pt_weights}")
             model.context_encoder.load_state_dict(torch.load(pt_weights))
-            # Freeze the Context Backbone to evaluate strict linear probing
             for param in model.context_encoder.parameters():
                 param.requires_grad = False
 
     if phase == "hpo":
-        # Pass empirical_alpha into the HPO function
         score = run_hpo_phase(
             run_dir, 
             state["inherit_weights"], 
             models.TMLPN_Downstream, 
-            {"num_classes": NUM_CLASSES}, 
+            {"num_classes": NUM_CLASSES, "backbone_name": cfg['backbone']}, 
             train_loader, 
             eval_loader, 
             NUM_CLASSES, 
             empirical_alpha, 
-            DEVICE
+            global_gdl,
+            DEVICE,
+            cfg['hpo']
         )
         with open(os.path.join(run_dir, "results.json"), 'w') as f: json.dump({"phase": phase, "best_mIoU": score}, f)
         return
@@ -389,17 +396,42 @@ def main():
         with open(os.path.join(run_dir, "results.json"), 'w') as f: json.dump({"phase": phase}, f)
         return
 
-    MAX_EPOCHS = 150 if phase == "baseline" else (300 if phase == "hero" else 200)
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
+    MAX_EPOCHS = cfg['epochs'].get(phase, cfg['epochs']['default'])
+    lr = cfg['learning_rates'].get(phase, cfg['learning_rates']['default'])
+    
+    if phase == "microtune":
+        print("[*] Microtune Phase: Unfreezing foundation backbone for end-to-end fine-tuning.")
+        for param in model.parameters():
+            param.requires_grad = True
+
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
     scaler = GradScaler('cuda', enabled=True)
     
-    
-    empirical_alpha = compute_empirical_alpha(train_loader, NUM_CLASSES)   
-    criterion = AlphaBalancedFocalGDLLoss(num_classes=NUM_CLASSES, alpha=empirical_alpha).to(DEVICE)
+    criterion = AlphaBalancedFocalGDLLoss(
+        num_classes=NUM_CLASSES, 
+        alpha=empirical_alpha, 
+        global_gdl_weights=global_gdl
+    ).to(DEVICE)
     
     writer = SummaryWriter(log_dir=os.path.join(run_dir, "logs"))
+    cam_extractor = SegmentationGradCAM(model, model.decode_head.linear_pred)
 
-    for epoch in range(state["start_epoch"], MAX_EPOCHS):
+    start_epoch = 0
+    if state["is_resume"]:
+        checkpoint_path = os.path.join(run_dir, "checkpoint.pt")
+        if os.path.exists(checkpoint_path):
+            print(f"\n[*] CRITICAL: Resuming interrupted run from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            start_epoch = checkpoint['epoch']
+            state["best_miou"] = checkpoint['best_miou']
+            print(f"[*] Successfully restored state. Resuming strictly at Epoch {start_epoch + 1}")
+        else:
+            print("\n[!] WARNING: JSON state indicated resume, but no checkpoint.pt found. Starting from Epoch 1.")
+
+    for epoch in range(start_epoch, MAX_EPOCHS):
         model.train()
         train_loss = 0.0
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS} [{phase}]")
@@ -415,53 +447,90 @@ def main():
                 if teacher_model is not None:
                     with torch.no_grad():
                         t_seg = teacher_model(x_full)
-                    loss_kd = knowledge_distillation_loss(pred_seg, t_seg, temperature=4.0)
+                    loss_kd = knowledge_distillation_loss(pred_seg, t_seg, temperature=cfg.get('kd_temperature', 4.0))
                     loss = (0.5 * loss) + (0.5 * loss_kd)
                     
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            train_loss += loss.item()
             
-        # Evaluation
+            # --- AMP Exception Handling & Gradient Safety ---
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            is_valid_gradients = True
+            for param in model.parameters():
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    is_valid_gradients = False
+                    break
+            
+            if is_valid_gradients:
+                scaler.step(optimizer)
+            else:
+                print(f"\n[!] WARNING: Unstable gradients (NaN/Inf) detected at Epoch {epoch+1}. Skipping optimizer step.")
+                
+            scaler.update()
+            
+            train_loss += loss.item()
+            loop.set_postfix(loss=loss.item())
+            
+        avg_train_loss = train_loss / len(train_loader)
+        writer.add_scalar("Loss/Train", avg_train_loss, epoch)
+            
         model.eval()
+        val_loss = 0.0
         val_iou = IoUMetric(NUM_CLASSES, DEVICE)
-        with torch.no_grad():
+        logged_image = False 
+        
+        with torch.no_grad(): 
             for batch in eval_loader:
                 x_full, seg_mask = batch['x_full'].to(DEVICE), batch['seg_mask'].to(DEVICE)
+                
                 with autocast('cuda', dtype=torch.bfloat16):
                     pred_seg = model(x_full)
+                    loss = criterion(pred_seg, seg_mask)
+                    val_loss += loss.item()
+                    
                 val_iou.update(pred_seg, seg_mask)
                 
+                if not logged_image and epoch % 5 == 0:
+                    with torch.enable_grad(): 
+                        heatmap, _ = cam_extractor.generate_cam(x_full[0:1], target_class=1)
+                        
+                    rgb_vis = x_full[0, :3].cpu().numpy().transpose(1, 2, 0)
+                    rgb_vis = (rgb_vis - rgb_vis.min()) / (rgb_vis.max() - rgb_vis.min() + 1e-8)
+                    
+                    heatmap_resized = cv2.resize(heatmap, (rgb_vis.shape[1], rgb_vis.shape[0]))
+                    heatmap_color = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
+                    heatmap_color = np.float32(heatmap_color) / 255
+                    heatmap_color = heatmap_color[:, :, ::-1] 
+                    
+                    overlay = 0.5 * rgb_vis + 0.5 * heatmap_color
+                    writer.add_image("Explainability/GradCAM_Defect_Focus", overlay.transpose(2, 0, 1), epoch)
+                    logged_image = True
+        
+        avg_val_loss = val_loss / len(eval_loader)
         avg_val_miou = val_iou.get_miou()
-        writer.add_scalar("Metrics/Validation_mIoU", avg_val_miou, epoch)
+        per_class_ious = val_iou.get_per_class_iou()
         
-        if phase == "hero": criterion.update_dynamic_weights(val_iou.get_per_class_iou())
+        writer.add_scalar("Loss/Validation", avg_val_loss, epoch)
+        writer.add_scalar("Metrics/mIoU_Validation", avg_val_miou, epoch)
         
-        if avg_val_miou > state["best_miou"]:
+        for c in range(NUM_CLASSES):
+            writer.add_scalar(f"Class_IoU/Class_{c}", per_class_ious[c].item(), epoch)
+
+        if avg_val_miou > state.get("best_miou", 0.0):
             state["best_miou"] = avg_val_miou
             torch.save(model.state_dict(), os.path.join(run_dir, "best_model.pt"))
             
-        with open(os.path.join(run_dir, "state.json"), 'w') as f: json.dump(state, f)
-
-    # FINAL DIAGNOSTICS (TTA)
-    print("\n🔬 INITIATING COMPREHENSIVE TTA ROBUSTNESS DIAGNOSTICS")
-    model.load_state_dict(torch.load(os.path.join(run_dir, "best_model.pt")))
-    tta_model = TTAWrapper(model).eval()
-    
-    metrics = {'base': IoUMetric(NUM_CLASSES, DEVICE), 'tta': IoUMetric(NUM_CLASSES, DEVICE)}
-    with torch.no_grad():
-        for batch in tqdm(eval_loader, desc="Diagnostic Pass"):
-            x_full, seg_mask = batch['x_full'].to(DEVICE), batch['seg_mask'].to(DEVICE)
-            with autocast('cuda', dtype=torch.bfloat16):
-                logits_base = model(x_full)
-                logits_tta, _ = tta_model(x_full)
-                metrics['base'].update(logits_base, seg_mask)
-                metrics['tta'].update(logits_tta, seg_mask)
-
-    print(f"Standard mIoU: {metrics['base'].get_miou():.4f} | TTA mIoU: {metrics['tta'].get_miou():.4f}")
-    with open(os.path.join(run_dir, "results.json"), 'w') as f:
-        json.dump({"phase": phase, "final_base_mIoU": metrics['base'].get_miou(), "final_tta_mIoU": metrics['tta'].get_miou()}, f)
+        torch.save({
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'best_miou': state.get("best_miou", 0.0)
+        }, os.path.join(run_dir, "checkpoint.pt"))
+            
+        with open(os.path.join(run_dir, "state.json"), 'w') as f: 
+            json.dump(state, f, indent=4)
 
 if __name__ == '__main__':
     enforce_reproducibility()

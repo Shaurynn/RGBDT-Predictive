@@ -140,13 +140,15 @@ class SpatialJEPAPredictor(nn.Module):
 
 class ModalityIsolatedPatchEmbed(nn.Module):
     """
-    Physically isolates modality ingestion at the stem to prevent low-level kernel corruption 
-    from 3-channel ImageNet weights when processing unaligned multimodal data.
+    Physically isolates modality ingestion at the stem.
+    Integrates Learnable Physical Calibration Priors to recover absolute metric 
+    and radiometric scale lost during numerical dataset standardization.
     """
     def __init__(self, original_proj):
         super().__init__()
         # Inherit unmodified weights for RGB (channels 0-2)
         self.rgb_proj = original_proj
+        
         # Kaiming-initialized independent filters for Depth and Thermal (channels 3-4)
         self.depth_therm_proj = nn.Conv2d(
             in_channels=2, 
@@ -159,13 +161,23 @@ class ModalityIsolatedPatchEmbed(nn.Module):
         nn.init.kaiming_normal_(self.depth_therm_proj.weight, mode='fan_out', nonlinearity='relu')
         if self.depth_therm_proj.bias is not None:
             nn.init.zeros_(self.depth_therm_proj.bias)
+            
+        # --- Learnable Physical Calibration Priors ---
+        # Allows the network to dynamically recover physical scale (gamma) and shift (beta)
+        self.dt_scale = nn.Parameter(torch.ones(1, 2, 1, 1))
+        self.dt_bias = nn.Parameter(torch.zeros(1, 2, 1, 1))
 
     def forward(self, x):
         # Split 5-channel input into RGB (3ch) and Depth/Thermal (2ch)
         x_rgb = x[:, :3, :, :]
         x_dt = x[:, 3:, :, :]
+        
+        # Dynamically recalibrate the physical streams prior to convolution
+        x_dt_calibrated = (x_dt * self.dt_scale) + self.dt_bias
+        
         # Process separately and sum features within the latent embedding dimension
-        return self.rgb_proj(x_rgb) + self.depth_therm_proj(x_dt)
+        return self.rgb_proj(x_rgb) + self.depth_therm_proj(x_dt_calibrated)
+    
 class MultimodalJEPA(nn.Module):
     def __init__(self, backbone_name='mit_b1'):
         super().__init__()
@@ -189,8 +201,11 @@ class MultimodalJEPA(nn.Module):
     def forward(self, x_visible, x_full, high_res_mask):
         z_context = self.context_encoder(x_visible)[-1]
         
+        # Target execution remains pristine and deterministic
         with torch.no_grad():
-            z_target = self.target_encoder(x_full)[-1]
+            # Explicit .detach() severs the computational graph entirely, providing 
+            # an absolute mathematical guarantee against gradient leakage.
+            z_target = self.target_encoder(x_full)[-1].detach()
             
         B, C, H, W = z_context.shape
         latent_mask = F.interpolate(high_res_mask, size=(H, W), mode='nearest')
