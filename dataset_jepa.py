@@ -5,10 +5,59 @@ import json
 import math
 import torch
 import numpy as np
+import pandas as pd
+from PIL import Image
 from typing import Tuple, List, Dict, Any
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
 
+class PredictiveMultimodalDataset(Dataset):
+    def __init__(self, dataset_name, split="train", splits_root="data/splits", transform=None):
+        """
+        Universal, agnostic dataloader for the MM-JEPA architecture.
+        Routes explicitly based on the --dataset flag paradigm.
+        """
+        self.dataset_name = dataset_name
+        self.split = split
+        self.transform = transform
+        
+        # Route to the dataset-specific locked CSV directory
+        csv_path = os.path.join(splits_root, dataset_name, f"{split}.csv")
+        
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(
+                f"[-] CRITICAL: Reproducibility artifact missing. "
+                f"No static split found for dataset '{dataset_name}' at {csv_path}. "
+                f"Run `python freeze_splits.py --dataset {dataset_name} ...` first."
+            )
+            
+        self.manifest = pd.read_csv(csv_path)
+        print(f"[*] Instantiated agnostic loader for '{dataset_name}' [{split}]: {len(self.manifest)} samples.")
+
+    def __len__(self):
+        return len(self.manifest)
+
+    def __getitem__(self, idx):
+        row = self.manifest.iloc[idx]
+        
+        # Agnostic loading: Paths are explicitly provided by the dataframe
+        rgb = Image.open(row['rgb_path']).convert('RGB')
+        depth = Image.open(row['depth_path']).convert('L')
+        thermal = Image.open(row['thermal_path']).convert('L')
+        
+        # Package for the ModalityIsolatedPatchEmbed stem
+        sample = {
+            'rgb': rgb,
+            'depth': depth,
+            'thermal': thermal,
+            'class_label': row['class_label']
+        }
+        
+        if self.transform:
+            sample = self.transform(sample)
+            
+        return sample
+    
 class BaseRGBDTDataset(Dataset):
     """
     Abstract base class for RGB-Depth-Thermal datasets.

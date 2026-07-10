@@ -9,7 +9,7 @@ dataset:
   # Note: Metric caps (depth/thermal) are strictly handled via dataset metadata.json
 
 phase1_pretraining:
-  backbone: "mit_b1"
+  backbone: "mit_b2"
   batch_size: 8
   epochs: 100
   optimizer:
@@ -20,7 +20,7 @@ phase1_pretraining:
     tau_base: 0.996
 
 phase2_downstream:
-  backbone: "mit_b1"
+  backbone: "mit_b2"
   teacher_backbone: "mit_b4"
   batch_size: 6
   kd_temperature: 4.0
@@ -33,7 +33,7 @@ phase2_downstream:
   epochs:
     baseline: 30
     hero: 300
-    microtune: 50
+    microtune: 200
     default: 200
   learning_rates:
     default: 1.0e-4

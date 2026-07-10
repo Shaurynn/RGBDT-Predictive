@@ -19,9 +19,26 @@ def main():
     img_size = (config['dataset']['image_height'], config['dataset']['image_width'])
     dataset_name = config['dataset']['name']
 
-    data_dir = os.path.join("dataset", dataset_name)
-    dataset = JEPAPretrainDataset(data_dir=data_dir, image_size=img_size)
-    dataloader = DataLoader(dataset, batch_size=cfg['batch_size'], shuffle=True, num_workers=4, pin_memory=True)
+    # --- Agnostic Configuration Routing ---
+    splits_root = os.path.join("data", "splits")
+    
+    # JEPAPretrainDataset encapsulates Phase-1 masking while inheriting the universal CSV reader
+    dataset = JEPAPretrainDataset(
+        dataset_name=dataset_name, 
+        split="train",
+        splits_root=splits_root, 
+        image_size=img_size
+    )
+    
+    # drop_last=True protects spatial variance from dimensional collapse on uneven micro-batches
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=cfg['batch_size'], 
+        shuffle=True, 
+        num_workers=4, 
+        pin_memory=True, 
+        drop_last=True
+    )
     
     model = MultimodalJEPA(backbone_name=cfg['backbone']).to(DEVICE)
     

@@ -491,11 +491,27 @@ def main():
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    data_dir = os.path.join("dataset", dataset_name)
-    NUM_CLASSES = get_dynamic_class_count(data_dir)
+    # --- Agnostic Configuration Routing ---
+    splits_root = os.path.join("data", "splits")
+    manifest_dir = os.path.join(splits_root, dataset_name)
     
-    train_dataset = DownstreamSegmentationDataset(data_dir=data_dir, split="train", image_size=img_size)
-    eval_dataset = DownstreamSegmentationDataset(data_dir=data_dir, split="eval", image_size=img_size)
+    # Dynamically detect classes directly from the frozen split directory
+    NUM_CLASSES = get_dynamic_class_count(manifest_dir)
+    
+    # DownstreamSegmentationDataset encapsulates target mapping while inheriting the universal CSV reader
+    train_dataset = DownstreamSegmentationDataset(
+        dataset_name=dataset_name, 
+        split="train", 
+        splits_root=splits_root, 
+        image_size=img_size
+    )
+    eval_dataset = DownstreamSegmentationDataset(
+        dataset_name=dataset_name, 
+        split="eval", 
+        splits_root=splits_root, 
+        image_size=img_size
+    )
+    
     train_loader = DataLoader(train_dataset, batch_size=cfg['batch_size'], shuffle=True, num_workers=4)
     eval_loader = DataLoader(eval_dataset, batch_size=cfg['batch_size'], shuffle=False, num_workers=4)
     
