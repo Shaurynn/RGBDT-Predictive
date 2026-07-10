@@ -1,76 +1,91 @@
 import os
-import glob
 import argparse
 import pandas as pd
-from sklearn.model_selection import train_test_split
 
-def parse_dataset_structure(data_root, dataset_name):
+def adapt_canonical_splits(data_root, dataset_name):
     """
-    Extensible routing logic to parse different dataset folder structures.
-    Returns a list of dictionaries containing exact paths for all modalities.
+    Reads the canonical dataset splits and maps them to explicit modality subdirectories,
+    preserving the official benchmark distribution for fair baseline comparisons.
     """
-    data = []
+    canonical_train_path = os.path.join(data_root, "train_dataset.csv")
+    canonical_eval_path = os.path.join(data_root, "eval_dataset.csv")
     
-    # Generic generic traversal (e.g., finding the anchor RGB image)
-    # Can be expanded with elif dataset_name == 'other_dataset':
-    search_pattern = os.path.join(data_root, "**", "*_rgb.png")
-    anchor_files = glob.glob(search_pattern, recursive=True)
+    if not (os.path.exists(canonical_train_path) and os.path.exists(canonical_eval_path)):
+        raise FileNotFoundError(
+            f"[-] CRITICAL: Canonical benchmark splits (`train_dataset.csv`, `eval_dataset.csv`) "
+            f"not found in root dataset directory: {data_root}"
+        )
+
+    # Define the strict dataset subdirectory structure
+    subdirs = {
+        "rgb": os.path.join(data_root, "RGB"),
+        "depth": os.path.join(data_root, "Depth"),
+        "thermal": os.path.join(data_root, "Thermal"),
+        "mask": os.path.join(data_root, "Class_Annotations")
+    }
     
-    for rgb_path in anchor_files:
-        # Resolve modalities explicitly at the generation phase
-        depth_path = rgb_path.replace('_rgb.png', '_depth.png')
-        thermal_path = rgb_path.replace('_rgb.png', '_thermal.png')
-        mask_path = rgb_path.replace('_rgb.png', '_mask.png') # If downstream
-        
-        # Verify multi-modal integrity
-        if os.path.exists(depth_path) and os.path.exists(thermal_path):
-            class_name = os.path.basename(os.path.dirname(rgb_path))
-            data.append({
-                "dataset": dataset_name,
-                "class_label": class_name,
-                "rgb_path": rgb_path,
-                "depth_path": depth_path,
-                "thermal_path": thermal_path,
-                "mask_path": mask_path if os.path.exists(mask_path) else None
-            })
+    # Verify strict folder structure exists
+    for name, path in subdirs.items():
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"[-] CRITICAL: Required subdirectory missing: {path}")
+
+    print("[*] Detected official canonical splits and strict modality subdirectories.")
+    
+    # Read the canonical splits. 
+    train_df_raw = pd.read_csv(canonical_train_path)
+    eval_df_raw = pd.read_csv(canonical_eval_path)
+    
+    def process_split(df):
+        records = []
+        for _, row in df.iterrows():
+            # EXPLICIT FIX: Force string casting to override Pandas numeric inference
+            filename = str(row.get('filename', row.iloc[0]))
             
-    return data
+            # Safely extract class label (fallback to second column if 'class_label' header is missing)
+            if 'class_label' in row:
+                class_label = str(row['class_label'])
+            else:
+                class_label = str(row.iloc[1]) if len(row) > 1 else 'unknown'
+            
+            records.append({
+                "dataset": dataset_name,
+                "class_label": class_label,
+                "rgb_path": os.path.join(subdirs["rgb"], filename),
+                "depth_path": os.path.join(subdirs["depth"], filename),
+                "thermal_path": os.path.join(subdirs["thermal"], filename),
+                "mask_path": os.path.join(subdirs["mask"], filename)
+            })
+        return pd.DataFrame(records)
+
+    return process_split(train_df_raw), process_split(eval_df_raw)
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate deterministic dataset splits.")
-    # ONLY the dataset name is required now, matching the execution config
+    parser = argparse.ArgumentParser(description="Adapt canonical dataset splits into the agnostic framework.")
     parser.add_argument("--dataset", type=str, required=True, help="Name of the dataset (e.g., MM5)")
     args = parser.parse_args()
 
-    # Inherit the exact same routing convention used in pretrain_jepa.py
     data_root = os.path.join("dataset", args.dataset)
     
     if not os.path.exists(data_root):
         raise FileNotFoundError(
             f"[-] CRITICAL: Data directory not found at {data_root}. "
-            f"Please ensure your dataset is placed or symlinked correctly."
+            f"Ensure metadata.json, classes.txt, and canonical CSVs are present."
         )
 
     output_dir = os.path.join("data", "splits", args.dataset)
     os.makedirs(output_dir, exist_ok=True)
-    print(f"[*] Compiling agnostic manifest for dataset: {args.dataset} from {data_root}")
+    print(f"[*] Adapting agnostic manifest for dataset: {args.dataset} from {data_root}")
 
-    # Pass the standardized data_root to the parser
-    data_records = parse_dataset_structure(data_root, args.dataset)
-    df = pd.DataFrame(data_records)
+    # Process and preserve the canonical splits
+    train_df, val_df = adapt_canonical_splits(data_root, args.dataset)
     
-    if len(df) == 0:
-        raise ValueError(f"[-] No valid 3-stream multi-modal data found in {data_root}")
-
-    # Deterministic split generation
-    train_df, temp_df = train_test_split(df, test_size=0.30, stratify=df['class_label'], random_state=42)
-    val_df, test_df = train_test_split(temp_df, test_size=0.50, stratify=temp_df['class_label'], random_state=42)
-
+    # Serialize to the locked routing directory
     train_df.to_csv(os.path.join(output_dir, "train.csv"), index=False)
     val_df.to_csv(os.path.join(output_dir, "val.csv"), index=False)
-    test_df.to_csv(os.path.join(output_dir, "test.csv"), index=False)
     
-    print(f"[+] Static splits frozen to {output_dir}")
+    print(f"[+] Canonical splits preserved and frozen to {output_dir}")
+    print(f"    Train: {len(train_df)} samples")
+    print(f"    Eval:  {len(val_df)} samples")
 
 if __name__ == "__main__":
     main()
