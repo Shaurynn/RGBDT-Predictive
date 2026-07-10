@@ -1,5 +1,6 @@
 import os
 import argparse
+import shutil
 import pandas as pd
 
 def adapt_canonical_splits(data_root, dataset_name):
@@ -82,6 +83,7 @@ def main():
     # Serialize to the locked routing directory
     train_df.to_csv(os.path.join(output_dir, "train.csv"), index=False)
     val_df.to_csv(os.path.join(output_dir, "val.csv"), index=False)
+    shutil.copyfile(os.path.join(data_root, "classes.txt"), os.path.join(output_dir, "classes.txt"))
     
     print(f"[+] Canonical splits preserved and frozen to {output_dir}")
     print(f"    Train: {len(train_df)} samples")

@@ -28,7 +28,7 @@ class PredictiveMultimodalDataset(Dataset):
             raise FileNotFoundError(
                 f"[-] CRITICAL: Reproducibility artifact missing. "
                 f"No static split found for dataset '{dataset_name}' at {csv_path}. "
-                f"Run `python freeze_splits.py --dataset {dataset_name} ...` first."
+                f"Run `python freeze_splits.py --dataset {dataset_name}` first."
             )
             
         self.manifest = pd.read_csv(csv_path)
@@ -62,9 +62,16 @@ class BaseRGBDTDataset(Dataset):
     """
     Abstract base class for RGB-Depth-Thermal datasets.
     Centralizes robust file I/O, metadata parsing, statistical caching, and exception handling.
+    Supports both legacy `data_dir` and agnostic `dataset_name` parameters.
     """
-    def __init__(self, data_dir: str, split: str = 'train', image_size: Tuple[int, int] = (480, 640)):
-        self.data_dir = data_dir
+    def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train', splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640)):
+        if data_dir is None and dataset_name is not None:
+            self.data_dir = os.path.join("dataset", dataset_name)
+        elif data_dir is not None:
+            self.data_dir = data_dir
+        else:
+            raise ValueError("[!] CRITICAL: Either 'data_dir' or 'dataset_name' must be provided.")
+            
         self.split = split
         self.image_size = image_size
         
@@ -73,7 +80,7 @@ class BaseRGBDTDataset(Dataset):
         self.depth_scale = float(self.metadata.get('depth_max_mm', 10000.0))
         self.therm_scale = float(self.metadata.get('thermal_max_raw', 65535.0))
 
-        csv_path = os.path.join(data_dir, f'{split}_dataset.csv')
+        csv_path = os.path.join(self.data_dir, f'{split}_dataset.csv')
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"[!] CRITICAL: Dataset split manifest missing at {csv_path}")
             
@@ -159,6 +166,9 @@ class BaseRGBDTDataset(Dataset):
 class JEPAPretrainDataset(BaseRGBDTDataset):
     """Phase 1 Dataset utilizing isolated base components."""
     
+    def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train', splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640)):
+        super().__init__(data_dir=data_dir, dataset_name=dataset_name, split=split, splits_root=splits_root, image_size=image_size)
+
     def _generate_multiblock_mask(self, h: int, w: int, num_blocks: int = 4) -> torch.Tensor:
         mask = torch.zeros((1, h, w), dtype=torch.float32)
         for _ in range(num_blocks):
@@ -195,6 +205,9 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
 class DownstreamSegmentationDataset(BaseRGBDTDataset):
     """Phase 2 Dataset utilizing isolated base components."""
     
+    def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train', splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640)):
+        super().__init__(data_dir=data_dir, dataset_name=dataset_name, split=split, splits_root=splits_root, image_size=image_size)
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         base_name = self.image_files[idx]
         x_full = self._load_multimodal_tensors(base_name)
