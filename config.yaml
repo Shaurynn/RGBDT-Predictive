@@ -38,3 +38,9 @@ phase2_downstream:
   learning_rates:
     default: 1.0e-4
     microtune: 1.0e-5
+
+ablations:
+  enable_modality_isolation: true    # Set to false to force naive 5-channel early fusion
+  variance_type: "spatial"           # Options: "spatial", "batch", "none"
+  gdl_type: "global_anchored"        # Options: "global_anchored", "batch_dynamic", "none"
+  enable_kd: true                    # Set to false to bypass the teacher network routing

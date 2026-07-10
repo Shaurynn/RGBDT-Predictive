@@ -8,63 +8,84 @@ import copy
 # --- 1. MODALITY-SPECIFIC TOKENIZATION ---
 # ====================================================================================
 
-class MultimodalJEPA(nn.Module):
-    def __init__(self, backbone_name='mit_b1'):
+class ModalityIsolatedPatchEmbed(nn.Module):
+    """
+    Control Variant (TMLPN Flagship): Physically isolates modality ingestion at the stem.
+    Integrates Learnable Physical Calibration Priors and a 1x1 Alignment Projection 
+    to securely fuse unaligned sensor manifolds.
+    """
+    def __init__(self, original_proj):
         super().__init__()
-        # Load strict 3-channel ImageNet weights
-        self.context_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, weights='imagenet')
+        # Inherit unmodified weights for RGB (channels 0-2)
+        self.rgb_proj = original_proj
         
-        # Surgically replace the first overlap patch embedding projection with the isolated stems
-        original_proj = self.context_encoder.patch_embed1.proj
-        self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj)
-        
-        self.target_encoder = copy.deepcopy(self.context_encoder)
-        
-        # 1. Lock the affine weights
-        for p in self.target_encoder.parameters(): 
-            p.requires_grad = False
+        # Kaiming-initialized independent filters for Depth and Thermal (channels 3-4)
+        self.depth_therm_proj = nn.Conv2d(
+            in_channels=2, 
+            out_channels=original_proj.out_channels, 
+            kernel_size=original_proj.kernel_size, 
+            stride=original_proj.stride, 
+            padding=original_proj.padding, 
+            bias=original_proj.bias is not None
+        )
+        nn.init.kaiming_normal_(self.depth_therm_proj.weight, mode='fan_out', nonlinearity='relu')
+        if self.depth_therm_proj.bias is not None:
+            nn.init.zeros_(self.depth_therm_proj.bias)
             
-        # 2. Lock the state machine to prevent Dropout/BN leakage
-        self.target_encoder.eval()
-            
-        self.predictor = SpatialJEPAPredictor(embed_dim=self.context_encoder.out_channels[-1])
+        # --- 1. Learnable Physical Calibration Priors ---
+        self.dt_scale = nn.Parameter(torch.ones(1, 2, 1, 1))
+        self.dt_bias = nn.Parameter(torch.zeros(1, 2, 1, 1))
+        
+        # --- 2. The 1x1 Alignment Projection ---
+        # Aligns the Kaiming-initialized DT feature manifold with the 
+        # ImageNet-pretrained RGB manifold prior to additive fusion.
+        self.dt_alignment = nn.Conv2d(
+            in_channels=original_proj.out_channels,
+            out_channels=original_proj.out_channels,
+            kernel_size=1,
+            bias=False
+        )
+        # Dirac initialization ensures the layer starts as a stable identity mapping
+        nn.init.dirac_(self.dt_alignment.weight)
 
-    def train(self, mode=True):
-        """
-        Overrides the default PyTorch train() method.
-        Ensures that calling model.train() in the training loop does NOT 
-        accidentally push the Target Encoder back into stochastic training mode.
-        """
-        super().train(mode)
-        self.target_encoder.eval()
-        return self
-
-    @torch.no_grad()
-    def update_target_network(self, tau=0.996):
-        """
-        True EMA Momentum Update.
-        Synchronizes both the affine parameters AND the internal buffers (e.g., BN stats).
-        """
-        # Update Affine Parameters
-        for ctx_p, tgt_p in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
-            tgt_p.data = tau * tgt_p.data + (1.0 - tau) * ctx_p.data
-            
-        # Update Internal Buffers
-        for ctx_b, tgt_b in zip(self.context_encoder.buffers(), self.target_encoder.buffers()):
-            tgt_b.data = tau * tgt_b.data + (1.0 - tau) * ctx_b.data
-
-    def forward(self, x_visible, x_full, high_res_mask):
-        z_context = self.context_encoder(x_visible)[-1]
+    def forward(self, x):
+        x_rgb = x[:, :3, :, :]
+        x_dt = x[:, 3:, :, :]
         
-        # Target execution remains pristine and deterministic
-        with torch.no_grad():
-            z_target = self.target_encoder(x_full)[-1]
-            
-        B, C, H, W = z_context.shape
-        latent_mask = F.interpolate(high_res_mask, size=(H, W), mode='nearest')
+        x_dt_calibrated = (x_dt * self.dt_scale) + self.dt_bias
         
-        z_pred = self.predictor(z_context, latent_mask)
-        return z_pred, z_target, latent_mask
+        dt_features = self.depth_therm_proj(x_dt_calibrated)
+        dt_aligned = self.dt_alignment(dt_features)
+        
+        # Additive fusion is now mathematically grounded across aligned vector spaces
+        return self.rgb_proj(x_rgb) + dt_aligned
+
+class NaiveEarlyFusionPatchEmbed(nn.Module):
+    """
+    Ablation Variant A: Naive 5-Channel Early Fusion.
+    Stacks all modalities directly into a single unified convolution block.
+    Used exclusively to prove the necessity of the isolated stem.
+    """
+    def __init__(self, original_proj):
+        super().__init__()
+        
+        self.unified_proj = nn.Conv2d(
+            in_channels=5, 
+            out_channels=original_proj.out_channels, 
+            kernel_size=original_proj.kernel_size, 
+            stride=original_proj.stride, 
+            padding=original_proj.padding, 
+            bias=original_proj.bias is not None
+        )
+        
+        # Standard Kaiming Initialization for the unified block
+        nn.init.kaiming_normal_(self.unified_proj.weight, mode='fan_out', nonlinearity='relu')
+        if self.unified_proj.bias is not None:
+            nn.init.zeros_(self.unified_proj.bias)
+
+    def forward(self, x):
+        # Directly projects the raw 5-channel tensor
+        return self.unified_proj(x)
 
 # ====================================================================================
 # --- 2. JEPA COMPONENTS ---
@@ -137,66 +158,21 @@ class SpatialJEPAPredictor(nn.Module):
 # ====================================================================================
 # --- 3. THE MASTER ARCHITECTURES ---
 # ====================================================================================
-
-class ModalityIsolatedPatchEmbed(nn.Module):
-    """
-    Physically isolates modality ingestion at the stem.
-    Integrates Learnable Physical Calibration Priors and a 1x1 Alignment Projection 
-    to securely fuse unaligned sensor manifolds.
-    """
-    def __init__(self, original_proj):
-        super().__init__()
-        # Inherit unmodified weights for RGB (channels 0-2)
-        self.rgb_proj = original_proj
-        
-        # Kaiming-initialized independent filters for Depth and Thermal (channels 3-4)
-        self.depth_therm_proj = nn.Conv2d(
-            in_channels=2, 
-            out_channels=original_proj.out_channels, 
-            kernel_size=original_proj.kernel_size, 
-            stride=original_proj.stride, 
-            padding=original_proj.padding, 
-            bias=original_proj.bias is not None
-        )
-        nn.init.kaiming_normal_(self.depth_therm_proj.weight, mode='fan_out', nonlinearity='relu')
-        if self.depth_therm_proj.bias is not None:
-            nn.init.zeros_(self.depth_therm_proj.bias)
-            
-        # --- 1. Learnable Physical Calibration Priors ---
-        self.dt_scale = nn.Parameter(torch.ones(1, 2, 1, 1))
-        self.dt_bias = nn.Parameter(torch.zeros(1, 2, 1, 1))
-        
-        # --- 2. The 1x1 Alignment Projection ---
-        # Aligns the Kaiming-initialized DT feature manifold with the 
-        # ImageNet-pretrained RGB manifold prior to additive fusion.
-        self.dt_alignment = nn.Conv2d(
-            in_channels=original_proj.out_channels,
-            out_channels=original_proj.out_channels,
-            kernel_size=1,
-            bias=False
-        )
-        # Dirac initialization ensures the layer starts as a stable identity mapping
-        nn.init.dirac_(self.dt_alignment.weight)
-
-    def forward(self, x):
-        x_rgb = x[:, :3, :, :]
-        x_dt = x[:, 3:, :, :]
-        
-        x_dt_calibrated = (x_dt * self.dt_scale) + self.dt_bias
-        
-        dt_features = self.depth_therm_proj(x_dt_calibrated)
-        dt_aligned = self.dt_alignment(dt_features)
-        
-        # Additive fusion is now mathematically grounded across aligned vector spaces
-        return self.rgb_proj(x_rgb) + dt_aligned
     
 class MultimodalJEPA(nn.Module):
-    def __init__(self, backbone_name='mit_b1'):
+    def __init__(self, backbone_name='mit_b1', isolated_stem=True):
         super().__init__()
+        self.isolated_stem = isolated_stem
         self.context_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, weights='imagenet')
         
+        # Extract the original PyTorch projection geometry
         original_proj = self.context_encoder.patch_embed1.proj
-        self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj)
+        
+        # Apply strict architectural routing based on the orchestrator's ablation state
+        if self.isolated_stem:
+            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj)
+        else:
+            self.context_encoder.patch_embed1.proj = NaiveEarlyFusionPatchEmbed(original_proj)
         
         self.target_encoder = copy.deepcopy(self.context_encoder)
         for p in self.target_encoder.parameters(): 
@@ -291,14 +267,19 @@ class TMLPN_Downstream(nn.Module):
     PHASE 2: Supervised Semantic Segmentation Architecture.
     Utilizes a Multi-Scale All-MLP Decoder to preserve fine-grained spatial boundaries.
     """
-    def __init__(self, num_classes=10, backbone_name='mit_b1'):
+    def __init__(self, num_classes=10, backbone_name='mit_b1', isolated_stem=True):
         super().__init__()
-        
+        self.isolated_stem = isolated_stem
         self.context_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, weights=None)
         
-        # Surgically replace the stem to match Phase 1 multimodal isolation
+        # Extract the original PyTorch projection geometry
         original_proj = self.context_encoder.patch_embed1.proj
-        self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj)
+        
+        # Apply strict architectural routing based on the orchestrator's ablation state
+        if self.isolated_stem:
+            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj)
+        else:
+            self.context_encoder.patch_embed1.proj = NaiveEarlyFusionPatchEmbed(original_proj)
         
         # Extract the channel dimensions for the 4 hierarchical transformer stages
         encoder_channels = self.context_encoder.out_channels[-4:]

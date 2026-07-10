@@ -35,13 +35,14 @@ def enforce_reproducibility(seed=42):
 # ====================================================================================
 
 class AlphaBalancedFocalGDLLoss(nn.Module):
-    def __init__(self, num_classes, alpha=None, global_gdl_weights=None, gamma=2.0, dice_weight=1.0, ignore_index=255, eps=1e-6):
+    def __init__(self, num_classes, alpha=None, global_gdl_weights=None, gamma=2.0, dice_weight=1.0, ignore_index=255, eps=1e-6, use_batch_dynamic=False):
         super().__init__()
         self.num_classes = num_classes
         self.gamma = gamma
         self.base_dice_weight = dice_weight
         self.ignore_index = ignore_index
         self.eps = eps
+        self.use_batch_dynamic = use_batch_dynamic
         
         if alpha is None:
             self.register_buffer('alpha', torch.ones(num_classes))
@@ -62,17 +63,11 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
     def forward(self, inputs, targets):
         inputs = torch.clamp(inputs.float(), min=-20.0, max=20.0)
         
-        # --- Sanitize Targets for Cross-Entropy ---
-        # Map any illegal/out-of-bound indices temporarily to 0 and explicitly 
-        # mark them via valid_mask / ignore settings to prevent CUDA assert crashes.
         illegal_mask = (targets < 0) | (targets >= self.num_classes)
         ce_targets = targets.clone()
         ce_targets[illegal_mask & (targets != self.ignore_index)] = 0
         
-        # --- 1. Protected Alpha-Balanced Focal Loss ---
         ce_loss = F.cross_entropy(inputs, ce_targets, reduction='none', ignore_index=self.ignore_index)
-        
-        # Zero out loss contributions from truly illegal targets that escaped ignore_index
         ce_loss = ce_loss.clone()
         ce_loss[illegal_mask & (targets != self.ignore_index)] = 0.0
         
@@ -87,7 +82,6 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
         
         focal_loss = (alpha_t * (1 - pt) ** self.gamma * ce_loss).mean()
 
-        # --- 2. Global Generalized Dice Loss (GDL) ---
         valid_inputs = inputs.permute(0, 2, 3, 1)[valid_mask] 
         valid_targets = targets[valid_mask]                   
         
@@ -102,7 +96,11 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
             ground_truth_volume = targets_one_hot.sum(dim=0)
             pred_volume = inputs_soft.sum(dim=0)
             
-            w = self.gdl_weights[:self.num_classes].to(inputs.device)
+            if self.use_batch_dynamic:
+                w = 1.0 / (ground_truth_volume ** 2 + self.eps)
+            else:
+                w = self.gdl_weights[:self.num_classes].to(inputs.device)
+                
             present_classes = w > 0
             
             if present_classes.sum() > 0:
@@ -113,76 +111,6 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
                 dice_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
 
         return focal_loss + (self.base_dice_weight * dice_loss)
-# class AlphaBalancedFocalGDLLoss(nn.Module):
-#     def __init__(self, num_classes, alpha=None, global_gdl_weights=None, gamma=2.0, dice_weight=1.0, ignore_index=255, eps=1e-6):
-#         super().__init__()
-#         self.num_classes = num_classes
-#         self.gamma = gamma
-#         self.base_dice_weight = dice_weight
-#         self.ignore_index = ignore_index
-#         self.eps = eps
-        
-#         if alpha is None:
-#             self.register_buffer('alpha', torch.ones(num_classes))
-#         else:
-#             alpha_t = torch.tensor(alpha, dtype=torch.float32)
-#             if alpha_t.size(0) != num_classes:
-#                 alpha_t = alpha_t[:num_classes] if alpha_t.size(0) > num_classes else torch.cat([alpha_t, torch.ones(num_classes - alpha_t.size(0))])
-#             self.register_buffer('alpha', alpha_t)
-            
-#         if global_gdl_weights is None:
-#             self.register_buffer('gdl_weights', torch.ones(num_classes))
-#         else:
-#             gdl_t = torch.tensor(global_gdl_weights, dtype=torch.float32)
-#             if gdl_t.size(0) != num_classes:
-#                 gdl_t = gdl_t[:num_classes] if gdl_t.size(0) > num_classes else torch.cat([gdl_t, torch.ones(num_classes - gdl_t.size(0))])
-#             self.register_buffer('gdl_weights', gdl_t)
-
-#     def forward(self, inputs, targets):
-#         inputs = torch.clamp(inputs.float(), min=-20.0, max=20.0)
-        
-#         # --- 1. Protected Alpha-Balanced Focal Loss ---
-#         ce_loss = F.cross_entropy(inputs, targets, reduction='none', ignore_index=self.ignore_index)
-#         ce_loss_safe = torch.clamp(ce_loss, min=0.0, max=50.0)
-#         pt = torch.exp(-ce_loss_safe)
-        
-#         valid_mask = (targets != self.ignore_index)
-#         alpha_t = torch.ones_like(targets, dtype=torch.float32)
-        
-#         # Clamp indices strictly between 0 and num_classes - 1 to prevent device-side assertion failures
-#         safe_targets = torch.clamp(targets, min=0, max=self.num_classes - 1)
-#         alpha_t[valid_mask] = self.alpha[safe_targets[valid_mask]]
-        
-#         focal_loss = (alpha_t * (1 - pt) ** self.gamma * ce_loss).mean()
-
-#         # --- 2. Global Generalized Dice Loss (GDL) ---
-#         valid_inputs = inputs.permute(0, 2, 3, 1)[valid_mask] 
-#         valid_targets = targets[valid_mask]                   
-        
-#         if valid_targets.numel() == 0:
-#             dice_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
-#         else:
-#             inputs_soft = F.softmax(valid_inputs, dim=1)
-            
-#             # Secure bounds for one_hot indices against negative values or over-limit classes
-#             safe_valid_targets = torch.clamp(valid_targets, min=0, max=self.num_classes - 1)
-#             targets_one_hot = F.one_hot(safe_valid_targets, num_classes=self.num_classes).float()
-            
-#             intersection = (inputs_soft * targets_one_hot).sum(dim=0)
-#             ground_truth_volume = targets_one_hot.sum(dim=0)
-#             pred_volume = inputs_soft.sum(dim=0)
-            
-#             w = self.gdl_weights[:self.num_classes].to(inputs.device)
-#             present_classes = w > 0
-            
-#             if present_classes.sum() > 0:
-#                 numerator = 2.0 * (w[present_classes] * intersection[present_classes]).sum()
-#                 denominator = (w[present_classes] * (ground_truth_volume[present_classes] + pred_volume[present_classes])).sum()
-#                 dice_loss = 1.0 - (numerator / (denominator + self.eps))
-#             else:
-#                 dice_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
-
-#         return focal_loss + (self.base_dice_weight * dice_loss)
 
 def knowledge_distillation_loss(student_logits, teacher_logits, temperature=4.0):
     soft_targets = F.softmax(teacher_logits / temperature, dim=1)
@@ -198,7 +126,6 @@ class IoUMetric:
         
     def update(self, logits, targets, ignore_index=255):
         preds = torch.argmax(logits, dim=1)
-        # Filter out ignore_index and enforce strict in-bounds range [0, num_classes - 1]
         valid_mask = (
             (targets != ignore_index) & 
             (targets >= 0) & (targets < self.num_classes) & 
@@ -211,7 +138,6 @@ class IoUMetric:
         bins = targets * self.num_classes + preds
         bincount = torch.bincount(bins, minlength=self.num_classes**2)
         
-        # Safeguard: trim bincount if unexpected outlier indices slip through
         if bincount.numel() > self.num_classes**2:
             bincount = bincount[:self.num_classes**2]
             
@@ -230,36 +156,6 @@ class IoUMetric:
         valid_classes = self.unions > 0
         if valid_classes.sum() == 0: return 0.0
         return self.get_per_class_iou()[valid_classes].mean().item()
-# class IoUMetric:
-#     def __init__(self, num_classes, device):
-#         self.num_classes = num_classes
-#         self.device = device
-#         self.intersections = torch.zeros(num_classes, device=device)
-#         self.unions = torch.zeros(num_classes, device=device)
-        
-#     def update(self, logits, targets, ignore_index=255):
-#         preds = torch.argmax(logits, dim=1)
-#         valid_mask = targets != ignore_index
-#         preds = preds[valid_mask]
-#         targets = targets[valid_mask]
-#         if targets.numel() == 0: return
-#         bins = targets * self.num_classes + preds
-#         bincount = torch.bincount(bins, minlength=self.num_classes**2)
-#         conf_matrix = bincount.reshape(self.num_classes, self.num_classes)
-#         intersection = torch.diag(conf_matrix)
-#         union = conf_matrix.sum(dim=1) + conf_matrix.sum(dim=0) - intersection
-#         self.intersections += intersection
-#         self.unions += union
-        
-#     def get_per_class_iou(self):
-#         ious = self.intersections / torch.clamp(self.unions, min=1.0)
-#         ious[self.unions == 0] = 1.0 
-#         return ious
-        
-#     def get_miou(self):
-#         valid_classes = self.unions > 0
-#         if valid_classes.sum() == 0: return 0.0
-#         return self.get_per_class_iou()[valid_classes].mean().item()
 
 class TTAWrapper(nn.Module):
     def __init__(self, model):
@@ -363,7 +259,6 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
                     pred_seg = model(x_full)
                     loss = criterion(pred_seg, seg_mask)
                 
-                # Safe Gradient Scaling
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -409,7 +304,6 @@ def get_dynamic_class_count(data_dir):
 def compute_dataset_statistics(dataloader, num_classes, ignore_index=255, max_batches=100):
     print("\n[*] Dynamically computing global dataset statistics (Laplace Smoothed)...")
     pseudo_count = 1.0
-    # Allow dynamic tracking of max indices if annotations exceed classes.txt length
     pixel_counts = torch.full((num_classes,), pseudo_count, dtype=torch.float64)
     
     for i, batch in enumerate(dataloader):
@@ -421,7 +315,6 @@ def compute_dataset_statistics(dataloader, num_classes, ignore_index=255, max_ba
         if valid_targets.numel() > 0:
             max_val = valid_targets.max().item()
             if max_val >= pixel_counts.size(0):
-                # Dynamically expand tensor size if a larger label index is discovered in the split
                 new_size = max_val + 1
                 print(f"[!] WARNING: Encountered label index {max_val}, expanding statistics tensor from {pixel_counts.size(0)} to {new_size}")
                 expanded_counts = torch.full((new_size,), pseudo_count, dtype=torch.float64)
@@ -430,7 +323,6 @@ def compute_dataset_statistics(dataloader, num_classes, ignore_index=255, max_ba
                 num_classes = new_size
                 
             counts = torch.bincount(valid_targets.flatten(), minlength=num_classes)
-            # Ensure shape alignment if counts dimension grows
             if counts.size(0) > pixel_counts.size(0):
                 counts = counts[:pixel_counts.size(0)]
             pixel_counts[:counts.size(0)] += counts.cpu().double()
@@ -488,17 +380,19 @@ def main():
     cfg = config['phase2_downstream']
     img_size = (config['dataset']['image_height'], config['dataset']['image_width'])
     dataset_name = config['dataset']['name']
+    
+    # --- Isolate namespace and extract dynamic seed ---
+    trial_name = cfg.get('trial_name', 'baseline')
+    active_seed = cfg.get('seed', 42)
+    enforce_reproducibility(active_seed)
+    print(f"[*] Locked PyTorch computational graph to Seed: {active_seed}")
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # --- Agnostic Configuration Routing ---
     splits_root = os.path.join("data", "splits")
     manifest_dir = os.path.join(splits_root, dataset_name)
-    
-    # Dynamically detect classes directly from the frozen split directory
     NUM_CLASSES = get_dynamic_class_count(manifest_dir)
     
-    # DownstreamSegmentationDataset encapsulates target mapping while inheriting the universal CSV reader
     train_dataset = DownstreamSegmentationDataset(
         dataset_name=dataset_name, 
         split="train", 
@@ -517,27 +411,40 @@ def main():
     
     empirical_alpha, global_gdl = compute_dataset_statistics(train_loader, NUM_CLASSES)
     
+    # --- ABLATION STATE INJECTION ---
+    ablation_cfg = cfg.get('ablations', {})
+    gdl_type = ablation_cfg.get('gdl_type', 'global_anchored')
+    enable_kd = ablation_cfg.get('enable_kd', True)
+
+    print("\n" + "="*60)
+    print("🔬 ABLATION STATE [PHASE 2: DOWNSTREAM]")
+    print("="*60)
+    print(f"[*] Generalized Dice Loss (GDL) Type : {gdl_type.upper()}")
+    print(f"[*] Knowledge Distillation (KD)      : {enable_kd}")
+    print("="*60 + "\n")
+    
     model = models.TMLPN_Downstream(num_classes=NUM_CLASSES, backbone_name=cfg['backbone']).to(DEVICE)
     
     teacher_model = None
-    if getattr(args, 'teacher_weights', None) and os.path.exists(args.teacher_weights):
+    if enable_kd and getattr(args, 'teacher_weights', None) and os.path.exists(args.teacher_weights):
         teacher_model = models.TMLPN_Downstream(num_classes=NUM_CLASSES, backbone_name=cfg['teacher_backbone']).to(DEVICE)
         teacher_model.load_state_dict(torch.load(args.teacher_weights))
         teacher_model.eval()
         for p in teacher_model.parameters(): p.requires_grad = False
     
-    manager = ExperimentManager(model_instance=model, dataset=dataset_name, backbone=cfg['backbone'])
+    # UPDATED: Namespace isolation trick for the experiment manager
+    isolated_backbone = f"{cfg['backbone']}_{trial_name}" if trial_name != "baseline" else cfg['backbone']
+    manager = ExperimentManager(model_instance=model, dataset=dataset_name, backbone=isolated_backbone)
+    
     state = manager.detect_state()
     if state is None: return 
     run_dir, phase = state["run_dir"], state["phase"]
 
     if phase == "baseline" and not state["is_resume"]:
-        pt_weights = os.path.join("weights", dataset_name, f"jepa_context_encoder_{cfg['backbone']}.pt")
+        # UPDATED: Enforce strict isolated namespace for artifact loading
+        pt_weights = os.path.join("weights", dataset_name, trial_name, f"jepa_context_encoder_{cfg['backbone']}.pt")
         if os.path.exists(pt_weights):
             print(f"[*] Injecting Phase 1 MM-JEPA Foundation Weights: {pt_weights}")
-            # # Use strict=False to accommodate the newly added dt_alignment projection layer
-            # model.context_encoder.load_state_dict(torch.load(pt_weights), strict=False)
-            # Explicitly call PyTorch's base nn.Module load_state_dict to bypass SMP's signature restriction
             torch.nn.Module.load_state_dict(
                 model.context_encoder, 
                 torch.load(pt_weights), 
@@ -569,13 +476,11 @@ def main():
 
     MAX_EPOCHS = cfg['epochs'].get(phase, cfg['epochs']['default'])
     
-    # --- 1. DEFAULT HYPERPARAMETERS (From YAML Config) ---
     lr = cfg['learning_rates'].get(phase, cfg['learning_rates']['default'])
     weight_decay = cfg.get('optimizer', {}).get('weight_decay', 1e-4)
     gamma = 2.0
     dice_weight = 1.0
     
-    # --- 2. HPO INJECTION (Override defaults for Hero/Microtune) ---
     if phase in ["hero", "microtune"] and state.get("inherit_weights"):
         hpo_dir = os.path.dirname(state["inherit_weights"])
         hpo_params_path = os.path.join(hpo_dir, "best_params.json")
@@ -592,7 +497,6 @@ def main():
             
             print(f"    -> LR: {lr:.2e} | WD: {weight_decay:.2e} | Gamma: {gamma:.2f} | Dice W: {dice_weight:.2f}")
             
-            # Force the ultra-low learning rate for the final microtune phase, regardless of HPO
             if phase == "microtune":
                 lr = cfg['learning_rates'].get('microtune', 1e-5)
                 print(f"[*] Microtune Phase: Overriding HPO learning rate to {lr:.2e} for end-to-end adjustment.")
@@ -602,34 +506,31 @@ def main():
         for param in model.parameters():
             param.requires_grad = True
 
-    # --- 3. INSTANTIATE WITH INJECTED PARAMS ---
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=weight_decay)
     scaler = GradScaler('cuda', enabled=True)
     
     criterion = AlphaBalancedFocalGDLLoss(
         num_classes=NUM_CLASSES, 
         alpha=empirical_alpha, 
-        global_gdl_weights=global_gdl,
+        global_gdl_weights=global_gdl if gdl_type == 'global_anchored' else None,
         gamma=gamma,
-        dice_weight=dice_weight
+        dice_weight=dice_weight,
+        use_batch_dynamic=(gdl_type == 'batch_dynamic')
     ).to(DEVICE)
     
-    # --- NEW: MLOPS HYPERPARAMETER TRACKING ---
     active_hparams = {
         "lr": lr,
         "weight_decay": weight_decay,
         "gamma": gamma,
         "dice_weight": dice_weight,
         "batch_size": cfg['batch_size'],
-        "kd_temperature": cfg.get('kd_temperature', 4.0)
+        "kd_temperature": cfg.get('kd_temperature', 4.0),
+        **ablation_cfg
     }
     
-    # Bind to the live state machine
     state["hyperparameters"] = active_hparams
     
     writer = SummaryWriter(log_dir=os.path.join(run_dir, "logs"))
-    
-    # Log cleanly to the TensorBoard "Text" tab
     writer.add_text("Configuration/Hyperparameters", json.dumps(active_hparams, indent=4), 0)
     
     cam_extractor = SegmentationGradCAM(model, model.decode_head.linear_pred)
@@ -641,10 +542,8 @@ def main():
             print(f"\n[*] CRITICAL: Resuming interrupted run from {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
             
-            # Load model state safely
             model.load_state_dict(checkpoint['model_state_dict'], strict=False)
             
-            # Resilient optimizer and scaler loading with graceful fallback
             try:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             except ValueError as e:
@@ -662,20 +561,6 @@ def main():
             print(f"[*] Successfully restored state. Resuming strictly at Epoch {start_epoch + 1}")
         else:
             print("\n[!] WARNING: JSON state indicated resume, but no checkpoint.pt found. Starting from Epoch 1.")
-    # start_epoch = 0
-    # if state["is_resume"]:
-    #     checkpoint_path = os.path.join(run_dir, "checkpoint.pt")
-    #     if os.path.exists(checkpoint_path):
-    #         print(f"\n[*] CRITICAL: Resuming interrupted run from {checkpoint_path}")
-    #         checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-    #         model.load_state_dict(checkpoint['model_state_dict'])
-    #         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    #         scaler.load_state_dict(checkpoint['scaler_state_dict'])
-    #         start_epoch = checkpoint['epoch']
-    #         state["best_miou"] = checkpoint['best_miou']
-    #         print(f"[*] Successfully restored state. Resuming strictly at Epoch {start_epoch + 1}")
-    #     else:
-    #         print("\n[!] WARNING: JSON state indicated resume, but no checkpoint.pt found. Starting from Epoch 1.")
 
     for epoch in range(start_epoch, MAX_EPOCHS):
         model.train()
@@ -690,7 +575,7 @@ def main():
                 pred_seg = model(x_full)
                 loss = criterion(pred_seg, seg_mask)
                 
-                if teacher_model is not None:
+                if enable_kd and teacher_model is not None:
                     with torch.no_grad():
                         t_seg = teacher_model(x_full)
                     loss_kd = knowledge_distillation_loss(pred_seg, t_seg, temperature=cfg.get('kd_temperature', 4.0))
@@ -698,7 +583,6 @@ def main():
                     
             scaler.scale(loss).backward()
             
-            # --- AMP Exception Handling & Gradient Safety ---
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
@@ -754,7 +638,6 @@ def main():
 
                     vis_dir = os.path.join(run_dir, "visualizations")
                     os.makedirs(vis_dir, exist_ok=True)
-                    # Convert RGB back to BGR for OpenCV saving and scale to 0-255 uint8
                     bgr_save = cv2.cvtColor(np.uint8(255 * np.clip(overlay, 0, 1)), cv2.COLOR_RGB2BGR)
                     cv2.imwrite(os.path.join(vis_dir, f"gradcam_epoch_{epoch+1}.png"), bgr_save)
                     
@@ -795,5 +678,4 @@ def main():
     print(f"[*] Phase '{phase}' completed successfully. Results recorded to {results_path}")
 
 if __name__ == '__main__':
-    enforce_reproducibility()
     main()
