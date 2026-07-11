@@ -673,7 +673,9 @@ def main():
         json.dump({
             "phase": phase, 
             "hyperparameters": active_hparams,
-            "best_mIoU": state.get("best_miou", 0.0)
+            "best_mIoU": state.get("best_miou", 0.0),
+            "final_train_loss": avg_train_loss,   
+            "final_val_loss": avg_val_loss
         }, f, indent=4)
     print(f"[*] Phase '{phase}' completed successfully. Results recorded to {results_path}")
 

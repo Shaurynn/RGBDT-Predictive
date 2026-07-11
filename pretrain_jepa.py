@@ -61,13 +61,26 @@ def main():
     ablation_cfg = cfg.get('ablations', {})
     enable_isolation = ablation_cfg.get('enable_modality_isolation', True)
     variance_type = ablation_cfg.get('variance_type', 'spatial')
+    mask_strategy = ablation_cfg.get('mask_strategy', 'multi_block') # NEW: Extract strategy
 
     print("\n" + "="*60)
     print("🔬 ABLATION STATE [PHASE 1: PRE-TRAINING]")
     print("="*60)
     print(f"[*] Modality Isolated Stem (1x1 Dirac) : {enable_isolation}")
     print(f"[*] Variance Regularization Topology   : {variance_type.upper()}")
+    print(f"[*] Masking Strategy                   : {mask_strategy.upper()}") # NEW
     print("="*60 + "\n")
+
+    # --- Agnostic Configuration Routing ---
+    splits_root = os.path.join("data", "splits")
+    
+    dataset = JEPAPretrainDataset(
+        dataset_name=dataset_name, 
+        split="train",
+        splits_root=splits_root, 
+        image_size=img_size,
+        mask_strategy=mask_strategy # NEW: Pass strategy to loader
+    )
     
     model = MultimodalJEPA(backbone_name=cfg['backbone'], isolated_stem=enable_isolation).to(DEVICE)
     

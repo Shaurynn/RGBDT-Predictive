@@ -88,25 +88,37 @@ def run_pipeline():
     backup_path = "config.yaml.backup"
     
     dataset_name = "MM5" 
-    backbones = ["mit_b3", "mit_b4", "mit_b5"]
+    backbones = ["mit_b1", "mit_b2", "mit_b3", "mit_b4", "mit_b5"]
     
-    # N=3 CVPR Minimum Viable Standard
-    academic_seeds = [42, 1024, 2048] 
+    # N=5 CVPR Gold Standard
+    academic_seeds = [42, 1024, 2048, 4096, 8192]
     
     control_optimal = {
         "enable_modality_isolation": True,
         "variance_type": "spatial",
         "gdl_type": "global_anchored",
-        "enable_kd": True
+        "enable_kd": True,
+        "mask_strategy": "multi_block" # Baseline uses semantic blocks
     }
 
-    # The ablation target matrix includes the control itself to establish the statistical baseline
+    # The exhaustive CVPR-compliant ablation matrix
     ablation_matrix = {
         "Control_Optimal": control_optimal,
+        
+        # Criterion 1: Remove Dirac projection
         "Ablation_NaiveFusion": {**control_optimal, "enable_modality_isolation": False},
+        
+        # Criterion 2: Alter/Remove spatial variance
         "Ablation_BatchVariance": {**control_optimal, "variance_type": "batch"},
+        "Ablation_NoVariance": {**control_optimal, "variance_type": "none"},
+        
+        # Criterion 3: Disable Knowledge Distillation
+        "Ablation_NoKD": {**control_optimal, "enable_kd": False},
+        
+        # Criterion 4: Use random patches instead of multi-block
+        "Ablation_RandomMasking": {**control_optimal, "mask_strategy": "random"}
     }
-
+    
     print("[*] Initiating MLOps Orchestration Pipeline...")
     shutil.copy(config_path, backup_path)
 
@@ -139,12 +151,12 @@ def run_pipeline():
                     execute_command(["uv", "run", "train_downstream.py"], f"Phase 2 Call [{current_phase_index}/5] ({backbone})")
 
         # =====================================================================
-        # PART 2: ABLATION STUDIES (N=3 Seeds)
+        # PART 2: ABLATION STUDIES (N=5 Seeds)
         # =====================================================================
         ablation_target_backbone = "mit_b3" 
 
         print("\n" + "="*70)
-        print("🔬 INITIATING ABLATION STUDIES (N=3 Statistical Matrix)")
+        print("🔬 INITIATING ABLATION STUDIES (N=5 Statistical Matrix)")
         print("="*70)
 
         for seed in academic_seeds:

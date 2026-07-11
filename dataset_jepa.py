@@ -164,10 +164,11 @@ class BaseRGBDTDataset(Dataset):
 
 
 class JEPAPretrainDataset(BaseRGBDTDataset):
-    """Phase 1 Dataset utilizing isolated base components."""
+    """Phase 1 Dataset utilizing isolated base components with dynamic mask routing."""
     
-    def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train', splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640)):
+    def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train', splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640), mask_strategy: str = "multi_block"):
         super().__init__(data_dir=data_dir, dataset_name=dataset_name, split=split, splits_root=splits_root, image_size=image_size)
+        self.mask_strategy = mask_strategy
 
     def _generate_multiblock_mask(self, h: int, w: int, num_blocks: int = 4) -> torch.Tensor:
         mask = torch.zeros((1, h, w), dtype=torch.float32)
@@ -191,12 +192,35 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
             
         return mask
 
+    def _generate_random_patch_mask(self, h: int, w: int, patch_size: int = 16, mask_ratio: float = 0.60) -> torch.Tensor:
+        """Ablation Variant: Drops completely random disjointed patches instead of semantic blocks."""
+        mask = torch.zeros((1, h, w), dtype=torch.float32)
+        num_patches_h, num_patches_w = h // patch_size, w // patch_size
+        total_patches = num_patches_h * num_patches_w
+        num_mask_patches = int(total_patches * mask_ratio)
+        
+        # Randomly select patches to mask
+        mask_indices = np.random.choice(total_patches, num_mask_patches, replace=False)
+        
+        for idx in mask_indices:
+            row = (idx // num_patches_w) * patch_size
+            col = (idx % num_patches_w) * patch_size
+            mask[:, row:row+patch_size, col:col+patch_size] = 1.0
+            
+        return mask
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         base_name = self.image_files[idx]
         x_full = self._load_multimodal_tensors(base_name)
         
         x_normalized = TF.normalize(x_full, mean=self.mean, std=self.std)
-        mask = self._generate_multiblock_mask(self.image_size[0], self.image_size[1])
+        
+        # Route the mask topology based on the orchestrator's injected state
+        if self.mask_strategy == "random":
+            mask = self._generate_random_patch_mask(self.image_size[0], self.image_size[1])
+        else:
+            mask = self._generate_multiblock_mask(self.image_size[0], self.image_size[1])
+            
         x_visible = x_normalized * (1.0 - mask)
         
         return {'x_full': x_normalized, 'x_visible': x_visible, 'mask': mask}
