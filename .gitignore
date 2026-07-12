@@ -1,0 +1,17 @@
+.venv/
+.pytest_cache/
+.oython-version
+.dvc/
+.env
+diagnostics/
+results/
+archive/
+documents/
+*.ipynb
+__pycache__/
+.vscode/
+configs/
+dataset/
+weights/
+config.*
+/dataset
