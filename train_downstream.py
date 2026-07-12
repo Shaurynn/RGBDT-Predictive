@@ -228,6 +228,10 @@ class ExperimentManager:
         return state
 
 def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_loader, eval_loader, num_classes, empirical_alpha, global_gdl, device, cfg_hpo):
+    
+    # 1. Define a persistent database path specific to this trial's run_dir
+    db_path = os.path.join(run_dir, "hpo_sweep.db")
+    
     def objective(trial):
         model = ModelClass(**model_kwargs).to(device)
         if inherit_weights and os.path.exists(inherit_weights): model.load_state_dict(torch.load(inherit_weights))
@@ -287,9 +291,19 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
             if trial.should_prune(): raise optuna.exceptions.TrialPruned()
         return best_miou
 
-    study = optuna.create_study(direction="maximize", pruner=optuna.pruners.HyperbandPruner())
+    # 2. Inject the persistent SQLite backend
+    study = optuna.create_study(
+        study_name="TMLPN_HPO_Sweep",
+        storage=f"sqlite:///{db_path}",       # <-- This line ensures the .db file is generated
+        direction="maximize", 
+        pruner=optuna.pruners.HyperbandPruner(),
+        load_if_exists=True                   
+    )
+    
     study.optimize(objective, n_trials=cfg_hpo['n_trials'])
-    with open(os.path.join(run_dir, "best_params.json"), "w") as f: json.dump(study.best_params, f, indent=4)
+    with open(os.path.join(run_dir, "best_params.json"), "w") as f: 
+        json.dump(study.best_params, f, indent=4)
+        
     return study.best_value
 
 def get_dynamic_class_count(data_dir):
