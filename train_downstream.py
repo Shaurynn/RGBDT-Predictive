@@ -76,7 +76,6 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
         
         valid_mask = (targets != self.ignore_index) & (~illegal_mask)
         alpha_t = torch.ones_like(targets, dtype=torch.float32)
-        
         safe_targets = torch.clamp(targets, min=0, max=self.num_classes - 1)
         alpha_t[valid_mask] = self.alpha[safe_targets[valid_mask]]
         
@@ -112,10 +111,21 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
 
         return focal_loss + (self.base_dice_weight * dice_loss)
 
-def knowledge_distillation_loss(student_logits, teacher_logits, temperature=4.0):
-    soft_targets = F.softmax(teacher_logits / temperature, dim=1)
-    student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
-    return F.kl_div(student_log_probs, soft_targets, reduction='batchmean') * (temperature ** 2)
+def feature_distillation_loss(student_features, teacher_features):
+    """
+    V2 KD: Aligns the intermediate representational manifolds of the student 
+    directly with the teacher, circumventing noisy logit predictions.
+    """
+    loss = 0.0
+    valid_stages = 0
+    for s_feat, t_feat in zip(student_features, teacher_features):
+        if s_feat.shape == t_feat.shape:
+            # L2 Normalization guarantees gradient magnitude stability regardless of stage depth
+            s_norm = F.normalize(s_feat, dim=1)
+            t_norm = F.normalize(t_feat, dim=1)
+            loss += F.mse_loss(s_norm, t_norm)
+            valid_stages += 1
+    return loss / max(1, valid_stages)
 
 class IoUMetric:
     def __init__(self, num_classes, device):
@@ -137,7 +147,6 @@ class IoUMetric:
         
         bins = targets * self.num_classes + preds
         bincount = torch.bincount(bins, minlength=self.num_classes**2)
-        
         if bincount.numel() > self.num_classes**2:
             bincount = bincount[:self.num_classes**2]
             
@@ -156,20 +165,6 @@ class IoUMetric:
         valid_classes = self.unions > 0
         if valid_classes.sum() == 0: return 0.0
         return self.get_per_class_iou()[valid_classes].mean().item()
-
-class TTAWrapper(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, x_full):
-        out_orig = self.model(x_full)
-        out_hf = self.model(torch.flip(x_full, dims=[3]))
-        out_hf = torch.flip(out_hf, dims=[3]) 
-        out_vf = self.model(torch.flip(x_full, dims=[2]))
-        out_vf = torch.flip(out_vf, dims=[2]) 
-        preds_stack = torch.stack([out_orig, out_hf, out_vf], dim=0)
-        return preds_stack.mean(dim=0), preds_stack.var(dim=0).mean(dim=1)
 
 def export_to_onnx(model, weights_path, run_dir, device):
     print(f"\n--- Serializing Architecture to ONNX ---")
@@ -192,6 +187,41 @@ def export_to_onnx(model, weights_path, run_dir, device):
 # ====================================================================================
 # --- PIPELINE MANAGEMENT & TRAINING ---
 # ====================================================================================
+
+def build_llrd_optimizer(model, base_lr, weight_decay, decay_rate, phase):
+    """
+    Implements Layer-Wise Learning Rate Decay (LLRD).
+    Applies exponential decay down the backbone to prevent catastrophic forgetting.
+    """
+    if phase != "microtune":
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        return optim.AdamW(trainable, lr=base_lr, weight_decay=weight_decay)
+        
+    param_groups = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        
+        # Group by architectural depth
+        if 'decode_head' in name:
+            lr = base_lr
+        elif 'block4' in name or 'patch_embed4' in name:
+            lr = base_lr * (decay_rate ** 1)
+        elif 'block3' in name or 'patch_embed3' in name:
+            lr = base_lr * (decay_rate ** 2)
+        elif 'block2' in name or 'patch_embed2' in name:
+            lr = base_lr * (decay_rate ** 3)
+        elif 'block1' in name or 'patch_embed1' in name:
+            lr = base_lr * (decay_rate ** 4)
+        elif 'patch_embed1.proj' in name or 'dt_alignment' in name:
+            lr = base_lr * (decay_rate ** 5)
+        else:
+            lr = base_lr * (decay_rate ** 5)
+            
+        param_groups.append({'params': [param], 'lr': lr, 'weight_decay': weight_decay})
+        
+    return optim.AdamW(param_groups)
+
 class ExperimentManager:
     def __init__(self, model_instance, dataset="MM5", backbone="mit_b1", base_dir="results"):
         self.model_name = model_instance.__class__.__name__
@@ -228,8 +258,6 @@ class ExperimentManager:
         return state
 
 def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_loader, eval_loader, num_classes, empirical_alpha, global_gdl, device, cfg_hpo):
-    
-    # 1. Define a persistent database path specific to this trial's run_dir
     db_path = os.path.join(run_dir, "hpo_sweep.db")
     
     def objective(trial):
@@ -241,19 +269,12 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
         gamma = trial.suggest_float("gamma", 1.0, 4.0)
         dice = trial.suggest_float("dice_weight", 0.5, 2.0)
         
-        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=wd)
         
-        criterion = AlphaBalancedFocalGDLLoss(
-            num_classes=num_classes, 
-            alpha=empirical_alpha, 
-            global_gdl_weights=global_gdl,
-            gamma=gamma, 
-            dice_weight=dice
-        ).to(device)
-        
+        criterion = AlphaBalancedFocalGDLLoss(num_classes=num_classes, alpha=empirical_alpha, global_gdl_weights=global_gdl, gamma=gamma, dice_weight=dice).to(device)
         scaler = GradScaler('cuda', enabled=True)
-        
         best_miou = 0.0
+        
         for epoch in range(30): 
             model.train()
             for batch in train_loader:
@@ -272,7 +293,6 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
                     if param.grad is not None and not torch.isfinite(param.grad).all():
                         is_valid_gradients = False
                         break
-                
                 if is_valid_gradients:
                     scaler.step(optimizer)
                 scaler.update()
@@ -291,69 +311,40 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
             if trial.should_prune(): raise optuna.exceptions.TrialPruned()
         return best_miou
 
-    # 2. Inject the persistent SQLite backend
-    study = optuna.create_study(
-        study_name="TMLPN_HPO_Sweep",
-        storage=f"sqlite:///{db_path}",       # <-- This line ensures the .db file is generated
-        direction="maximize", 
-        pruner=optuna.pruners.HyperbandPruner(),
-        load_if_exists=True                   
-    )
-    
+    study = optuna.create_study(study_name="TMLPN_HPO_Sweep", storage=f"sqlite:///{db_path}", direction="maximize", pruner=optuna.pruners.HyperbandPruner(), load_if_exists=True)
     study.optimize(objective, n_trials=cfg_hpo['n_trials'])
-    with open(os.path.join(run_dir, "best_params.json"), "w") as f: 
-        json.dump(study.best_params, f, indent=4)
-        
+    with open(os.path.join(run_dir, "best_params.json"), "w") as f: json.dump(study.best_params, f, indent=4)
     return study.best_value
 
 def get_dynamic_class_count(data_dir):
     class_file = os.path.join(data_dir, "classes.txt")
-    if not os.path.exists(class_file):
-        raise FileNotFoundError(f"[!] CRITICAL: {class_file} not found.")
     with open(class_file, "r") as f:
         num_classes = len([line for line in f if line.strip()])
-    print(f"[*] Dynamically detected {num_classes} classes from dataset manifest.")
     return num_classes
 
 def compute_dataset_statistics(dataloader, num_classes, ignore_index=255, max_batches=100):
-    print("\n[*] Dynamically computing global dataset statistics (Laplace Smoothed)...")
     pseudo_count = 1.0
     pixel_counts = torch.full((num_classes,), pseudo_count, dtype=torch.float64)
-    
     for i, batch in enumerate(dataloader):
         if i >= max_batches: break
         targets = batch['seg_mask']
-        valid_mask = targets != ignore_index
-        valid_targets = targets[valid_mask]
-        
+        valid_targets = targets[targets != ignore_index]
         if valid_targets.numel() > 0:
             max_val = valid_targets.max().item()
             if max_val >= pixel_counts.size(0):
                 new_size = max_val + 1
-                print(f"[!] WARNING: Encountered label index {max_val}, expanding statistics tensor from {pixel_counts.size(0)} to {new_size}")
-                expanded_counts = torch.full((new_size,), pseudo_count, dtype=torch.float64)
-                expanded_counts[:pixel_counts.size(0)] = pixel_counts
-                pixel_counts = expanded_counts
+                expanded = torch.full((new_size,), pseudo_count, dtype=torch.float64)
+                expanded[:pixel_counts.size(0)] = pixel_counts
+                pixel_counts = expanded
                 num_classes = new_size
-                
             counts = torch.bincount(valid_targets.flatten(), minlength=num_classes)
-            if counts.size(0) > pixel_counts.size(0):
-                counts = counts[:pixel_counts.size(0)]
             pixel_counts[:counts.size(0)] += counts.cpu().double()
             
-    total_pixels = pixel_counts.sum()
-    frequencies = pixel_counts / total_pixels
-    median_freq = torch.median(frequencies)
-    alpha = median_freq / frequencies
-    gdl_raw_weights = 1.0 / (frequencies ** 2)
-    global_gdl_weights = gdl_raw_weights / gdl_raw_weights.max()
-    
-    alpha_list = [round(a, 4) for a in alpha.tolist()]
-    gdl_list = [round(g, 4) for g in global_gdl_weights.tolist()]
-    
-    print(f"[*] Computed Global Alpha Weights ({len(alpha_list)} classes): {alpha_list}")
-    print(f"[*] Computed Global GDL Weights ({len(gdl_list)} classes): {gdl_list}\n")
-    return alpha_list, gdl_list
+    frequencies = pixel_counts / pixel_counts.sum()
+    alpha = torch.median(frequencies) / frequencies
+    gdl_raw = 1.0 / (frequencies ** 2)
+    gdl = gdl_raw / gdl_raw.max()
+    return [round(a, 4) for a in alpha.tolist()], [round(g, 4) for g in gdl.tolist()]
 
 class SegmentationGradCAM:
     def __init__(self, model, target_layer):
@@ -381,106 +372,73 @@ class SegmentationGradCAM:
         activations = self.activations.detach()
         for i in range(activations.shape[1]):
             activations[:, i, :, :] *= pooled_gradients[i]
-        heatmap = torch.mean(activations, dim=1).squeeze()
-        heatmap = F.relu(heatmap)
-        if torch.max(heatmap) > 0:
-            heatmap /= torch.max(heatmap)
+        heatmap = F.relu(torch.mean(activations, dim=1).squeeze())
+        if torch.max(heatmap) > 0: heatmap /= torch.max(heatmap)
         return heatmap.cpu().numpy(), logits.detach()
 
 def main():
     args, config = parse_with_config("Phase 2: Downstream Supervised Semantic Segmentation")
-    
-    # --- Extracted Configuration Parameters ---
     cfg = config['phase2_downstream']
     img_size = (config['dataset']['image_height'], config['dataset']['image_width'])
     dataset_name = config['dataset']['name']
-    
-    # --- Isolate namespace and extract dynamic seed ---
     trial_name = cfg.get('trial_name', 'baseline')
     active_seed = cfg.get('seed', 42)
     enforce_reproducibility(active_seed)
-    print(f"[*] Locked PyTorch computational graph to Seed: {active_seed}")
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
     splits_root = os.path.join("data", "splits")
-    manifest_dir = os.path.join(splits_root, dataset_name)
-    NUM_CLASSES = get_dynamic_class_count(manifest_dir)
+    NUM_CLASSES = get_dynamic_class_count(os.path.join(splits_root, dataset_name))
     
-    train_dataset = DownstreamSegmentationDataset(
-        dataset_name=dataset_name, 
-        split="train", 
-        splits_root=splits_root, 
-        image_size=img_size
-    )
-    eval_dataset = DownstreamSegmentationDataset(
-        dataset_name=dataset_name, 
-        split="eval", 
-        splits_root=splits_root, 
-        image_size=img_size
-    )
+    train_dataset = DownstreamSegmentationDataset(dataset_name=dataset_name, split="train", splits_root=splits_root, image_size=img_size)
+    eval_dataset = DownstreamSegmentationDataset(dataset_name=dataset_name, split="eval", splits_root=splits_root, image_size=img_size)
     
     train_loader = DataLoader(train_dataset, batch_size=cfg['batch_size'], shuffle=True, num_workers=4)
     eval_loader = DataLoader(eval_dataset, batch_size=cfg['batch_size'], shuffle=False, num_workers=4)
     
     empirical_alpha, global_gdl = compute_dataset_statistics(train_loader, NUM_CLASSES)
     
-    # --- ABLATION STATE INJECTION ---
     ablation_cfg = cfg.get('ablations', {})
     gdl_type = ablation_cfg.get('gdl_type', 'global_anchored')
     enable_kd = ablation_cfg.get('enable_kd', True)
-
-    print("\n" + "="*60)
-    print("🔬 ABLATION STATE [PHASE 2: DOWNSTREAM]")
-    print("="*60)
-    print(f"[*] Generalized Dice Loss (GDL) Type : {gdl_type.upper()}")
-    print(f"[*] Knowledge Distillation (KD)      : {enable_kd}")
-    print("="*60 + "\n")
+    use_lora = cfg.get('use_lora', True)
     
-    model = models.TMLPN_Downstream(num_classes=NUM_CLASSES, backbone_name=cfg['backbone']).to(DEVICE)
+    model_kwargs = {
+        "num_classes": NUM_CLASSES,
+        "backbone_name": cfg['backbone'],
+        "isolated_stem": ablation_cfg.get('enable_modality_isolation', True),
+        "use_lora": use_lora,
+        "lora_r": cfg.get('lora', {}).get('r', 8),
+        "lora_alpha": cfg.get('lora', {}).get('alpha', 16)
+    }
+
+    # Model upgraded to V2 Architecture
+    model = models.TMLPN_Downstream_v2(**model_kwargs).to(DEVICE)
     
     teacher_model = None
     if enable_kd and getattr(args, 'teacher_weights', None) and os.path.exists(args.teacher_weights):
-        teacher_model = models.TMLPN_Downstream(num_classes=NUM_CLASSES, backbone_name=cfg['teacher_backbone']).to(DEVICE)
+        t_kwargs = model_kwargs.copy()
+        t_kwargs['backbone_name'] = cfg['teacher_backbone']
+        t_kwargs['use_lora'] = False # Teachers deploy fully merged weights
+        teacher_model = models.TMLPN_Downstream_v2(**t_kwargs).to(DEVICE)
         teacher_model.load_state_dict(torch.load(args.teacher_weights))
         teacher_model.eval()
         for p in teacher_model.parameters(): p.requires_grad = False
     
-    # UPDATED: Namespace isolation trick for the experiment manager
     isolated_backbone = f"{cfg['backbone']}_{trial_name}" if trial_name != "baseline" else cfg['backbone']
     manager = ExperimentManager(model_instance=model, dataset=dataset_name, backbone=isolated_backbone)
-    
     state = manager.detect_state()
     if state is None: return 
     run_dir, phase = state["run_dir"], state["phase"]
 
     if phase == "baseline" and not state["is_resume"]:
-        # UPDATED: Enforce strict isolated namespace for artifact loading
         pt_weights = os.path.join("weights", dataset_name, trial_name, f"jepa_context_encoder_{cfg['backbone']}.pt")
         if os.path.exists(pt_weights):
             print(f"[*] Injecting Phase 1 MM-JEPA Foundation Weights: {pt_weights}")
-            torch.nn.Module.load_state_dict(
-                model.context_encoder, 
-                torch.load(pt_weights), 
-                strict=False
-            )
-            for param in model.context_encoder.parameters():
-                param.requires_grad = False
+            torch.nn.Module.load_state_dict(model.context_encoder, torch.load(pt_weights), strict=False)
+            for param in model.context_encoder.parameters(): param.requires_grad = False
 
     if phase == "hpo":
-        score = run_hpo_phase(
-            run_dir, 
-            state["inherit_weights"], 
-            models.TMLPN_Downstream, 
-            {"num_classes": NUM_CLASSES, "backbone_name": cfg['backbone']}, 
-            train_loader, 
-            eval_loader, 
-            NUM_CLASSES, 
-            empirical_alpha, 
-            global_gdl,
-            DEVICE,
-            cfg['hpo']
-        )
+        score = run_hpo_phase(run_dir, state["inherit_weights"], models.TMLPN_Downstream_v2, model_kwargs, train_loader, eval_loader, NUM_CLASSES, empirical_alpha, global_gdl, DEVICE, cfg['hpo'])
         with open(os.path.join(run_dir, "results.json"), 'w') as f: json.dump({"phase": phase, "best_mIoU": score}, f)
         return
     elif phase == "export":
@@ -489,92 +447,62 @@ def main():
         return
 
     MAX_EPOCHS = cfg['epochs'].get(phase, cfg['epochs']['default'])
-    
     lr = cfg['learning_rates'].get(phase, cfg['learning_rates']['default'])
     weight_decay = cfg.get('optimizer', {}).get('weight_decay', 1e-4)
-    gamma = 2.0
-    dice_weight = 1.0
+    gamma, dice_weight = 2.0, 1.0
     
     if phase in ["hero", "microtune"] and state.get("inherit_weights"):
-        hpo_dir = os.path.dirname(state["inherit_weights"])
-        hpo_params_path = os.path.join(hpo_dir, "best_params.json")
-        
+        hpo_params_path = os.path.join(os.path.dirname(state["inherit_weights"]), "best_params.json")
         if os.path.exists(hpo_params_path):
-            print(f"\n[*] Injecting optimized hyperparameters from HPO phase: {hpo_params_path}")
-            with open(hpo_params_path, 'r') as f:
-                best_params = json.load(f)
-                
+            with open(hpo_params_path, 'r') as f: best_params = json.load(f)
             lr = best_params.get("lr", lr)
             weight_decay = best_params.get("weight_decay", weight_decay)
             gamma = best_params.get("gamma", gamma)
             dice_weight = best_params.get("dice_weight", dice_weight)
-            
-            print(f"    -> LR: {lr:.2e} | WD: {weight_decay:.2e} | Gamma: {gamma:.2f} | Dice W: {dice_weight:.2f}")
-            
             if phase == "microtune":
                 lr = cfg['learning_rates'].get('microtune', 1e-5)
-                print(f"[*] Microtune Phase: Overriding HPO learning rate to {lr:.2e} for end-to-end adjustment.")
 
     if phase == "microtune":
-        print("[*] Microtune Phase: Unfreezing foundation backbone for end-to-end fine-tuning.")
-        for param in model.parameters():
-            param.requires_grad = True
+        print("\n[*] Initializing Microtune Phase")
+        if use_lora:
+            print("[*] LoRA Active: Tuning ONLY Decoder and Low-Rank matrices. Foundation remains frozen.")
+            for name, param in model.named_parameters():
+                if 'lora_' in name or 'decode_head' in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
+        else:
+            print("[*] LoRA Inactive: Full backbone unfreezing with Layer-Wise Learning Rate Decay (LLRD).")
+            for param in model.parameters():
+                param.requires_grad = True
 
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=weight_decay)
+    optimizer = build_llrd_optimizer(model, lr, weight_decay, cfg.get('llrd_decay', 0.85), phase)
     scaler = GradScaler('cuda', enabled=True)
     
     criterion = AlphaBalancedFocalGDLLoss(
-        num_classes=NUM_CLASSES, 
-        alpha=empirical_alpha, 
-        global_gdl_weights=global_gdl if gdl_type == 'global_anchored' else None,
-        gamma=gamma,
-        dice_weight=dice_weight,
-        use_batch_dynamic=(gdl_type == 'batch_dynamic')
+        num_classes=NUM_CLASSES, alpha=empirical_alpha, global_gdl_weights=global_gdl if gdl_type == 'global_anchored' else None,
+        gamma=gamma, dice_weight=dice_weight, use_batch_dynamic=(gdl_type == 'batch_dynamic')
     ).to(DEVICE)
     
-    active_hparams = {
-        "lr": lr,
-        "weight_decay": weight_decay,
-        "gamma": gamma,
-        "dice_weight": dice_weight,
-        "batch_size": cfg['batch_size'],
-        "kd_temperature": cfg.get('kd_temperature', 4.0),
-        **ablation_cfg
-    }
-    
+    active_hparams = {"lr": lr, "weight_decay": weight_decay, "gamma": gamma, "dice_weight": dice_weight, "batch_size": cfg['batch_size'], "use_lora": use_lora, **ablation_cfg}
     state["hyperparameters"] = active_hparams
     
     writer = SummaryWriter(log_dir=os.path.join(run_dir, "logs"))
     writer.add_text("Configuration/Hyperparameters", json.dumps(active_hparams, indent=4), 0)
-    
     cam_extractor = SegmentationGradCAM(model, model.decode_head.linear_pred)
 
     start_epoch = 0
     if state["is_resume"]:
         checkpoint_path = os.path.join(run_dir, "checkpoint.pt")
         if os.path.exists(checkpoint_path):
-            print(f"\n[*] CRITICAL: Resuming interrupted run from {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-            
             model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-            
-            try:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            except ValueError as e:
-                print(f"\n[!] WARNING: Optimizer state dict size mismatch detected ({e}).")
-                print("[*] Re-initializing optimizer for current parameter configuration. Momentum buffers reset.")
-                
-            try:
-                scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            except Exception as e:
-                print(f"[!] WARNING: Could not restore GradScaler state ({e}). Initializing fresh scaler.")
-                
+            try: optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except ValueError: pass
+            try: scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            except Exception: pass
             start_epoch = checkpoint['epoch']
             state["best_miou"] = checkpoint['best_miou']
-            
-            print(f"[*] Successfully restored state. Resuming strictly at Epoch {start_epoch + 1}")
-        else:
-            print("\n[!] WARNING: JSON state indicated resume, but no checkpoint.pt found. Starting from Epoch 1.")
 
     for epoch in range(start_epoch, MAX_EPOCHS):
         model.train()
@@ -586,17 +514,16 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             
             with autocast('cuda', dtype=torch.bfloat16):
-                pred_seg = model(x_full)
+                pred_seg, s_feats = model(x_full, return_features=True)
                 loss = criterion(pred_seg, seg_mask)
                 
                 if enable_kd and teacher_model is not None:
                     with torch.no_grad():
-                        t_seg = teacher_model(x_full)
-                    loss_kd = knowledge_distillation_loss(pred_seg, t_seg, temperature=cfg.get('kd_temperature', 4.0))
+                        _, t_feats = teacher_model(x_full, return_features=True)
+                    loss_kd = feature_distillation_loss(s_feats, t_feats)
                     loss = (0.5 * loss) + (0.5 * loss_kd)
                     
             scaler.scale(loss).backward()
-            
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
@@ -606,18 +533,13 @@ def main():
                     is_valid_gradients = False
                     break
             
-            if is_valid_gradients:
-                scaler.step(optimizer)
-            else:
-                print(f"\n[!] WARNING: Unstable gradients (NaN/Inf) detected at Epoch {epoch+1}. Skipping optimizer step.")
-                
+            if is_valid_gradients: scaler.step(optimizer)
             scaler.update()
             
             train_loss += loss.item()
             loop.set_postfix(loss=loss.item())
             
-        avg_train_loss = train_loss / len(train_loader)
-        writer.add_scalar("Loss/Train", avg_train_loss, epoch)
+        writer.add_scalar("Loss/Train", train_loss / len(train_loader), epoch)
             
         model.eval()
         val_loss = 0.0
@@ -627,71 +549,41 @@ def main():
         with torch.no_grad(): 
             for batch in eval_loader:
                 x_full, seg_mask = batch['x_full'].to(DEVICE), batch['seg_mask'].to(DEVICE)
-                
                 with autocast('cuda', dtype=torch.bfloat16):
                     pred_seg = model(x_full)
                     loss = criterion(pred_seg, seg_mask)
                     val_loss += loss.item()
-                    
                 val_iou.update(pred_seg, seg_mask)
                 
                 if not logged_image and epoch % 5 == 0:
                     with torch.enable_grad(): 
                         heatmap, _ = cam_extractor.generate_cam(x_full[0:1], target_class=1)
-                        
                     rgb_vis = x_full[0, :3].cpu().numpy().transpose(1, 2, 0)
                     rgb_vis = (rgb_vis - rgb_vis.min()) / (rgb_vis.max() - rgb_vis.min() + 1e-8)
-                    
                     heatmap_resized = cv2.resize(heatmap, (rgb_vis.shape[1], rgb_vis.shape[0]))
                     heatmap_color = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-                    heatmap_color = np.float32(heatmap_color) / 255
-                    heatmap_color = heatmap_color[:, :, ::-1] 
-                    
+                    heatmap_color = (np.float32(heatmap_color) / 255.0)[:, :, ::-1]
                     overlay = 0.5 * rgb_vis + 0.5 * heatmap_color
                     writer.add_image("Explainability/GradCAM_Defect_Focus", overlay.transpose(2, 0, 1), epoch)
-
-                    vis_dir = os.path.join(run_dir, "visualizations")
-                    os.makedirs(vis_dir, exist_ok=True)
-                    bgr_save = cv2.cvtColor(np.uint8(255 * np.clip(overlay, 0, 1)), cv2.COLOR_RGB2BGR)
-                    cv2.imwrite(os.path.join(vis_dir, f"gradcam_epoch_{epoch+1}.png"), bgr_save)
-                    
                     logged_image = True
         
-        avg_val_loss = val_loss / len(eval_loader)
         avg_val_miou = val_iou.get_miou()
-        per_class_ious = val_iou.get_per_class_iou()
-        
-        writer.add_scalar("Loss/Validation", avg_val_loss, epoch)
+        writer.add_scalar("Loss/Validation", val_loss / len(eval_loader), epoch)
         writer.add_scalar("Metrics/mIoU_Validation", avg_val_miou, epoch)
         
-        for c in range(NUM_CLASSES):
-            writer.add_scalar(f"Class_IoU/Class_{c}", per_class_ious[c].item(), epoch)
-
         if avg_val_miou > state.get("best_miou", 0.0):
             state["best_miou"] = avg_val_miou
             torch.save(model.state_dict(), os.path.join(run_dir, "best_model.pt"))
             
         torch.save({
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scaler_state_dict': scaler.state_dict(),
+            'epoch': epoch + 1, 'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(), 'scaler_state_dict': scaler.state_dict(),
             'best_miou': state.get("best_miou", 0.0)
         }, os.path.join(run_dir, "checkpoint.pt"))
+        with open(os.path.join(run_dir, "state.json"), 'w') as f: json.dump(state, f, indent=4)
             
-        with open(os.path.join(run_dir, "state.json"), 'w') as f: 
-            json.dump(state, f, indent=4)
-            
-    results_path = os.path.join(run_dir, "results.json")
-    with open(results_path, 'w') as f:
-        json.dump({
-            "phase": phase, 
-            "hyperparameters": active_hparams,
-            "best_mIoU": state.get("best_miou", 0.0),
-            "final_train_loss": avg_train_loss,   
-            "final_val_loss": avg_val_loss
-        }, f, indent=4)
-    print(f"[*] Phase '{phase}' completed successfully. Results recorded to {results_path}")
+    with open(os.path.join(run_dir, "results.json"), 'w') as f:
+        json.dump({"phase": phase, "hyperparameters": active_hparams, "best_mIoU": state.get("best_miou", 0.0), "final_train_loss": train_loss / len(train_loader), "final_val_loss": val_loss / len(eval_loader)}, f, indent=4)
 
 if __name__ == '__main__':
     main()

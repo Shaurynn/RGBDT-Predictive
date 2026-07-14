@@ -18,7 +18,7 @@ Recent literature highlights Multimodal JEPA (MuMo-JEPA) architectures, which re
 
 1. **Memory-Bandwidth Bottlenecks:** Holding multiple independent ViT trunks in VRAM violates the shared-memory and bandwidth constraints of edge devices, as standard non-hierarchical Transformers incur prohibitive parameter counts and memory access costs during inference [19].
 2. **Quadratic Scaling:** Standard self-attention mechanisms scale with $O(N^2)$ complexity relative to spatial resolution, prohibiting real-time inference on high-resolution industrial image strips [4].
-3. **Hardware-Aware Early Fusion:** TMLPN utilizes a single hierarchical MiT trunk with a mathematically protected modality-isolated stem [10]. The MiT sequence reduction process ensures linear $O(N)$ computational scaling [10], while our Dirac-initialized $1\times 1$ projections successfully neutralize the latent alignment flaws typically associated with simplistic early fusion [5, 7].
+3. **Hardware-Aware Early Fusion:** TMLPN utilizes a single hierarchical MiT trunk with a mathematically protected modality-isolated stem [10]. The MiT sequence reduction process ensures linear $O(N)$ computational scaling [10], while our Dirac-initialized $1 \times 1$ projections successfully neutralize the latent alignment flaws typically associated with simplistic early fusion [5, 7].
 
 ---
 
@@ -38,7 +38,7 @@ To build a true foundation model of the physical environment, the network must d
 
 > ![Network Architecture](assets/Network_Architecture_Diagram.png)
 >
-> Figure 1: The Tri-Modal Latent Predictive Network (TMLPN) two-stage execution pipeline.
+> Figure 1: The Tri-Modal Latent Predictive Network (TMLPN_v1) two-stage execution pipeline.
 >
 > (Left) Phase 1: Self-Supervised MM-JEPA Pre-Training. Unaligned 5-channel multi-modal inputs are processed through a ModalityIsolatedPatchEmbed stem. To mathematically bridge the cross-modal domain gap, the Kaiming-initialized Depth+Thermal stream passes through a $1 \times 1$ Dirac-initialized alignment projection and learnable affine calibration priors before additive fusion with the ImageNet-initialized RGB manifold. The masked input (utilizing explicit token replacement) is processed by the Context Encoder, while the unmasked input is processed by the Target Encoder. To prevent representation collapse, the Target Encoder is computationally isolated from the gradient graph and updated strictly via a Cosine Annealing Exponential Moving Average (EMA) schedule. A depthwise-separable predictor aligns the representations in the latent space, optimized via an $L_2$-normalized MSE loss and spatial variance regularization.
 >
@@ -52,33 +52,16 @@ Initializing a multi-channel stream directly from 3-channel weights introduces s
 
 * **RGB Stream:** Inherits pristine, unmodified 3-channel ImageNet kernels to leverage generalized edge-detection priors [22].
 * **D+T Stream:** Utilizes independent, Kaiming-initialized convolutions to prevent early-epoch activation vanishing in the high-variance depth and thermal tensors [6].
-* **1x1 Dirac Alignment:** Direct summation of distinctly initialized kernels (ImageNet vs. Kaiming) assumes an aligned additive vector space—a known theoretical flaw [5]. To bridge this dimensional and statistical gap prior to additive fusion, TMLPN utilizes a $1\times 1$ convolutional projection initialized via a Dirac delta distribution [7]. This guarantees a stable identity mapping at initialization, mathematically preventing gradient shattering while allowing the Kaiming-initialized Depth/Thermal kernels to gradually align with the ImageNet manifold [7].
-* **Learnable Physical Calibration Priors:** Linear sensor standardization strips absolute thermodynamic metrics [20]. To preserve physical scale and shift, TMLPN applies learnable affine parameters ($\gamma$ and $\beta$), a technique proven to recover critical feature-wise modulations post-normalization [8].
-
-$$x_{calibrated}=\gamma\left(\frac{x_{dt}}{S}\right)+\beta$$
+* **1x1 Dirac Alignment:** To bridge this dimensional and statistical gap prior to additive fusion, TMLPN utilizes a $1 \times 1$ convolutional projection initialized via a Dirac delta distribution [7]. This mathematically prevents gradient shattering while allowing the Kaiming-initialized Depth/Thermal kernels to gradually align with the ImageNet manifold [7].
 
 ### 3.2 The MM-JEPA Topology
 
 To satisfy the theoretical mandates of latent prediction, the network executes the following spatial constraints:
 
-* **Token Replacement Masking:** Rather than zeroing out masked regions—which CNNs misinterpret as valid radiometric data—masked spatial coordinates are explicitly replaced with a broadcasted, learnable parameter (`encoder_mask_token`), aligning with proven masked image modeling protocols [9].
-* **Multi-Block Strategy:** The architecture samples 4 independent overlapping target blocks with varying scales (0.15–0.20) and aspect ratios (0.75–1.5) [2]. These specific hyperparameter boundaries are implemented to adhere strictly to the empirically validated optimal target-sampling distributions established in the foundational I-JEPA literature [2].
-* **Target-Conditioned Spatial Predictor:** To resolve the theoretical contradiction of spatial awareness in resolution-invariant backbones, pure 2D Positional Encodings are entirely stripped from the Context and Target Encoders [10]. They are instead concatenated *only* alongside the context feature map and target mask within the depthwise-separable predictor, ensuring the network knows exactly *where* to predict [10].
-* **EMA Cosine Annealing & Gradient Isolation:** Early training epochs produce highly volatile context embeddings [11]. TMLPN mitigates target network corruption via a Cosine Annealing Schedule, dynamically asymptoting the momentum parameter from $0.996$ to $1.0$ [11].
-
-$$\tau_i=1-(1-\tau_{base})\frac{\cos(\pi\cdot i/N)+1}{2}$$
-
-* **Computational Isolation:** Target network outputs are strictly severed from the computational graph via `.detach()`, mathematically guaranteeing gradient isolation and preventing representation collapse [11].
-
-### 3.3 The Latent Predictive Objective & Spatial Regularization
-
-The resulting feature manifolds are optimized via a unified objective function designed to ensure stability under micro-batch constraints:
-
-1. **$L_2$ Normalized Target Inference:** Both predicted and target features are $L_2$-normalized along the channel dimension before MSE calculation [2]. This projects continuous multimodal representations onto a unit hypersphere, measuring cosine-equivalent directional alignment rather than arbitrary magnitude scaling [2].
-2. **Context Consistency:** A down-weighted auxiliary objective evaluated on unmasked coordinates enforces representational consistency across the spatial grid [11].
-3. **Spatial Variance Regularization:** Standard architectures rely on batch-wise variance to prevent dimensional shrinkage [12]. Under edge-hardware memory constraints, micro-batch sizes ($N \le 6$) cause batch-wise variance to violently oscillate, inducing gradient collapse [12]. TMLPN explicitly computes standard deviation $\sigma$ across the *spatial* dimensions of the feature map, mathematically anchoring a diverse embedding space across the high-resolution grid [12].
-
-$$\mathcal{L}_{Var}=\frac{1}{C}\sum_{c=1}^{C}\max(0,1-\sqrt{\text{Var}_{spatial}(z_{target}^{(c)})+\epsilon})$$
+* **Token Replacement Masking:** Masked spatial coordinates are explicitly replaced with a broadcasted, learnable parameter (`encoder_mask_token`), aligning with proven masked image modeling protocols [9].
+* **Multi-Block Strategy:** The architecture samples 4 independent overlapping target blocks with varying scales (0.15–0.20) and aspect ratios (0.75–1.5) [2].
+* **Target-Conditioned Spatial Predictor:** Pure 2D Positional Encodings are concatenated *only* alongside the context feature map and target mask within the depthwise-separable predictor, ensuring the network knows exactly *where* to predict [10].
+* **EMA Cosine Annealing & Gradient Isolation:** Target network outputs are severed from the computational graph, updated strictly via a Cosine Annealing Exponential Moving Average (EMA) schedule from $0.996$ to $1.0$ to prevent representation collapse [11].
 
 ---
 
@@ -94,36 +77,82 @@ Heavy transposed convolution decoders violate the latency constraints required f
 
 Industrial datasets exhibit extreme foreground-background class imbalance [20]. The downstream engine utilizes a mathematically rigorous bipartite loss objective:
 
-1. **$\alpha$-Balanced Focal Loss:** Mitigates background dominance by explicitly weighting classes according to their empirical dataset frequencies via Median Frequency Balancing [13]. Absolute tensor clamping guarantees safety against floating-point overflow during unaligned gradient shocks [13].
-
-$$\mathcal{L}_{Focal}=-\alpha_t(1-p_t)^\gamma\log(p_t)$$
-
-2. **Global Volume Anchored Generalized Dice Loss (GDL):** Standard GDL computes dynamic weights per batch [14]. In bounded micro-batches, structural defect classes are frequently absent, causing destructive gradient sparsity [14]. TMLPN utilizes *Global Volume Anchoring*, where GDL weights are permanently anchored to the inverse square of the global dataset frequencies [14]. Additive Laplace Smoothing ensures theoretical bounds are naturally constrained by the dataset's native volume [24].
-
-$$\mathcal{L}_{GDL}=1-2\frac{\sum_{c=1}^C w_c \sum_{n=1}^N p_{nc} g_{nc}}{\sum_{c=1}^C w_c \sum_{n=1}^N (p_{nc} + g_{nc})}$$
-
-3. **Dynamic Class-Weighting (DCW):** Acting as a differentiable, class-level analog to Online Hard Example Mining (OHEM) [15], DCW tracks an Exponential Moving Average of validation IoU [16]. The downstream Dice penalty is exponentially scaled via $W_c = \exp(\tau \cdot (1 - \text{IoU}_c))$, prioritizing minority classes without inducing discrete gradient shocks [16].
-
-### 4.3 Knowledge Distillation
-
-To break representational capacity ceilings, the pipeline integrates a Knowledge Distillation (KD) engine [17]. By minimizing the Kullback-Leibler (KL) Divergence against a massive Teacher's soft probabilities (`mit_b4`), the edge-deployed `mit_b1` Student inherits advanced stochastic noise suppression [17].
+1. **$\alpha$-Balanced Focal Loss:** Mitigates background dominance by explicitly weighting classes according to their empirical dataset frequencies via Median Frequency Balancing [13].
+2. **Global Volume Anchored Generalized Dice Loss (GDL):** TMLPN utilizes *Global Volume Anchoring*, where GDL weights are permanently anchored to the inverse square of the global dataset frequencies [14]. Additive Laplace Smoothing ensures theoretical bounds are naturally constrained by the dataset's native volume [24].
 
 ---
 
-## 5. Experimental Results [PENDING]
+## 5. V1 Pipeline Findings & Ablation Analysis
 
-*Note: The architecture is actively training [20]. Quantitative milestones, including Test-Time Augmentation (TTA) robustness and Expected Calibration Error (ECE), will be populated upon the conclusion of the Microtune phase [24].*
+Initial execution of the `v1` pipeline yielded high baseline performance but revealed critical structural vulnerabilities during end-to-end unfreezing.
 
-| Method | Backbone | Pre-Training | mIoU | Pixel Accuracy | Params (M) | Edge FPS |
+### 5.1 The `microtune` Collapse: Gradient Shattering
+
+As illustrated in Figure 3, the models achieved exceptional peaks during the `hero` phase (with `mit_b5` reaching an impressive **0.8397 mIoU** with a frozen foundation). However, when the pipeline transitioned to the `microtune` phase for end-to-end tuning, performance suffered a catastrophic collapse (dropping to ~0.61–0.68 mIoU).
+
+> ![v1 Phase Progression](assets/v1_phase_progression_trajectory.png)
+>
+> **Figure 3: Architecture Progression Trajectory (V1).** Demonstrates severe catastrophic forgetting when the massive multi-scale decoder's gradients overwrite the delicate JEPA-pretrained foundation during the Microtune phase.
+
+This phenomenon is a textbook case of gradient shattering. Unconstrained downstream gradients propagating back from a high-capacity decoder aggressively overwrote the generalized multimodal manifolds learned during Phase 1 self-supervised pre-training, destroying the network's spatial awareness.
+
+### 5.2 Ablation Matrix: Component Necessity
+
+A rigorous N=5 ablation study (Figure 3) isolated the empirical necessity of our architectural components:
+
+> ![v1 Ablation Studies](assets/v1_ablation_statistics.png)
+>
+> **Figure 3: N=5 Ablation Study Results.** Validated using Welch's t-test for statistical significance against the optimal control.
+
+* **Modality Isolation is Critical:** The `NaiveFusion` ablation collapsed the network to a **0.4476 mIoU** ($p=0.0001$), proving that forcing 3-channel pretrained weights to blindly accept 5-channel unaligned data destroys ImageNet priors. The Dirac-initialized $1 \times 1$ alignment stem is mathematically necessary.
+* **Logit-Level KD is Noisy:** Disabling Knowledge Distillation (`NoKD`) yielded no statistically significant penalty ($p=0.7603$). In dense pixel-prediction tasks, raw logit distributions are highly noisy, meaning traditional KD provided zero measurable gain while doubling VRAM requirements.
+* **Variance Regularization is Redundant:** Removing variance regularization (`NoVariance`) showed no degradation ($p=0.8297$), confirming that the EMA asymmetric target updates naturally prevent dimensional collapse without explicit spatial variance penalties [11].
+
+---
+
+## 6. V2 Architecture: Optimization & Preservation Strategies
+
+To address the vulnerabilities discovered in the `v1` pipeline, the `v2` architecture transitions to a highly fortified downstream engine designed specifically to bend the network toward semantic segmentation without inducing catastrophic forgetting.
+
+> ![v2 Network Architecture Diagram](assets/v2_Network_Architecture_Diagram.png)
+>
+> **Figure 4: The finalized Tri-Modal Latent Predictive Network (TMLPN_v2) two-stage execution pipeline.**
+>
+> (Top) Phase 1: Self-Supervised MM-JEPA Pre-Training. Reorganized and streamlined for improved visual clarity, removing Predictor implementation notes and internal citations. Arrows flow from unaligned inputs (with mask token replacement) through a `ModalityIsolatedPatchEmbed` stem (with Dirac alignment and learnable affine priors) to the Context Encoder (student MiT backbone, with LLRD decay) and Target Encoder (teacher MiT backbone, frozen EMA with cosine schedule). Arrows point from context and target representations to the Unified Phase 1 JEPA Objective, now strictly optimized via an $L_2$-normalized MSE Latent >Predictive Loss on masked target coordinates]. The redundant master 'Context Consistency' and 'Variance Regularization' loss terms have been masterfully pruned].
+>
+> (Center) Phase 2: Supervised Segmentation & Feature-Level Distillation (N=5 Matrix). The converged student and locked teacher models run in parallel. Arrows flow from Student segmentation logits to a combined Segmentation Loss block (GDL + Focal + DCW). Arrows flow from four intermediate hierarchical feature stages to a central MSE Feature-Alignment Loss block]. The diagram visualizes the bipartite objective: [SegLoss] + [FD Loss]. Text labels explicitly state "Trainable: Only LoRA & Decoder"].
+>
+> (Right) Explainability & Deployment. Validated via Segmentation Grad-CAM overlays. A summarized MLOps M-JEPA Research Rigor box details the component necessity.
+
+### 6.1 Low-Rank Adaptation (LoRA)
+
+To completely neutralize gradient shattering during the `microtune` phase, the `v2` pipeline integrates Low-Rank Adaptation (LoRA) [25]. Rather than fully unfreezing the $N \times N$ weight matrices inside the MiT backbone, the foundation remains mathematically locked. We inject tiny, trainable low-rank matrices ($A$ and $B$) specifically into the Query and Value projection layers of the transformer blocks [25]. This guarantees zero catastrophic forgetting of the Phase 1 JEPA pre-training while radically reducing VRAM consumption.
+
+### 6.2 Layer-Wise Learning Rate Decay (LLRD)
+
+To safely couple the LoRA modules with the high-capacity decoder, we deploy Layer-Wise Learning Rate Decay (LLRD) [27]. The optimizer groups parameters hierarchically: the downstream decoder receives the full base learning rate, while gradients flowing deeper into the backbone are exponentially decayed (e.g., $lr \times 0.85^n$). This ensures deep foundation layers adapt smoothly while protecting the fragile structural manifolds at the modality stem [27].
+
+### 6.3 Feature-Level Knowledge Distillation
+
+To compress the performant `mit_b5` architecture into an edge-ready `mit_b1` without the noise of logit-level distillation, `v2` upgrades to Feature-Level KD [26]. By $L_2$-normalizing and aligning the intermediate feature grids of the teacher directly with the student via MSE loss, the student mathematically inherits the complex representational structure of the teacher, circumventing spatial boundary noise [26].
+
+---
+
+## 7. V2 Experimental Results [PENDING]
+
+*The `v2` architecture is actively undergoing its N=5 statistical evaluation.*
+
+| Method | Backbone | Pre-Training | Mean mIoU | Std Dev | Params (M) | Edge FPS |
 | --- | --- | --- | --- | --- | --- | --- |
-| SFDFNet [18] | ResNet-50 | ImageNet | TBD | TBD | TBD | TBD |
-| **TMLPN (Ours)** | **MiT-b1** | **MM-JEPA** | **[PENDING]** | **[PENDING]** | **13.7** | **[PENDING]** |
+| SFDFNet [18] | ResNet-50 | ImageNet | TBD | --- | TBD | TBD |
+| **TMLPN_v2 (Ours)** | **MiT-b1 (Student)** | **MM-JEPA** | **[PENDING]** | **[PENDING]** | **13.7** | **[PENDING]** |
+| **TMLPN_v2 (Ours)** | **MiT-b5 (Teacher)** | **MM-JEPA** | **[PENDING]** | **[PENDING]** | **82.0** | **[PENDING]** |
 
 ---
 
-## 6. Edge Deployment (Jetson Orin Nano)
+## 8. Edge Deployment (Jetson Orin Nano / Orange Pi 5)
 
-The isolated, finetuned architecture is natively serialized to an ONNX artifact (`opset_version=18`) for cross-platform compatibility [20]. By deploying this distilled TensorRT engine onto a Jetson Orin Nano, the system achieves sub-pixel structural segmentation and real-time autonomous predictions directly at the sensor source [20].
+The isolated, finetuned architecture is natively serialized to an ONNX artifact (`opset_version=18`) for cross-platform compatibility [20]. By deploying this distilled TensorRT engine onto edge hardware such as the Jetson Orin Nano or Rockchip RK3588 NPUs, the system achieves sub-pixel structural segmentation and real-time autonomous predictions directly at the sensor source [20].
 
 To ensure explainability is preserved during deployment, Segmentation Grad-CAM heatmaps are extracted directly from the `decode_head.linear_pred` layer, dynamically verifying structural defect focus over artifact exploitation [23].
 
@@ -178,6 +207,12 @@ To ensure explainability is preserved during deployment, Segmentation Grad-CAM h
 [23] Selvaraju, R. R., Cogswell, M., Das, A., Vedantam, R., Parikh, D., & Batra, D. (2017). Grad-CAM: Visual Explanations from Deep Networks via Gradient-based Localization. *ICCV*.
 
 [24] Bouthillier, X., Delaunay, P., Bronzi, M., Trofimov, A., Nichyporuk, B., Szeto, J., ... & Vincent, P. (2021). Accounting for Variance in Machine Learning Benchmarks. *MLSys*.
+
+[25] Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L., & Chen, W. (2021). LoRA: Low-Rank Adaptation of Large Language Models. *ICLR*.
+
+[26] Romero, A., Ballas, N., Kahou, S. E., Chassang, A., Gatta, C., & Bengio, Y. (2014). FitNets: Hints for Thin Deep Nets. *ICLR*.
+
+[27] Clark, K., Luong, M. T., Le, Q. V., & Manning, C. D. (2020). ELECTRA: Pre-training Text Encoders as Discriminators Rather Than Generators. *ICLR*.
 
 ---
 
