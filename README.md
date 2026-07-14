@@ -36,7 +36,7 @@ To ensure strict academic reproducibility of our evaluation benchmarks, all arti
 
 To build a true foundation model of the physical environment, the network must decouple feature extraction from human-annotated labels [2]. Phase 1 achieves this through pure self-supervised spatial inference, forcing the network to understand structural geometry prior to task-specific fine-tuning [2].
 
-> ![Network Architecture](assets/Network_Architecture_Diagram.png)
+> ![Network Architecture](assets/v1_Network_Architecture_Diagram.png)
 >
 > Figure 1: The Tri-Modal Latent Predictive Network (TMLPN_v1) two-stage execution pipeline.
 >
