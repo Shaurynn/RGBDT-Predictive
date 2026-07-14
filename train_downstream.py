@@ -461,6 +461,12 @@ def main():
             dice_weight = best_params.get("dice_weight", dice_weight)
             if phase == "microtune":
                 lr = cfg['learning_rates'].get('microtune', 1e-5)
+                
+        # --- NEW INJECTION: Load the inherited weights ---
+        if os.path.exists(state["inherit_weights"]):
+            print(f"\n[*] Inheriting converged weights from previous phase: {state['inherit_weights']}")
+            model.load_state_dict(torch.load(state["inherit_weights"], map_location=DEVICE), strict=False)
+        # -------------------------------------------------
 
     if phase == "microtune":
         print("\n[*] Initializing Microtune Phase")
