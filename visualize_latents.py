@@ -14,14 +14,13 @@ from torch.utils.data import DataLoader
 from dataset_jepa import DownstreamSegmentationDataset
 import models
 
-# Suppress UMAP multi-threading warnings to maintain clean terminal output
 warnings.filterwarnings("ignore", message=".*n_jobs value 1 overridden.*")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="TMLPN Batch Latent Visualization Engine")
     parser.add_argument("--model", type=str, default="TMLPN_Downstream_v2", help="Target model architecture directory")
     parser.add_argument("--dataset", type=str, default="MM5", help="Target dataset directory")
-    parser.add_argument("--weights", type=str, default=None, help="Optional: Path to a specific best_model.pt to run in isolation")
+    parser.add_argument("--weights", type=str, default=None, help="Optional: Path to a specific model artifact to run in isolation")
     parser.add_argument("--backbone", type=str, default="mit_b5", help="Required only if using --weights to specify the backbone")
     parser.add_argument("--samples", type=int, default=8000, help="Max spatial tokens to sample per projection")
     return parser.parse_args()
@@ -79,35 +78,48 @@ def compute_and_plot(features, labels, title, ax_tsne, ax_umap, palette_type, cl
     umap_results = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine', random_state=42).fit_transform(features)
     
     if palette_type == "semantic" and class_names is not None:
+        unique_int_labels = sorted(np.unique(labels).astype(int))
         display_labels = [class_names[int(lbl)] if int(lbl) < len(class_names) else f"Class {lbl}" for lbl in labels]
+        hue_order = [class_names[i] if i < len(class_names) else f"Class {i}" for i in unique_int_labels]
+        palette = sns.color_palette("nipy_spectral", len(unique_int_labels))
     else:
         display_labels = labels
+        hue_order = ["RGB Manifold", "Depth+Thermal Manifold"]
+        palette = {"RGB Manifold": "#3498db", "Depth+Thermal Manifold": "#e74c3c"}
 
     df = pd.DataFrame({'TSNE_1': tsne_results[:, 0], 'TSNE_2': tsne_results[:, 1], 'UMAP_1': umap_results[:, 0], 'UMAP_2': umap_results[:, 1], 'Label': display_labels})
     
-    if palette_type == "modality":
-        palette = {"RGB Manifold": "#3498db", "Depth+Thermal Manifold": "#e74c3c"}
-    else:
-        palette = sns.color_palette("nipy_spectral", len(np.unique(display_labels)))
-        
-    sns.scatterplot(data=df, x='TSNE_1', y='TSNE_2', hue='Label', palette=palette, s=12, alpha=0.7, ax=ax_tsne, edgecolor=None)
+    sns.scatterplot(data=df, x='TSNE_1', y='TSNE_2', hue='Label', hue_order=hue_order, palette=palette, s=12, alpha=0.7, ax=ax_tsne, edgecolor=None)
     ax_tsne.set_title(f"t-SNE: {title}", fontweight='bold'); ax_tsne.set_xticks([]); ax_tsne.set_yticks([]) 
     if palette_type == "semantic":
         ax_tsne.legend(title="Structural Class", bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., fontsize='small')
     
-    sns.scatterplot(data=df, x='UMAP_1', y='UMAP_2', hue='Label', palette=palette, s=12, alpha=0.7, ax=ax_umap, edgecolor=None)
+    sns.scatterplot(data=df, x='UMAP_1', y='UMAP_2', hue='Label', hue_order=hue_order, palette=palette, s=12, alpha=0.7, ax=ax_umap, edgecolor=None)
     ax_umap.set_title(f"UMAP: {title}", fontweight='bold'); ax_umap.set_xticks([]); ax_umap.set_yticks([]) 
     if palette_type == "semantic":
         ax_umap.legend(title="Structural Class", bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., fontsize='small')
 
 def main():
     args = parse_args()
+    
+    if args.weights:
+        norm_path = os.path.normpath(args.weights)
+        path_parts = norm_path.split(os.sep)
+        anchor = "results" if "results" in path_parts else ("weights" if "weights" in path_parts else None)
+        
+        if anchor:
+            anchor_idx = path_parts.index(anchor)
+            if len(path_parts) > anchor_idx + 2:
+                args.model = path_parts[anchor_idx + 1]
+                args.dataset = path_parts[anchor_idx + 2]
+                print(f"[*] Isolated run detected. Auto-routed to Model: {args.model} | Dataset: {args.dataset}")
+    
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     splits_root = os.path.join("data", "splits")
     try:
         with open(os.path.join(splits_root, args.dataset, "classes.txt"), "r") as f:
-            class_names = [line.strip() for line in f if line.strip()]
+            class_names = [re.sub(r'\\s*', '', line).strip() for line in f if line.strip()]
             NUM_CLASSES = len(class_names)
     except FileNotFoundError:
         print(f"[-] CRITICAL: classes.txt not found. Cannot perform latent rendering for {args.dataset}")
@@ -120,47 +132,81 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     runs_to_process = []
+    
     if args.weights:
-        runs_to_process.append((args.weights, args.backbone, "Custom_Isolated_Run"))
+        is_p1 = "jepa" in os.path.basename(args.weights)
+        p1_w = args.weights if is_p1 else None
+        p2_w = None if is_p1 else args.weights
+        runs_to_process.append((p1_w, p2_w, args.backbone, "Custom_Isolated_Run"))
     else:
         base_dir = os.path.join("results", args.model, args.dataset)
         weight_files = glob.glob(os.path.join(base_dir, "*", "*", "best_model.pt"))
         for wf in weight_files:
             run_name = os.path.basename(os.path.dirname(wf))
             parent_backbone_folder = os.path.basename(os.path.dirname(os.path.dirname(wf)))
-            match = re.match(r"^(mit_b\d+)", parent_backbone_folder)
+            
+            match = re.match(r"^(mit_b\d+)(?:_(.*))?$", parent_backbone_folder)
             backbone = match.group(1) if match else "mit_b1"
-            runs_to_process.append((wf, backbone, run_name))
+            trial_name = match.group(2) if (match and match.group(2)) else "baseline"
+            
+            p1_weights = os.path.join("weights", args.model, args.dataset, trial_name, f"jepa_context_encoder_{backbone}.pt")
+            runs_to_process.append((p1_weights, wf, backbone, run_name))
 
     if not runs_to_process:
-        print(f"[-] No valid weights found for Model: {args.model} | Dataset: {args.dataset}")
+        print(f"[-] No valid artifacts found for Model: {args.model} | Dataset: {args.dataset}")
         return
 
-    print(f"\n[*] Booting Latent Visualization Engine (Found {len(runs_to_process)} target models)")
+    print(f"\n[*] Booting Latent Visualization Engine (Found {len(runs_to_process)} target executions)")
     
-    for weights_path, backbone, run_name in runs_to_process:
+    for p1_weights, p2_weights, backbone, run_name in runs_to_process:
         print("\n" + "="*70)
         print(f"[*] Processing: {run_name} (Backbone: {backbone})")
         print("="*70)
         
-        model = models.TMLPN_Downstream_v2(num_classes=NUM_CLASSES, backbone_name=backbone, use_lora=False).to(DEVICE)
-        model.load_state_dict(torch.load(weights_path, map_location=DEVICE), strict=False)
+        has_p1 = p1_weights and os.path.exists(p1_weights)
+        has_p2 = p2_weights and os.path.exists(p2_weights)
         
-        modality_features, modality_labels = extract_modality_embeddings(model, eval_loader, DEVICE, args.samples)
-        semantic_features, semantic_labels = extract_semantic_embeddings(model, eval_loader, DEVICE, args.samples)
-        
+        cols = 4 if (has_p1 and has_p2) else 2
         sns.set_theme(style="white", context="paper")
-        # Increased figure width to comfortably accommodate the external legends
-        fig, axes = plt.subplots(2, 2, figsize=(22, 16))
+        fig, axes = plt.subplots(2, cols, figsize=(8*cols, 16))
+        if cols == 2: axes = axes.reshape(2, 2)
         
-        compute_and_plot(modality_features, modality_labels, "Modality Alignment (Stem Output)", axes[0, 0], axes[0, 1], "modality")
-        compute_and_plot(semantic_features, semantic_labels, "Semantic Separation (c4 Deep Features)", axes[1, 0], axes[1, 1], "semantic", class_names)
-        
-        plt.tight_layout(pad=3.0)
-        save_path = os.path.join(out_dir, f"manifold_{run_name}.png")
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"[+] Rendered projection exported to: {save_path}")
+        try:
+            if has_p1:
+                print("    -> Extracting Phase 1 (Foundation) manifolds...")
+                model_p1 = models.TMLPN_Downstream_v2(num_classes=NUM_CLASSES, backbone_name=backbone, use_lora=False).to(DEVICE)
+                
+                raw_checkpoint = torch.load(p1_weights, map_location=DEVICE)
+                ce_weights = raw_checkpoint.get('context_encoder_state_dict', raw_checkpoint)
+                model_p1.load_state_dict({f"context_encoder.{k}": v for k, v in ce_weights.items()}, strict=False)
+                
+                m_f1, m_l1 = extract_modality_embeddings(model_p1, eval_loader, DEVICE, args.samples)
+                s_f1, s_l1 = extract_semantic_embeddings(model_p1, eval_loader, DEVICE, args.samples)
+                
+                col_offset = 0
+                compute_and_plot(m_f1, m_l1, "Phase 1: Modality Alignment", axes[0, col_offset], axes[0, col_offset+1], "modality", class_names)
+                compute_and_plot(s_f1, s_l1, "Phase 1: Semantic Foundation", axes[1, col_offset], axes[1, col_offset+1], "semantic", class_names)
+                
+            if has_p2:
+                print("    -> Extracting Phase 2 (Fine-Tuned) manifolds...")
+                model_p2 = models.TMLPN_Downstream_v2(num_classes=NUM_CLASSES, backbone_name=backbone, use_lora=False).to(DEVICE)
+                model_p2.load_state_dict(torch.load(p2_weights, map_location=DEVICE), strict=False)
+                
+                m_f2, m_l2 = extract_modality_embeddings(model_p2, eval_loader, DEVICE, args.samples)
+                s_f2, s_l2 = extract_semantic_embeddings(model_p2, eval_loader, DEVICE, args.samples)
+                
+                col_offset = 2 if (has_p1 and has_p2) else 0
+                compute_and_plot(m_f2, m_l2, "Phase 2: Modality Alignment", axes[0, col_offset], axes[0, col_offset+1], "modality", class_names)
+                compute_and_plot(s_f2, s_l2, "Phase 2: Semantic Separation", axes[1, col_offset], axes[1, col_offset+1], "semantic", class_names)
+                
+            plt.tight_layout(pad=3.0)
+            save_path = os.path.join(out_dir, f"manifold_progression_{run_name}.png")
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"[+] Rendered progression exported to: {save_path}")
+            
+        except Exception as e:
+            print(f"    -> [!] Extraction failed for {run_name}: {e}")
 
 if __name__ == "__main__":
     main()
