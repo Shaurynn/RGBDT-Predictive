@@ -3,6 +3,7 @@ import re
 import glob
 import torch
 import argparse
+import warnings
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -12,7 +13,8 @@ import umap.umap_ as umap
 from torch.utils.data import DataLoader
 from dataset_jepa import DownstreamSegmentationDataset
 import models
-import warnings
+
+# Suppress UMAP multi-threading warnings to maintain clean terminal output
 warnings.filterwarnings("ignore", message=".*n_jobs value 1 overridden.*")
 
 def parse_args():
@@ -48,7 +50,7 @@ def extract_modality_embeddings(model, dataloader, device, max_samples):
     
     return np.vstack((rgb_np[rgb_idx], dt_np[dt_idx])), np.array(['RGB Manifold'] * sample_size + ['Depth+Thermal Manifold'] * sample_size)
 
-def extract_semantic_embeddings(model, dataloader, device, num_classes, max_samples):
+def extract_semantic_embeddings(model, dataloader, device, max_samples):
     model.eval()
     semantic_features, semantic_labels = [], []
     with torch.no_grad():
@@ -72,26 +74,44 @@ def extract_semantic_embeddings(model, dataloader, device, num_classes, max_samp
         return f_np[indices], l_np[indices]
     return f_np, l_np
 
-def compute_and_plot(features, labels, title, ax_tsne, ax_umap, palette_type):
+def compute_and_plot(features, labels, title, ax_tsne, ax_umap, palette_type, class_names=None):
     tsne_results = TSNE(n_components=2, perplexity=45, random_state=42, max_iter=1000).fit_transform(features)
     umap_results = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine', random_state=42).fit_transform(features)
     
-    df = pd.DataFrame({'TSNE_1': tsne_results[:, 0], 'TSNE_2': tsne_results[:, 1], 'UMAP_1': umap_results[:, 0], 'UMAP_2': umap_results[:, 1], 'Label': labels})
-    palette = {"RGB Manifold": "#3498db", "Depth+Thermal Manifold": "#e74c3c"} if palette_type == "modality" else sns.color_palette("husl", len(np.unique(labels)))
+    if palette_type == "semantic" and class_names is not None:
+        display_labels = [class_names[int(lbl)] if int(lbl) < len(class_names) else f"Class {lbl}" for lbl in labels]
+    else:
+        display_labels = labels
+
+    df = pd.DataFrame({'TSNE_1': tsne_results[:, 0], 'TSNE_2': tsne_results[:, 1], 'UMAP_1': umap_results[:, 0], 'UMAP_2': umap_results[:, 1], 'Label': display_labels})
+    
+    if palette_type == "modality":
+        palette = {"RGB Manifold": "#3498db", "Depth+Thermal Manifold": "#e74c3c"}
+    else:
+        palette = sns.color_palette("nipy_spectral", len(np.unique(display_labels)))
         
     sns.scatterplot(data=df, x='TSNE_1', y='TSNE_2', hue='Label', palette=palette, s=12, alpha=0.7, ax=ax_tsne, edgecolor=None)
     ax_tsne.set_title(f"t-SNE: {title}", fontweight='bold'); ax_tsne.set_xticks([]); ax_tsne.set_yticks([]) 
+    if palette_type == "semantic":
+        ax_tsne.legend(title="Structural Class", bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., fontsize='small')
     
     sns.scatterplot(data=df, x='UMAP_1', y='UMAP_2', hue='Label', palette=palette, s=12, alpha=0.7, ax=ax_umap, edgecolor=None)
     ax_umap.set_title(f"UMAP: {title}", fontweight='bold'); ax_umap.set_xticks([]); ax_umap.set_yticks([]) 
+    if palette_type == "semantic":
+        ax_umap.legend(title="Structural Class", bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., fontsize='small')
 
 def main():
     args = parse_args()
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     splits_root = os.path.join("data", "splits")
-    with open(os.path.join(splits_root, args.dataset, "classes.txt"), "r") as f:
-        NUM_CLASSES = len([line for line in f if line.strip()])
+    try:
+        with open(os.path.join(splits_root, args.dataset, "classes.txt"), "r") as f:
+            class_names = [line.strip() for line in f if line.strip()]
+            NUM_CLASSES = len(class_names)
+    except FileNotFoundError:
+        print(f"[-] CRITICAL: classes.txt not found. Cannot perform latent rendering for {args.dataset}")
+        return
         
     eval_dataset = DownstreamSegmentationDataset(dataset_name=args.dataset, split="eval", splits_root=splits_root, image_size=(480, 640))
     eval_loader = DataLoader(eval_dataset, batch_size=4, shuffle=True, num_workers=4)
@@ -104,7 +124,6 @@ def main():
         runs_to_process.append((args.weights, args.backbone, "Custom_Isolated_Run"))
     else:
         base_dir = os.path.join("results", args.model, args.dataset)
-        # Added the extra '/*' depth to reach inside the timestamped run folders
         weight_files = glob.glob(os.path.join(base_dir, "*", "*", "best_model.pt"))
         for wf in weight_files:
             run_name = os.path.basename(os.path.dirname(wf))
@@ -128,13 +147,14 @@ def main():
         model.load_state_dict(torch.load(weights_path, map_location=DEVICE), strict=False)
         
         modality_features, modality_labels = extract_modality_embeddings(model, eval_loader, DEVICE, args.samples)
-        semantic_features, semantic_labels = extract_semantic_embeddings(model, eval_loader, DEVICE, NUM_CLASSES, args.samples)
+        semantic_features, semantic_labels = extract_semantic_embeddings(model, eval_loader, DEVICE, args.samples)
         
         sns.set_theme(style="white", context="paper")
-        fig, axes = plt.subplots(2, 2, figsize=(18, 16))
+        # Increased figure width to comfortably accommodate the external legends
+        fig, axes = plt.subplots(2, 2, figsize=(22, 16))
         
         compute_and_plot(modality_features, modality_labels, "Modality Alignment (Stem Output)", axes[0, 0], axes[0, 1], "modality")
-        compute_and_plot(semantic_features, semantic_labels, "Semantic Separation (c4 Deep Features)", axes[1, 0], axes[1, 1], "semantic")
+        compute_and_plot(semantic_features, semantic_labels, "Semantic Separation (c4 Deep Features)", axes[1, 0], axes[1, 1], "semantic", class_names)
         
         plt.tight_layout(pad=3.0)
         save_path = os.path.join(out_dir, f"manifold_{run_name}.png")
