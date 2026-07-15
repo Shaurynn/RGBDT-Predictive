@@ -28,12 +28,30 @@ def parse_args():
     parser.add_argument("--skip_latents", action="store_true", help="Flag to bypass the heavy UMAP/t-SNE rendering")
     return parser.parse_args()
 
+def configure_dark_mode():
+    """Injects a high-contrast dark aesthetic strictly for spatial token visualization."""
+    plt.style.use('dark_background')
+    sns.set_theme(
+        style="dark", 
+        context="paper", 
+        rc={
+            "axes.facecolor": "#0d1117",       
+            "figure.facecolor": "#0d1117", 
+            "grid.color": "#30363d",           
+            "axes.edgecolor": "#30363d",
+            "text.color": "#c9d1d9",           
+            "xtick.color": "#c9d1d9",
+            "ytick.color": "#c9d1d9"
+        }
+    )
+
 # ====================================================================================
 # --- PART 1: METRIC AGGREGATION & STATISTICAL PLOTTING ---
 # ====================================================================================
 
 def generate_metric_visualizations(primary_baselines, ablation_stats, output_dir):
     os.makedirs(output_dir, exist_ok=True)
+    # Enforce standard light-mode whitegrid for CVPR statistical plots
     sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
 
     if primary_baselines:
@@ -133,19 +151,25 @@ def compute_and_plot_latents(features, labels, title, ax_tsne, ax_umap, palette_
     else:
         display_labels = labels
         hue_order = ["RGB Manifold", "Depth+Thermal Manifold"]
-        palette = {"RGB Manifold": "#3498db", "Depth+Thermal Manifold": "#e74c3c"}
+        palette = {"RGB Manifold": "#58a6ff", "Depth+Thermal Manifold": "#ff7b72"}
 
     df = pd.DataFrame({'TSNE_1': tsne_results[:, 0], 'TSNE_2': tsne_results[:, 1], 'UMAP_1': umap_results[:, 0], 'UMAP_2': umap_results[:, 1], 'Label': display_labels})
     
-    sns.scatterplot(data=df, x='TSNE_1', y='TSNE_2', hue='Label', hue_order=hue_order, palette=palette, s=12, alpha=0.7, ax=ax_tsne, edgecolor=None)
-    ax_tsne.set_title(f"t-SNE: {title}", fontweight='bold'); ax_tsne.set_xticks([]); ax_tsne.set_yticks([]) 
-    if palette_type == "semantic":
-        ax_tsne.legend(title="Structural Class", bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., fontsize='small')
+    sns.scatterplot(data=df, x='TSNE_1', y='TSNE_2', hue='Label', hue_order=hue_order, palette=palette, s=15, alpha=0.85, ax=ax_tsne, edgecolor='none')
+    ax_tsne.set_title(f"t-SNE: {title}", fontweight='bold', color='white')
+    ax_tsne.set_xticks([]); ax_tsne.set_yticks([]) 
     
-    sns.scatterplot(data=df, x='UMAP_1', y='UMAP_2', hue='Label', hue_order=hue_order, palette=palette, s=12, alpha=0.7, ax=ax_umap, edgecolor=None)
-    ax_umap.set_title(f"UMAP: {title}", fontweight='bold'); ax_umap.set_xticks([]); ax_umap.set_yticks([]) 
+    sns.scatterplot(data=df, x='UMAP_1', y='UMAP_2', hue='Label', hue_order=hue_order, palette=palette, s=15, alpha=0.85, ax=ax_umap, edgecolor='none')
+    ax_umap.set_title(f"UMAP: {title}", fontweight='bold', color='white')
+    ax_umap.set_xticks([]); ax_umap.set_yticks([]) 
+    
     if palette_type == "semantic":
-        ax_umap.legend(title="Structural Class", bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., fontsize='small')
+        for ax in [ax_tsne, ax_umap]:
+            legend = ax.legend(title="Structural Class", bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., fontsize='small')
+            plt.setp(legend.get_title(), color='white')
+            plt.setp(legend.get_texts(), color='white')
+            legend.get_frame().set_facecolor('#161b22')
+            legend.get_frame().set_edgecolor('#30363d')
 
 # ====================================================================================
 # --- MAIN EVALUATION ENGINE ---
@@ -234,12 +258,14 @@ def main():
     print("\n" + "="*85)
     print("🌌 INITIALIZING MANIFOLD PROJECTION ENGINE (UMAP / t-SNE)")
     print("="*85)
+    
+    # Inject Dark Mode directly before manifold plots
+    configure_dark_mode()
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     splits_root = os.path.join("data", "splits")
     try:
         with open(os.path.join(splits_root, args.dataset, "classes.txt"), "r") as f:
-            # FIXED: Corrected Regex for String Class Mapping
             class_names = [re.sub(r'\\s*', '', line).strip() for line in f if line.strip()]
             NUM_CLASSES = len(class_names)
     except FileNotFoundError:
@@ -259,7 +285,6 @@ def main():
         print("[-] No converged 'best_model.pt' artifacts found. Pipeline may still be training.")
         return
 
-    # UPGRADED: Pairing Engine for Progression Generation in analyse_results.py
     runs_to_process = []
     for wf in weight_files:
         run_name = os.path.basename(os.path.dirname(wf))
@@ -279,8 +304,7 @@ def main():
         has_p2 = p2_weights and os.path.exists(p2_weights)
         
         cols = 4 if (has_p1 and has_p2) else 2
-        sns.set_theme(style="white", context="paper")
-        fig, axes = plt.subplots(2, cols, figsize=(8*cols, 16))
+        fig, axes = plt.subplots(2, cols, figsize=(8*cols, 16), facecolor="#0d1117")
         if cols == 2: axes = axes.reshape(2, 2)
         
         try:
@@ -313,7 +337,7 @@ def main():
                 
             plt.tight_layout(pad=3.0)
             save_path = os.path.join(vis_dir, f"manifold_progression_{run_name}.png")
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor="#0d1117")
             plt.close()
             print(f"    -> Render saved to: {save_path}")
             

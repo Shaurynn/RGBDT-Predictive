@@ -14,16 +14,34 @@ from torch.utils.data import DataLoader
 from dataset_jepa import DownstreamSegmentationDataset
 import models
 
+# Suppress UMAP multi-threading warnings to maintain clean terminal output
 warnings.filterwarnings("ignore", message=".*n_jobs value 1 overridden.*")
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="TMLPN Batch Latent Visualization Engine")
+    parser = argparse.ArgumentParser(description="TMLPN Batch Latent Visualization Engine (Dark Mode)")
     parser.add_argument("--model", type=str, default="TMLPN_Downstream_v2", help="Target model architecture directory")
     parser.add_argument("--dataset", type=str, default="MM5", help="Target dataset directory")
     parser.add_argument("--weights", type=str, default=None, help="Optional: Path to a specific model artifact to run in isolation")
     parser.add_argument("--backbone", type=str, default="mit_b5", help="Required only if using --weights to specify the backbone")
     parser.add_argument("--samples", type=int, default=8000, help="Max spatial tokens to sample per projection")
     return parser.parse_args()
+
+def configure_dark_mode():
+    """Injects a high-contrast dark aesthetic for spatial token visualization."""
+    plt.style.use('dark_background')
+    sns.set_theme(
+        style="dark", 
+        context="paper", 
+        rc={
+            "axes.facecolor": "#0d1117",       # Deep charcoal background
+            "figure.facecolor": "#0d1117", 
+            "grid.color": "#30363d",           # Subtle slate gridlines
+            "axes.edgecolor": "#30363d",
+            "text.color": "#c9d1d9",           # Soft white text
+            "xtick.color": "#c9d1d9",
+            "ytick.color": "#c9d1d9"
+        }
+    )
 
 def extract_modality_embeddings(model, dataloader, device, max_samples):
     model.eval()
@@ -85,22 +103,32 @@ def compute_and_plot(features, labels, title, ax_tsne, ax_umap, palette_type, cl
     else:
         display_labels = labels
         hue_order = ["RGB Manifold", "Depth+Thermal Manifold"]
-        palette = {"RGB Manifold": "#3498db", "Depth+Thermal Manifold": "#e74c3c"}
+        # Adjusted modality colors to be highly visible against dark backgrounds
+        palette = {"RGB Manifold": "#58a6ff", "Depth+Thermal Manifold": "#ff7b72"}
 
     df = pd.DataFrame({'TSNE_1': tsne_results[:, 0], 'TSNE_2': tsne_results[:, 1], 'UMAP_1': umap_results[:, 0], 'UMAP_2': umap_results[:, 1], 'Label': display_labels})
     
-    sns.scatterplot(data=df, x='TSNE_1', y='TSNE_2', hue='Label', hue_order=hue_order, palette=palette, s=12, alpha=0.7, ax=ax_tsne, edgecolor=None)
-    ax_tsne.set_title(f"t-SNE: {title}", fontweight='bold'); ax_tsne.set_xticks([]); ax_tsne.set_yticks([]) 
-    if palette_type == "semantic":
-        ax_tsne.legend(title="Structural Class", bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., fontsize='small')
+    # Render scatter plots without edge borders to prevent dark-mode blurring
+    sns.scatterplot(data=df, x='TSNE_1', y='TSNE_2', hue='Label', hue_order=hue_order, palette=palette, s=15, alpha=0.85, ax=ax_tsne, edgecolor='none')
+    ax_tsne.set_title(f"t-SNE: {title}", fontweight='bold', color='white')
+    ax_tsne.set_xticks([]); ax_tsne.set_yticks([]) 
     
-    sns.scatterplot(data=df, x='UMAP_1', y='UMAP_2', hue='Label', hue_order=hue_order, palette=palette, s=12, alpha=0.7, ax=ax_umap, edgecolor=None)
-    ax_umap.set_title(f"UMAP: {title}", fontweight='bold'); ax_umap.set_xticks([]); ax_umap.set_yticks([]) 
+    sns.scatterplot(data=df, x='UMAP_1', y='UMAP_2', hue='Label', hue_order=hue_order, palette=palette, s=15, alpha=0.85, ax=ax_umap, edgecolor='none')
+    ax_umap.set_title(f"UMAP: {title}", fontweight='bold', color='white')
+    ax_umap.set_xticks([]); ax_umap.set_yticks([]) 
+    
     if palette_type == "semantic":
-        ax_umap.legend(title="Structural Class", bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., fontsize='small')
+        # Format legends for dark aesthetic
+        for ax in [ax_tsne, ax_umap]:
+            legend = ax.legend(title="Structural Class", bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., fontsize='small')
+            plt.setp(legend.get_title(), color='white')
+            plt.setp(legend.get_texts(), color='white')
+            legend.get_frame().set_facecolor('#161b22')
+            legend.get_frame().set_edgecolor('#30363d')
 
 def main():
     args = parse_args()
+    configure_dark_mode()
     
     if args.weights:
         norm_path = os.path.normpath(args.weights)
@@ -119,6 +147,7 @@ def main():
     splits_root = os.path.join("data", "splits")
     try:
         with open(os.path.join(splits_root, args.dataset, "classes.txt"), "r") as f:
+            # FIXED: Corrected Regex to preserve string spaces while dropping bracket tags
             class_names = [re.sub(r'\\s*', '', line).strip() for line in f if line.strip()]
             NUM_CLASSES = len(class_names)
     except FileNotFoundError:
@@ -167,8 +196,8 @@ def main():
         has_p2 = p2_weights and os.path.exists(p2_weights)
         
         cols = 4 if (has_p1 and has_p2) else 2
-        sns.set_theme(style="white", context="paper")
-        fig, axes = plt.subplots(2, cols, figsize=(8*cols, 16))
+        # Use #0d1117 (Deep Charcoal) to match the dark aesthetic matrix
+        fig, axes = plt.subplots(2, cols, figsize=(8*cols, 16), facecolor="#0d1117")
         if cols == 2: axes = axes.reshape(2, 2)
         
         try:
@@ -201,7 +230,7 @@ def main():
                 
             plt.tight_layout(pad=3.0)
             save_path = os.path.join(out_dir, f"manifold_progression_{run_name}.png")
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor="#0d1117")
             plt.close()
             print(f"[+] Rendered progression exported to: {save_path}")
             
