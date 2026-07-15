@@ -32,11 +32,29 @@ def main():
     img_size = (config['dataset']['image_height'], config['dataset']['image_width'])
     dataset_name = config['dataset']['name']
     
+    # NEW: Extract the target model architecture namespace for weight isolation
+    model_name = getattr(args, 'model', config.get('metadata', {}).get('model', 'TMLPN_Downstream_v2'))
+    
     # --- Isolate namespace and extract dynamic seed ---
     trial_name = cfg.get('trial_name', 'baseline')
     active_seed = cfg.get('seed', 42)
     enforce_reproducibility(active_seed)
     print(f"[*] Locked PyTorch computational graph to Seed: {active_seed}")
+
+    # --- ABLATION STATE INJECTION ---
+    ablation_cfg = cfg.get('ablations', {})
+    enable_isolation = ablation_cfg.get('enable_modality_isolation', True)
+    variance_type = ablation_cfg.get('variance_type', 'spatial')
+    mask_strategy = ablation_cfg.get('mask_strategy', 'multi_block')
+
+    print("\n" + "="*60)
+    print("🔬 ABLATION STATE [PHASE 1: PRE-TRAINING]")
+    print("="*60)
+    print(f"[*] Target Architecture Namespace      : {model_name}")
+    print(f"[*] Modality Isolated Stem (1x1 Dirac) : {enable_isolation}")
+    print(f"[*] Variance Regularization Topology   : {variance_type.upper()}")
+    print(f"[*] Masking Strategy                   : {mask_strategy.upper()}")
+    print("="*60 + "\n")
 
     # --- Agnostic Configuration Routing ---
     splits_root = os.path.join("data", "splits")
@@ -45,7 +63,8 @@ def main():
         dataset_name=dataset_name, 
         split="train",
         splits_root=splits_root, 
-        image_size=img_size
+        image_size=img_size,
+        mask_strategy=mask_strategy
     )
     
     dataloader = DataLoader(
@@ -57,37 +76,12 @@ def main():
         drop_last=True
     )
     
-    # --- ABLATION STATE INJECTION ---
-    ablation_cfg = cfg.get('ablations', {})
-    enable_isolation = ablation_cfg.get('enable_modality_isolation', True)
-    variance_type = ablation_cfg.get('variance_type', 'spatial')
-    mask_strategy = ablation_cfg.get('mask_strategy', 'multi_block') # NEW: Extract strategy
-
-    print("\n" + "="*60)
-    print("🔬 ABLATION STATE [PHASE 1: PRE-TRAINING]")
-    print("="*60)
-    print(f"[*] Modality Isolated Stem (1x1 Dirac) : {enable_isolation}")
-    print(f"[*] Variance Regularization Topology   : {variance_type.upper()}")
-    print(f"[*] Masking Strategy                   : {mask_strategy.upper()}") # NEW
-    print("="*60 + "\n")
-
-    # --- Agnostic Configuration Routing ---
-    splits_root = os.path.join("data", "splits")
-    
-    dataset = JEPAPretrainDataset(
-        dataset_name=dataset_name, 
-        split="train",
-        splits_root=splits_root, 
-        image_size=img_size,
-        mask_strategy=mask_strategy # NEW: Pass strategy to loader
-    )
-    
     model = MultimodalJEPA(backbone_name=cfg['backbone'], isolated_stem=enable_isolation).to(DEVICE)
     
     optimizer = optim.AdamW(model.parameters(), lr=cfg['optimizer']['lr'], weight_decay=cfg['optimizer']['weight_decay'])
     
-    # UPDATED: Enforce strict isolated namespace for artifact generation
-    weight_dir = os.path.join("weights", dataset_name, trial_name)
+    # UPDATED: Enforce strict isolated namespace for artifact generation matching the results/ tree
+    weight_dir = os.path.join("weights", model_name, dataset_name, trial_name)
     os.makedirs(weight_dir, exist_ok=True)
     
     start_epoch = 0
@@ -115,10 +109,11 @@ def main():
             z_pred_norm = F.normalize(z_pred, dim=1)
             z_target_norm = F.normalize(z_target, dim=1)
             
+            # --- V2 OBJECTIVE UPDATE ---
+            # Context Consistency is explicitly removed from the objective summation.
             loss_target = F.mse_loss(z_pred_norm[mask_exp == 1], z_target_norm[mask_exp == 1])
-            loss_context = F.mse_loss(z_pred_norm[mask_exp == 0], z_target_norm[mask_exp == 0])
             
-            # --- 3. Ablated Variance Regularization ---
+            # --- Ablated Variance Regularization ---
             if variance_type == 'spatial':
                 target_flat = z_target_norm.transpose(0, 1).reshape(z_target_norm.shape[1], -1)
                 std_target = torch.sqrt(target_flat.var(dim=1) + 1e-04) 
@@ -129,7 +124,8 @@ def main():
             else:
                 loss_var = torch.tensor(0.0, device=DEVICE)
             
-            loss = loss_target + (0.1 * loss_context) + (0.1 * loss_var)
+            # Final V2 Objective (Loss Context pruned)
+            loss = loss_target + (0.1 * loss_var)
             
             loss.backward()
             optimizer.step()

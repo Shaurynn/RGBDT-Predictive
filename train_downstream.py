@@ -112,15 +112,10 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
         return focal_loss + (self.base_dice_weight * dice_loss)
 
 def feature_distillation_loss(student_features, teacher_features):
-    """
-    V2 KD: Aligns the intermediate representational manifolds of the student 
-    directly with the teacher, circumventing noisy logit predictions.
-    """
     loss = 0.0
     valid_stages = 0
     for s_feat, t_feat in zip(student_features, teacher_features):
         if s_feat.shape == t_feat.shape:
-            # L2 Normalization guarantees gradient magnitude stability regardless of stage depth
             s_norm = F.normalize(s_feat, dim=1)
             t_norm = F.normalize(t_feat, dim=1)
             loss += F.mse_loss(s_norm, t_norm)
@@ -189,10 +184,6 @@ def export_to_onnx(model, weights_path, run_dir, device):
 # ====================================================================================
 
 def build_llrd_optimizer(model, base_lr, weight_decay, decay_rate, phase):
-    """
-    Implements Layer-Wise Learning Rate Decay (LLRD).
-    Applies exponential decay down the backbone to prevent catastrophic forgetting.
-    """
     if phase != "microtune":
         trainable = [p for p in model.parameters() if p.requires_grad]
         return optim.AdamW(trainable, lr=base_lr, weight_decay=weight_decay)
@@ -202,21 +193,13 @@ def build_llrd_optimizer(model, base_lr, weight_decay, decay_rate, phase):
         if not param.requires_grad:
             continue
         
-        # Group by architectural depth
-        if 'decode_head' in name:
-            lr = base_lr
-        elif 'block4' in name or 'patch_embed4' in name:
-            lr = base_lr * (decay_rate ** 1)
-        elif 'block3' in name or 'patch_embed3' in name:
-            lr = base_lr * (decay_rate ** 2)
-        elif 'block2' in name or 'patch_embed2' in name:
-            lr = base_lr * (decay_rate ** 3)
-        elif 'block1' in name or 'patch_embed1' in name:
-            lr = base_lr * (decay_rate ** 4)
-        elif 'patch_embed1.proj' in name or 'dt_alignment' in name:
-            lr = base_lr * (decay_rate ** 5)
-        else:
-            lr = base_lr * (decay_rate ** 5)
+        if 'decode_head' in name: lr = base_lr
+        elif 'block4' in name or 'patch_embed4' in name: lr = base_lr * (decay_rate ** 1)
+        elif 'block3' in name or 'patch_embed3' in name: lr = base_lr * (decay_rate ** 2)
+        elif 'block2' in name or 'patch_embed2' in name: lr = base_lr * (decay_rate ** 3)
+        elif 'block1' in name or 'patch_embed1' in name: lr = base_lr * (decay_rate ** 4)
+        elif 'patch_embed1.proj' in name or 'dt_alignment' in name: lr = base_lr * (decay_rate ** 5)
+        else: lr = base_lr * (decay_rate ** 5)
             
         param_groups.append({'params': [param], 'lr': lr, 'weight_decay': weight_decay})
         
@@ -418,7 +401,7 @@ def main():
     if enable_kd and getattr(args, 'teacher_weights', None) and os.path.exists(args.teacher_weights):
         t_kwargs = model_kwargs.copy()
         t_kwargs['backbone_name'] = cfg['teacher_backbone']
-        t_kwargs['use_lora'] = False # Teachers deploy fully merged weights
+        t_kwargs['use_lora'] = False
         teacher_model = models.TMLPN_Downstream_v2(**t_kwargs).to(DEVICE)
         teacher_model.load_state_dict(torch.load(args.teacher_weights))
         teacher_model.eval()
@@ -431,7 +414,8 @@ def main():
     run_dir, phase = state["run_dir"], state["phase"]
 
     if phase == "baseline" and not state["is_resume"]:
-        pt_weights = os.path.join("weights", dataset_name, trial_name, f"jepa_context_encoder_{cfg['backbone']}.pt")
+        # UPDATED: Enforce exact weights/ namespace hierarchy using model class name
+        pt_weights = os.path.join("weights", model.__class__.__name__, dataset_name, trial_name, f"jepa_context_encoder_{cfg['backbone']}.pt")
         if os.path.exists(pt_weights):
             print(f"[*] Injecting Phase 1 MM-JEPA Foundation Weights: {pt_weights}")
             torch.nn.Module.load_state_dict(model.context_encoder, torch.load(pt_weights), strict=False)
@@ -462,11 +446,9 @@ def main():
             if phase == "microtune":
                 lr = cfg['learning_rates'].get('microtune', 1e-5)
                 
-        # --- NEW INJECTION: Load the inherited weights ---
         if os.path.exists(state["inherit_weights"]):
             print(f"\n[*] Inheriting converged weights from previous phase: {state['inherit_weights']}")
             model.load_state_dict(torch.load(state["inherit_weights"], map_location=DEVICE), strict=False)
-        # -------------------------------------------------
 
     if phase == "microtune":
         print("\n[*] Initializing Microtune Phase")

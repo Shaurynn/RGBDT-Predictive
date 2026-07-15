@@ -114,7 +114,9 @@ def run_pipeline(dataset_name, backbones):
             print("="*70)
             
             inject_configuration(config_path, backbone, control_optimal, trial_name="baseline", seed=42)
-            jepa_weights = os.path.join("weights", dataset_name, "baseline", f"jepa_checkpoint_{backbone}.pt")
+            
+            # UPDATED: Enforce exact weights/ namespace hierarchy
+            jepa_weights = os.path.join("weights", "TMLPN_Downstream_v2", dataset_name, "baseline", f"jepa_checkpoint_{backbone}.pt")
             
             if not os.path.exists(jepa_weights): 
                 execute_command(["uv", "run", "pretrain_jepa.py"], f"Phase 1: MM-JEPA ({backbone})")
@@ -141,7 +143,9 @@ def run_pipeline(dataset_name, backbones):
                 trial_name = f"{trial_base_name}_seed{seed}"
                 inject_configuration(config_path, ablation_target_backbone, ablation_state, trial_name=trial_name, seed=seed)
                 
-                jepa_weights = os.path.join("weights", dataset_name, trial_name, f"jepa_checkpoint_{ablation_target_backbone}.pt")
+                # UPDATED: Enforce exact weights/ namespace hierarchy
+                jepa_weights = os.path.join("weights", "TMLPN_Downstream_v2", dataset_name, trial_name, f"jepa_checkpoint_{ablation_target_backbone}.pt")
+                
                 if not os.path.exists(jepa_weights): 
                     execute_command(["uv", "run", "pretrain_jepa.py"], f"Ablation Phase 1: {trial_name}")
                 else: 
