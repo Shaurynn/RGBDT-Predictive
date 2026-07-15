@@ -289,7 +289,10 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
                         pred_seg = model(x_full)
                     val_iou.update(pred_seg, seg_mask)
             score = val_iou.get_miou()
-            if score > best_miou: best_miou = score
+            if score > best_miou: 
+                best_miou = score
+                # Explicitly save the absolute best weights found during the sweep
+                torch.save(model.state_dict(), os.path.join(run_dir, "best_model.pt"))
             trial.report(score, epoch)
             if trial.should_prune(): raise optuna.exceptions.TrialPruned()
         return best_miou
