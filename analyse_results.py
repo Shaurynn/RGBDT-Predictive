@@ -239,7 +239,7 @@ def main():
         for phase in ["baseline", "hero", "microtune"]:
             if phase in primary_baselines[bb]:
                 data = primary_baselines[bb][phase]
-                print(f"{bb:<15} | {phase.capitalize():<12} | {data['mIoU']:.4f}     | {f'{data.get("train_loss")}'[:8]:<12} | {f'{data.get("val_loss")}'[:8]:<12}")
+                print(f"{bb:<15} | {phase.capitalize():<12} | {data['mIoU']:.4f}     | {str(data.get('train_loss'))[:8]:<12} | {str(data.get('val_loss'))[:8]:<12}")
         print("-" * 70)
         
     print("\n[ ABLATION MATRIX STATISTICS (N={} Seeds) ]\n".format(len(control_scores)) + f"{'Ablation Variant':<30} | {'Mean ± Std':<15} | {'p-value':<12} | {'Sig (<0.05)'}\n" + "-" * 80)
