@@ -177,7 +177,7 @@ An updated ablation matrix was executed across 5 random seeds to empirically val
 
 Visualizing the latent embeddings confirms that the V2 supervised downstream decoder effectively organizes spatial data without destroying foundational priors. 
 
-> ![V2 mit_b2 Microtune Manifolds](assets/v2_mit_b2_Microtune.jpg)
+> ![V2 mit_b2 Microtune Manifolds](assets/v2_mit_b2_Microtune.png)
 >
 > **Figure 7: TMLPN_v2 `mit_b2` Microtune Manifold Projections.** The t-SNE and UMAP projections demonstrate dense semantic separation of classes (bottom row) while maintaining perfectly parallel Modality Isolation (top row) between the RGB and Depth+Thermal streams directly after the stem. 
 
@@ -189,7 +189,7 @@ The isolated, finetuned architecture is natively serialized to an ONNX artifact 
 
 To ensure explainability is preserved during deployment, Segmentation Grad-CAM heatmaps are extracted directly from the `decode_head.linear_pred` layer, dynamically verifying structural defect focus over artifact exploitation [23][cite: 15].
 
-> ![V2 GradCAM Explainability](assets/v2_Gradcam_mit_b2_b3.jpg)
+> ![V2 GradCAM Explainability](assets/v2_Gradcam_mit_b2_b3.png)
 >
 > **Figure 8: Segmentation Grad-CAM Defect Focus.** Explanability heatmaps for `mit_b2` (top) and `mit_b3` (bottom) backbones tracking visual attention across the Baseline, Hero, and Microtune phases. The spatial attention confirms the network successfully localizes on physical anomalies rather than overfitting to background noise or uniform artifacting. 
 
