@@ -41,7 +41,11 @@ def adapt_canonical_splits(data_root, dataset_name, seed=42):
         records = []
         for _, row in df.iterrows():
             # EXPLICIT FIX: Force string casting to override Pandas numeric inference
-            filename = str(row.get('filename', row.iloc[0]))
+            filename = str(row.get('filename', row.iloc[0])).strip()
+            
+            # ENTERPRISE GUARD: Ensure filename contains a valid extension, appending .png if omitted
+            if not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff')):
+                filename = f"{filename}.png"
             
             # Safely extract class label (fallback to second column if 'class_label' header is missing)
             if 'class_label' in row:

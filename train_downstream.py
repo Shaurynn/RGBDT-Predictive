@@ -116,8 +116,9 @@ def feature_distillation_loss(student_features, teacher_features):
     valid_stages = 0
     for s_feat, t_feat in zip(student_features, teacher_features):
         if s_feat.shape == t_feat.shape:
-            s_norm = F.normalize(s_feat, dim=1)
-            t_norm = F.normalize(t_feat, dim=1)
+            # INJECTED EPSILON to prevent division by zero in F.normalize under bfloat16 mixed precision
+            s_norm = F.normalize(s_feat, dim=1, eps=1e-8)
+            t_norm = F.normalize(t_feat, dim=1, eps=1e-8)
             loss += F.mse_loss(s_norm, t_norm)
             valid_stages += 1
     return loss / max(1, valid_stages)
@@ -243,9 +244,17 @@ class ExperimentManager:
 def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_loader, val_loader, num_classes, empirical_alpha, global_gdl, device, cfg_hpo):
     db_path = os.path.join(run_dir, "hpo_sweep.db")
     
+    # Extract statistics to safely un-normalize physical priors inside HPO scope
+    d_mean, d_std = train_loader.dataset.mean[3], train_loader.dataset.std[3]
+    t_mean, t_std = train_loader.dataset.mean[4], train_loader.dataset.std[4]
+    
     def objective(trial):
         model = ModelClass(**model_kwargs).to(device)
         if inherit_weights and os.path.exists(inherit_weights): model.load_state_dict(torch.load(inherit_weights))
+        
+        # PATCH 3: Enforce frozen foundation during HPO sweep to prevent erroneous hyperparameter logic
+        for param in model.context_encoder.parameters():
+            param.requires_grad = False
         
         lr = trial.suggest_float("lr", cfg_hpo['lr_min'], cfg_hpo['lr_max'], log=True)
         wd = trial.suggest_float("weight_decay", cfg_hpo['wd_min'], cfg_hpo['wd_max'], log=True)
@@ -262,6 +271,11 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
             model.train()
             for batch in train_loader:
                 x_full, seg_mask = batch['x_full'].to(device), batch['seg_mask'].to(device)
+                
+                # PATCH 1: Z-Score Reversal (Physical Domain Recovery)
+                x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
+                x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
+                
                 optimizer.zero_grad(set_to_none=True)
                 with autocast('cuda', dtype=torch.bfloat16):
                     pred_seg = model(x_full)
@@ -285,6 +299,11 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
             with torch.no_grad():
                 for batch in val_loader:
                     x_full, seg_mask = batch['x_full'].to(device), batch['seg_mask'].to(device)
+                    
+                    # PATCH 1: Z-Score Reversal (Physical Domain Recovery)
+                    x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
+                    x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
+                    
                     with autocast('cuda', dtype=torch.bfloat16):
                         pred_seg = model(x_full)
                     val_iou.update(pred_seg, seg_mask)
@@ -406,6 +425,7 @@ def main():
         "num_classes": NUM_CLASSES,
         "backbone_name": cfg['backbone'],
         "isolated_stem": ablation_cfg.get('enable_modality_isolation', True),
+        "enable_dirac": ablation_cfg.get('enable_dirac', True), # PATCH: Extract and route flag
         "use_lora": use_lora,
         "lora_r": cfg.get('lora', {}).get('r', 8),
         "lora_alpha": cfg.get('lora', {}).get('alpha', 16)
@@ -437,7 +457,13 @@ def main():
         if os.path.exists(pt_weights):
             print(f"[*] Injecting Phase 1 MM-JEPA Foundation Weights: {pt_weights}")
             torch.nn.Module.load_state_dict(model.context_encoder, torch.load(pt_weights), strict=False)
-            for param in model.context_encoder.parameters(): param.requires_grad = False
+
+    # PATCH 2: Hero Phase Catastrophic Shattering Fix
+    # Enforce strict freezing for all foundational phases prior to microtune
+    if phase in ["baseline", "hpo", "hero"]:
+        print(f"[*] Enforcing frozen foundation for phase: {phase}")
+        for param in model.context_encoder.parameters():
+            param.requires_grad = False
 
     if phase == "hpo":
         # Pass the dynamic ModelClass to the Optuna search
@@ -506,6 +532,10 @@ def main():
     
     cam_extractor = SegmentationGradCAM(model, model.decode_head.linear_pred)
 
+    # Extract statistical cache parameters to safely un-normalize physical priors
+    d_mean, d_std = train_dataset.mean[3], train_dataset.std[3]
+    t_mean, t_std = train_dataset.mean[4], train_dataset.std[4]
+
     start_epoch = 0
     if state["is_resume"]:
         checkpoint_path = os.path.join(run_dir, "checkpoint.pt")
@@ -526,6 +556,11 @@ def main():
         
         for batch in loop:
             x_full, seg_mask = batch['x_full'].to(DEVICE), batch['seg_mask'].to(DEVICE)
+            
+            # PATCH 1: Z-Score Reversal (Physical Domain Recovery)
+            x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
+            x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
+            
             optimizer.zero_grad(set_to_none=True)
             
             with autocast('cuda', dtype=torch.bfloat16):
@@ -564,6 +599,11 @@ def main():
         with torch.no_grad(): 
             for batch in val_loader:
                 x_full, seg_mask = batch['x_full'].to(DEVICE), batch['seg_mask'].to(DEVICE)
+                
+                # PATCH 1: Z-Score Reversal (Physical Domain Recovery)
+                x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
+                x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
+                
                 with autocast('cuda', dtype=torch.bfloat16):
                     pred_seg = model(x_full)
                     loss = criterion(pred_seg, seg_mask)
@@ -576,6 +616,11 @@ def main():
                     rgb_vis = x_full[0, :3].cpu().numpy().transpose(1, 2, 0)
                     rgb_vis = (rgb_vis - rgb_vis.min()) / (rgb_vis.max() - rgb_vis.min() + 1e-8)
                     heatmap_resized = cv2.resize(heatmap, (rgb_vis.shape[1], rgb_vis.shape[0]))
+                    
+                    # --- NaN GUARD INJECTION ---
+                    # Sanitizes the extracted heatmap to prevent numpy cv2.applyColorMap casting exceptions
+                    heatmap_resized = np.nan_to_num(heatmap_resized, nan=0.0)
+                    
                     heatmap_color = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
                     heatmap_color = (np.float32(heatmap_color) / 255.0)[:, :, ::-1]
                     overlay = 0.5 * rgb_vis + 0.5 * heatmap_color
@@ -610,6 +655,11 @@ def main():
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Testing"):
             x_full, seg_mask = batch['x_full'].to(DEVICE), batch['seg_mask'].to(DEVICE)
+            
+            # PATCH 1: Z-Score Reversal (Physical Domain Recovery)
+            x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
+            x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
+            
             with autocast('cuda', dtype=torch.bfloat16):
                 pred_seg = model(x_full)
                 loss = criterion(pred_seg, seg_mask)

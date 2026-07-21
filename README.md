@@ -174,8 +174,11 @@ The TMLPN_v3 pipeline represents a comprehensive overhaul of the data ingestion 
 ### 7.1 Modality-Decoupled Physical Calibration
 
 In prior iterations, geometric depth and thermal intensities shared bundled affine scaling parameters. This design was physically contradictory. Depth values represent scale-invariant distance measurements, whereas thermal tensors represent temperature-dependent radiometric variances [20]. TMLPN_v3 physically isolates these priors at the tensor level (`depth_scale` and `therm_scale`), allowing the network to empirically learn independent calibration mappings:
-* **Scale-Invariant Depth:** Depth matrices are normalized by their spatial mean prior to calibration, ensuring the network penalizes geometric structural differences rather than absolute global distances.
-* **Radiometrically Bounded Thermal:** The thermal scaling factor is heavily bounded to prevent the network from incorrectly memorizing ambient factory temperature drift instead of physical anomalies.
+* **Scale-Invariant Depth:** Depth matrices are normalized by their spatial mean prior to calibration, ensuring the network penalizes geometric structural differences rather than absolute global distances [20].
+* **Radiometrically Bounded Thermal:** The thermal scaling factor is heavily bounded to prevent the network from incorrectly memorizing ambient factory temperature drift instead of physical anomalies [20].
+
+### 7.1.1 Dirac Initialization Isolation (`enable_dirac`)
+To rigorously distinguish whether performance gains stem from modality isolation per se or the specific Dirac delta initialization of the $1 \times 1$ alignment projection, the `ModalityIsolatedPatchEmbed` module incorporates an explicit `enable_dirac` boolean flag. Disabling this flag via configuration overrides replaces the Dirac identity initialization with standard Kaiming initialization while retaining the dual-stem modality separation, enabling precise isolation of initialization effects.
 
 ### 7.2 Fortified Pre-Training Objective
 
@@ -187,7 +190,7 @@ Relying exclusively on an Exponential Moving Average (EMA) teacher network [11] 
 
 The `JEPAPretrainDataset` engine was structurally rewritten to prevent PyTorch/OpenCV garbage collection memory spikes, ensuring scalable execution on datasets exceeding 10,000 samples. Furthermore, statistical caches were transitioned to IEEE 64-bit float PyTorch binaries (`.pt`), eliminating the numerical precision loss previously caused by standard JSON serialization.
 
-Crucially, TMLPN_v3 introduces physically-aware Multimodal Data Augmentation. To preserve alignment integrity, radiometric augmentations (brightness, contrast, hue, and saturation jitter) are strictly isolated to the RGB manifold. This simulates factory ambient lighting variance while permanently protecting the absolute physical measurement metrics inherent to the Depth and Thermal modalities. Furthermore, spatial geometry augmentations (horizontal/vertical flips) are strictly applied to individual camera strips during the initial ingestion phase to accurately simulate physical post-installation lane adjustments. Global spatial flips are explicitly omitted from the dataloader to prevent the generation of physically impossible structural layouts on the final composite manifold.
+Crucially, TMLPN_v3 introduces physically-aware Multimodal Data Augmentation. To preserve alignment integrity, radiometric augmentations (brightness, contrast, hue, and saturation jitter) are strictly isolated to the RGB manifold. This simulates factory ambient lighting variance while permanently protecting the absolute physical measurement metrics inherent to the Depth and Thermal modalities. Furthermore, spatial geometry augmentations (horizontal/vertical individual strip flips) are strictly applied to individual camera strips during the initial ingestion phase to accurately simulate physical post-installation lane adjustments. Global spatial tensor flips are explicitly omitted from the dataloader to prevent the generation of physically impossible structural layouts on the final composite manifold.
 
 ---
 
@@ -214,9 +217,12 @@ The Benjamini-Hochberg FDR was explicitly chosen over the standard Bonferroni co
 
 To rigorously attribute exactly which architectural upgrades definitively prevented catastrophic gradient shattering, the automated pipeline extracts the overall optimal performing backbone and executes a targeted Component Isolation matrix (N=5 seeds per variant). This ensures empirical validation on whether these strategies are individually necessary or if they rely on synergistic interactions to prevent collapse:
 
-* **Without LoRA (`Ablation_NoLoRA`):** Fully unfreezes the $N \times N$ network weights to prove whether allowing unbounded gradient flows natively overwrites the generalized multimodal representations.
-* **Without LLRD (`Ablation_NoLLRD`):** Overrides the hierarchical optimization by applying a flat learning rate multiplier of 1.0 across all layers to measure the impact of uniform tuning.
-* **Without Feature-Level KD (`Ablation_NoFeatureKD`):** Severs the student-teacher MSE spatial alignment constraint, forcing the isolated student backbone to train strictly on the supervised downstream semantic segmentation labels.
+* **Without LoRA (`Ablation_NoLoRA`):** Fully unfreezes the $N \times N$ network weights to prove whether allowing unbounded gradient flows natively overwrites the generalized multimodal representations [25].
+* **Without LLRD (`Ablation_NoLLRD`):** Overrides the hierarchical optimization by applying a flat learning rate multiplier of 1.0 across all layers to measure the impact of uniform tuning [27].
+* **Without Feature-Level KD (`Ablation_NoFeatureKD`):** Severs the student-teacher MSE spatial alignment constraint, forcing the isolated student backbone to train strictly on the supervised downstream semantic segmentation labels [26].
+* **Without Dirac Initialization (`Ablation_NoDirac`):** Evaluates performance when modality isolation is active but the Dirac projection initialization is replaced by standard Kaiming initialization.
+* **Combinatorial Synergy Trials (`Ablation_NoLoRA_NoLLRD`, `Ablation_Vanilla_V1`):** Multi-component combination tests that evaluate whether anti-collapse mechanisms act synergistically to completely eliminate catastrophic gradient shattering during downstream unfreezing.
+* **LoRA Rank Sensitivity Analysis (`LoRA_Rank_4`, `LoRA_Rank_16`, `LoRA_Rank_32`):** Sweeps adapter capacity across the frozen MiT backbone to determine the optimal trade-off between task-bending flexibility and parameter overhead [25].
 * **Without Context / Covariance:** Validates the efficacy of the newly fortified Phase 1 objective by selectively disabling the unmasked MSE [2] and VICReg mathematical penalties [12].
 
 ---
@@ -229,7 +235,7 @@ To ensure explainability is preserved during deployment, Segmentation Grad-CAM h
 
 > ![V2 GradCAM Explainability](assets/v2_Gradcam_mit_b2_b3.png)
 >
-> **Figure 8: Segmentation Grad-CAM Defect Focus.** Explanability heatmaps tracking visual attention across the Baseline, Hero, and Microtune phases. The spatial attention confirms the network successfully localizes on physical anomalies rather than overfitting to background noise or uniform artifacting.
+> **Figure 8: Segmentation Grad-CAM Defect Focus.** Explanability heatmaps tracking visual attention across the Baseline, Hero, and Microtune phases [23]. The spatial attention confirms the network successfully localizes on physical anomalies rather than overfitting to background noise or uniform artifacting [23].
 
 ---
 
@@ -237,8 +243,8 @@ To ensure explainability is preserved during deployment, Segmentation Grad-CAM h
 
 To fully complete our evaluation suite and validate its utility in physical infrastructure settings, our future work is explicitly outlined below:
 
-1. **SOTA Empirical Benchmarking:** Execute direct, head-to-head architectural comparisons against SFDFNet and leading RGB-D-T semantic segmentation baselines. This future evaluation will strictly utilize the locked dataset splits and identical Benjamini-Hochberg multi-seed correction framework to secure fair statistical validity.
-2. **Edge Deployment Validation (FPS):** While cross-platform compilation logic is confirmed, completing formal edge deployment validation remains outstanding. Physical benchmarking will evaluate execution latency, specifically reporting the absolute Frames Per Second (FPS) achievable via our generated TensorRT engine directly on Jetson Orin Nano and Orange Pi 5 edge endpoints.
+1. **SOTA Empirical Benchmarking:** Execute direct, head-to-head architectural comparisons against SFDFNet [18] and leading RGB-D-T semantic segmentation baselines. This future evaluation will strictly utilize the locked dataset splits and identical Benjamini-Hochberg multi-seed correction framework to secure fair statistical validity [24].
+2. **Edge Deployment Validation (FPS):** While cross-platform compilation logic is confirmed, completing formal edge deployment validation remains outstanding. Physical benchmarking will evaluate execution latency, specifically reporting the absolute Frames Per Second (FPS) achievable via our generated TensorRT engine directly on Jetson Orin Nano and Orange Pi 5 edge endpoints [20].
 
 ---
 
@@ -302,16 +308,16 @@ To fully complete our evaluation suite and validate its utility in physical infr
 
 ## 🙏 Acknowledgments & Citations
 
-This project would not be possible without the MM5 Dataset. We sincerely thank the original creators and authors for their foundational work in multi-modal data collection, hardware synchronization, and curation, which enabled the training and evaluation of this architecture.
+This project would not be possible without the MM5 Dataset [20, 21]. We sincerely thank the original creators and authors for their foundational work in multi-modal data collection, hardware synchronization, and curation, which enabled the training and evaluation of this architecture [20, 21].
 
 If you utilize this pipeline, the underlying architecture, or the data, please cite the primary publication alongside the dataset repository:
 
 **Primary Publication:**
 
-> Brenner, M., Reyes, N. H., Susnjak, T., & Barczak, A. L. C. (2026). MM5: Multimodal image capture and dataset generation for RGB, depth, thermal, UV, and NIR. Information Fusion, 126, 103516.
-> DOI: [https://doi.org/10.1016/j.inffus.2025.103516](https://doi.org/10.1016/j.inffus.2025.103516)
+> Brenner, M., Reyes, N. H., Susnjak, T., & Barczak, A. L. C. (2026). MM5: Multimodal image capture and dataset generation for RGB, depth, thermal, UV, and NIR. Information Fusion, 126, 103516. [20]
+> DOI: [https://doi.org/10.1016/j.inffus.2025.103516](https://doi.org/10.1016/j.inffus.2025.103516) [20]
 
 **Dataset:**
 
-> Brenner, M., Reyes, N., Susnjak, T., & Barczak, A. (2025). MM5: Multimodal Image Dataset. figshare. Dataset.
-> DOI: [https://doi.org/10.6084/m9.figshare.28722164](https://www.google.com/search?q=https://doi.org/10.6084/m9.figshare.28722164)
+> Brenner, M., Reyes, N., Susnjak, T., & Barczak, A. (2025). MM5: Multimodal Image Dataset. figshare. Dataset. [21]
+> DOI: [https://doi.org/10.6084/m9.figshare.28722164](https://www.google.com/search?q=https://doi.org/10.6084/m9.figshare.28722164) [21]

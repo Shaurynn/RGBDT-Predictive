@@ -95,17 +95,37 @@ def generate_metric_visualizations(primary_baselines, ablation_stats, output_dir
 # --- PART 2: LATENT SPACE EXTRACTION & PROJECTION ---
 # ====================================================================================
 
-def extract_modality_embeddings(model, dataloader, device, max_samples):
+# PATCH: Parameter signatures updated to receive dataset statistics for un-normalization
+def extract_modality_embeddings(model, dataloader, device, max_samples, d_mean, d_std, t_mean, t_std):
     model.eval()
     rgb_features_list, dt_features_list = [], []
     with torch.no_grad():
         for batch in dataloader:
             x_full = batch['x_full'].to(device)
-            stem = model.context_encoder.patch_embed1.proj
             
+            # PATCH: Z-Score Reversal prior to stem evaluation to prevent NaN cascades
+            x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
+            x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
+            
+            stem = model.context_encoder.patch_embed1.proj
             rgb_aligned = stem.rgb_proj(x_full[:, :3, :, :])
-            dt_raw = stem.depth_therm_proj((x_full[:, 3:, :, :] * stem.dt_scale) + stem.dt_bias)
-            dt_aligned = stem.dt_alignment(dt_raw)
+            
+            x_depth = x_full[:, 3:4, :, :]
+            x_therm = x_full[:, 4:5, :, :]
+            
+            # PATCH: Apply exact V3 physical stem logic instead of legacy attributes
+            if hasattr(stem, 'depth_scale'):
+                depth_mean_val = x_depth.mean(dim=(2, 3), keepdim=True) + 1e-8
+                x_depth_calibrated = ((x_depth / depth_mean_val) * stem.depth_scale) + stem.depth_bias
+                x_therm_calibrated = (x_therm * torch.sigmoid(stem.therm_scale)) + stem.therm_bias
+                x_dt_calibrated = torch.cat([x_depth_calibrated, x_therm_calibrated], dim=1)
+                
+                dt_raw = stem.depth_therm_proj(x_dt_calibrated)
+                dt_aligned = stem.dt_alignment(dt_raw)
+            else:
+                # Fallback for Legacy variants (if evaluated)
+                dt_raw = stem.depth_therm_proj((x_full[:, 3:, :, :] * getattr(stem, 'dt_scale', 1.0)) + getattr(stem, 'dt_bias', 0.0))
+                dt_aligned = stem.dt_alignment(dt_raw)
             
             rgb_features_list.append(rgb_aligned.permute(0, 2, 3, 1).reshape(-1, rgb_aligned.shape[1]).cpu().numpy())
             dt_features_list.append(dt_aligned.permute(0, 2, 3, 1).reshape(-1, dt_aligned.shape[1]).cpu().numpy())
@@ -119,12 +139,18 @@ def extract_modality_embeddings(model, dataloader, device, max_samples):
     
     return np.vstack((rgb_np[rgb_idx], dt_np[dt_idx])), np.array(['RGB Manifold'] * sample_size + ['Depth+Thermal Manifold'] * sample_size)
 
-def extract_semantic_embeddings(model, dataloader, device, max_samples):
+# PATCH: Parameter signatures updated to receive dataset statistics for un-normalization
+def extract_semantic_embeddings(model, dataloader, device, max_samples, d_mean, d_std, t_mean, t_std):
     model.eval()
     semantic_features, semantic_labels = [], []
     with torch.no_grad():
         for batch in dataloader:
             x_full, seg_mask = batch['x_full'].to(device), batch['seg_mask'].to(device)
+            
+            # PATCH: Z-Score Reversal prior to model evaluation to prevent NaN cascades
+            x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
+            x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
+            
             _, features = model(x_full, return_features=True)
             c4_latent = features[-1] 
             
@@ -320,8 +346,13 @@ def main():
         print(f"[-] WARNING: classes.txt not found. Cannot perform latent rendering for {args.dataset}")
         return
 
-    eval_dataset = DownstreamSegmentationDataset(dataset_name=args.dataset, split="eval", splits_root=splits_root, image_size=(480, 640))
+    # PATCH: Hardcoded split changed from "eval" to "test" to align with freeze_splits.py framework
+    eval_dataset = DownstreamSegmentationDataset(dataset_name=args.dataset, split="test", splits_root=splits_root, image_size=(480, 640))
     eval_loader = DataLoader(eval_dataset, batch_size=4, shuffle=True, num_workers=4)
+
+    # Extract statistical cache parameters to pass down for manifold un-normalization
+    d_mean, d_std = eval_dataset.mean[3], eval_dataset.std[3]
+    t_mean, t_std = eval_dataset.mean[4], eval_dataset.std[4]
 
     ModelClass = getattr(models, args.model, None)
     if ModelClass is None:
@@ -368,8 +399,9 @@ def main():
                 ce_weights = raw_checkpoint.get('context_encoder_state_dict', raw_checkpoint)
                 model_p1.load_state_dict({f"context_encoder.{k}": v for k, v in ce_weights.items()}, strict=False)
                 
-                m_f1, m_l1 = extract_modality_embeddings(model_p1, eval_loader, DEVICE, args.samples)
-                s_f1, s_l1 = extract_semantic_embeddings(model_p1, eval_loader, DEVICE, args.samples)
+                # PATCH: Pass statistics down for correct manifold projection
+                m_f1, m_l1 = extract_modality_embeddings(model_p1, eval_loader, DEVICE, args.samples, d_mean, d_std, t_mean, t_std)
+                s_f1, s_l1 = extract_semantic_embeddings(model_p1, eval_loader, DEVICE, args.samples, d_mean, d_std, t_mean, t_std)
                 
                 col_offset = 0
                 compute_and_plot_latents(m_f1, m_l1, "Phase 1: Modality Alignment", axes[0, col_offset], axes[0, col_offset+1], "modality", class_names)
@@ -380,8 +412,9 @@ def main():
                 model_p2 = ModelClass(num_classes=NUM_CLASSES, backbone_name=backbone, use_lora=False).to(DEVICE)
                 model_p2.load_state_dict(torch.load(p2_weights, map_location=DEVICE), strict=False)
                 
-                m_f2, m_l2 = extract_modality_embeddings(model_p2, eval_loader, DEVICE, args.samples)
-                s_f2, s_l2 = extract_semantic_embeddings(model_p2, eval_loader, DEVICE, args.samples)
+                # PATCH: Pass statistics down for correct manifold projection
+                m_f2, m_l2 = extract_modality_embeddings(model_p2, eval_loader, DEVICE, args.samples, d_mean, d_std, t_mean, t_std)
+                s_f2, s_l2 = extract_semantic_embeddings(model_p2, eval_loader, DEVICE, args.samples, d_mean, d_std, t_mean, t_std)
                 
                 col_offset = 2 if (has_p1 and has_p2) else 0
                 compute_and_plot_latents(m_f2, m_l2, "Phase 2: Modality Alignment", axes[0, col_offset], axes[0, col_offset+1], "modality", class_names)

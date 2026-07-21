@@ -29,7 +29,8 @@ def scale_invariant_depth_loss(pred_depth, target_depth, eps=1e-6):
     Computes a scale-invariant error for depth tensors, enforcing geometric 
     structure consistency invariant to absolute distance scale changes.
     """
-    log_diff = torch.log(pred_depth + eps) - torch.log(target_depth + eps)
+    # Double ReLU clamp to guarantee strict positivity before logarithmic evaluation
+    log_diff = torch.log(F.relu(pred_depth) + eps) - torch.log(F.relu(target_depth) + eps)
     n = log_diff.numel()
     return torch.mean(log_diff ** 2) - (torch.sum(log_diff) ** 2) / (n ** 2)
 
@@ -60,6 +61,7 @@ def main():
     # Extract V3 Fortification Flags
     enable_context = ablation_cfg.get('enable_context_consistency', True)
     enable_covariance = ablation_cfg.get('enable_covariance_penalty', True)
+    enable_dirac = ablation_cfg.get('enable_dirac', True)
 
     print("\n" + "="*60)
     print("🔬 ABLATION STATE [PHASE 1: PRE-TRAINING (V3 PHYSICAL PRIORS)]")
@@ -92,7 +94,7 @@ def main():
         drop_last=True
     )
     
-    model = MultimodalJEPA(backbone_name=cfg['backbone'], isolated_stem=enable_isolation).to(DEVICE)
+    model = MultimodalJEPA(backbone_name=cfg['backbone'], isolated_stem=enable_isolation, enable_dirac=enable_dirac).to(DEVICE)
     
     optimizer = optim.AdamW(model.parameters(), lr=cfg['optimizer']['lr'], weight_decay=cfg['optimizer']['weight_decay'])
     
@@ -107,6 +109,10 @@ def main():
     total_steps = len(dataloader) * cfg['epochs']
     global_step = start_epoch * len(dataloader)
     
+    # Extract statistical cache parameters to safely un-normalize physical priors
+    d_mean, d_std = dataset.mean[3], dataset.std[3]
+    t_mean, t_std = dataset.mean[4], dataset.std[4]
+    
     for epoch in range(start_epoch, cfg['epochs']):
         model.train()
         epoch_loss = 0.0
@@ -117,13 +123,22 @@ def main():
             x_visible = batch['x_visible'].to(DEVICE)
             high_res_mask = batch['mask'].to(DEVICE)
             
+            # --- Z-SCORE REVERSAL (PHYSICAL DOMAIN RECOVERY) ---
+            # Un-normalize Depth and Thermal manifolds to prevent zero-division explosions 
+            # within the V3 ModalityIsolatedPatchEmbed spatial mean operation.
+            x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
+            x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
+            
+            x_visible[:, 3, :, :] = (x_visible[:, 3, :, :] * d_std) + d_mean
+            x_visible[:, 4, :, :] = (x_visible[:, 4, :, :] * t_std) + t_mean
+            
             optimizer.zero_grad(set_to_none=True)
             
             z_pred, z_target, latent_mask = model(x_visible, x_full, high_res_mask)
             mask_exp = latent_mask.expand(-1, z_pred.shape[1], -1, -1)
             
-            z_pred_norm = F.normalize(z_pred, dim=1)
-            z_target_norm = F.normalize(z_target, dim=1)
+            z_pred_norm = F.normalize(z_pred, dim=1, eps=1e-8)
+            z_target_norm = F.normalize(z_target, dim=1, eps=1e-8)
             
             # =================================================================================
             # --- V3 OBJECTIVE UPDATE: CONDITIONAL ALIGNMENT, DECORRELATION & PHYSICS ---
@@ -144,8 +159,8 @@ def main():
             
             stem = model.context_encoder.patch_embed1.proj
             if hasattr(stem, 'depth_scale'):
-                d_mean = raw_depth.mean(dim=(2, 3), keepdim=True).clamp(min=1e-5)
-                calibrated_depth = ((raw_depth / d_mean) * stem.depth_scale) + stem.depth_bias
+                d_mean_tensor = raw_depth.mean(dim=(2, 3), keepdim=True).clamp(min=1e-5)
+                calibrated_depth = ((raw_depth / d_mean_tensor) * stem.depth_scale) + stem.depth_bias
                 calibrated_therm = (raw_therm * torch.sigmoid(stem.therm_scale)) + stem.therm_bias
                 
                 # Scale-Invariant Depth Consistency Penalty

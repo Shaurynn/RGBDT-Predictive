@@ -10,7 +10,8 @@ import copy
 # ====================================================================================
 
 class ModalityIsolatedPatchEmbed(nn.Module):
-    def __init__(self, original_proj):
+    # PATCH: Added enable_dirac flag to isolate initialization effects from dual-stem topology
+    def __init__(self, original_proj, enable_dirac=True):
         super().__init__()
         self.rgb_proj = original_proj
         
@@ -40,7 +41,12 @@ class ModalityIsolatedPatchEmbed(nn.Module):
             kernel_size=1,
             bias=False
         )
-        nn.init.dirac_(self.dt_alignment.weight)
+        
+        # PATCH: Conditional Dirac Isolation
+        if enable_dirac:
+            nn.init.dirac_(self.dt_alignment.weight)
+        else:
+            nn.init.kaiming_normal_(self.dt_alignment.weight, mode='fan_out', nonlinearity='relu')
 
     def forward(self, x):
         x_rgb = x[:, :3, :, :]
@@ -48,7 +54,8 @@ class ModalityIsolatedPatchEmbed(nn.Module):
         x_therm = x[:, 4:5, :, :]
         
         # 1. Encode Depth Scale-Invariance: Normalize by spatial mean to ensure geometric scale invariance
-        depth_mean = x_depth.mean(dim=(2, 3), keepdim=True).clamp(min=1e-5)
+        # INJECTED EPSILON (+ 1e-8) to prevent zero-division NaN generation during perfectly uniform edge regions
+        depth_mean = x_depth.mean(dim=(2, 3), keepdim=True) + 1e-8
         x_depth_normalized = x_depth / depth_mean
         x_depth_calibrated = (x_depth_normalized * self.depth_scale) + self.depth_bias
         
@@ -180,14 +187,14 @@ def apply_lora_to_mit(model, r=8, alpha=16):
 # ====================================================================================
     
 class MultimodalJEPA(nn.Module):
-    def __init__(self, backbone_name='mit_b1', isolated_stem=True):
+    def __init__(self, backbone_name='mit_b1', isolated_stem=True, enable_dirac=True):
         super().__init__()
         self.isolated_stem = isolated_stem
         self.context_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, weights='imagenet')
         original_proj = self.context_encoder.patch_embed1.proj
         
         if self.isolated_stem:
-            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj)
+            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj, enable_dirac=enable_dirac)
         else:
             self.context_encoder.patch_embed1.proj = NaiveEarlyFusionPatchEmbed(original_proj)
         
@@ -308,7 +315,7 @@ class TMLPN_Downstream_v3(nn.Module):
     PHASE 2: V3 Supervised Semantic Segmentation Architecture.
     Integrates Modality-Decoupled Physical Priors, LoRA, and Feature-Level KD.
     """
-    def __init__(self, num_classes=10, backbone_name='mit_b1', isolated_stem=True, use_lora=False, lora_r=8, lora_alpha=16):
+    def __init__(self, num_classes=10, backbone_name='mit_b1', isolated_stem=True, enable_dirac=True, use_lora=False, lora_r=8, lora_alpha=16):
         super().__init__()
         self.isolated_stem = isolated_stem
         self.context_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, weights=None)
@@ -316,7 +323,7 @@ class TMLPN_Downstream_v3(nn.Module):
         # Stem Extraction with explicit V3 Physical Priors
         original_proj = self.context_encoder.patch_embed1.proj
         if self.isolated_stem:
-            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj)
+            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj, enable_dirac=enable_dirac)
         else:
             self.context_encoder.patch_embed1.proj = NaiveEarlyFusionPatchEmbed(original_proj)
             

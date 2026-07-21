@@ -44,6 +44,7 @@ def send_alert_email(subject, error_message):
 # ====================================================================================
 # --- CONFIGURATION MANAGER ---
 # ====================================================================================
+# PATCH A: Dynamic LoRA Rank Routing to Downstream Configurations
 def inject_configuration(yaml_path, backbone_name, ablation_state, trial_name="baseline", seed=42, model_name="TMLPN_Downstream_v3"):
     with open(yaml_path, 'r') as f: config = yaml.safe_load(f)
 
@@ -53,8 +54,17 @@ def inject_configuration(yaml_path, backbone_name, ablation_state, trial_name="b
 
     config['phase1_pretraining']['backbone'] = backbone_name
     config['phase2_downstream']['backbone'] = backbone_name
+    
+    # Extract structural flags
     config['phase1_pretraining']['ablations'] = ablation_state
     config['phase2_downstream']['ablations'] = ablation_state
+    
+    # Dynamic LoRA Rank Routing
+    if "lora_r" in ablation_state:
+        config['phase2_downstream']['lora']['r'] = ablation_state["lora_r"]
+    else:
+        config['phase2_downstream']['lora']['r'] = 8 # Default fallback
+
     config['phase1_pretraining']['trial_name'] = trial_name
     config['phase2_downstream']['trial_name'] = trial_name
     config['phase1_pretraining']['seed'] = seed
@@ -84,7 +94,7 @@ def identify_optimal_backbone(dataset_name, backbones, seeds, model_name="TMLPN_
     best performing architecture based on mean mIoU, dynamically routing the pipeline.
     """
     print("\n" + "="*70)
-    print(f"📊 AUTO-EVALUATING BASELINES FOR OPTIMAL BACKBONE SELECTION ({model_name})")
+    print(f"投 AUTO-EVALUATING BASELINES FOR OPTIMAL BACKBONE SELECTION ({model_name})")
     print("="*70)
     
     best_backbone = backbones[0]
@@ -147,12 +157,16 @@ def run_pipeline(dataset_name, backbones, model_name="TMLPN_Downstream_v3"):
         "enable_kd": True,
         "mask_strategy": "multi_block",
         "enable_covariance_penalty": True,
-        "enable_context_consistency": True
+        "enable_context_consistency": True,
+        "use_lora": True,               
+        "llrd_decay": 0.85,
+        "enable_dirac": True
     }
 
     ablation_matrix = {
         "Control_Optimal": control_optimal,
         "Ablation_NaiveFusion": {**control_optimal, "enable_modality_isolation": False},
+        "Ablation_NoDirac": {**control_optimal, "enable_dirac": False}, # Added Dirac Isolation Evaluation
         "Ablation_BatchVariance": {**control_optimal, "variance_type": "batch"},
         "Ablation_NoVariance": {**control_optimal, "variance_type": "none"}, 
         "Ablation_NoKD": {**control_optimal, "enable_kd": False},            
@@ -171,7 +185,7 @@ def run_pipeline(dataset_name, backbones, model_name="TMLPN_Downstream_v3"):
                 trial_name = f"baseline_seed{seed}"
                 
                 print("\n" + "="*70)
-                print(f"🚀 INITIATING CYCLE: Backbone [{backbone}] | Seed: {seed}")
+                print(f"噫 INITIATING CYCLE: Backbone [{backbone}] | Seed: {seed}")
                 print("="*70)
                 
                 inject_configuration(config_path, backbone, control_optimal, trial_name=trial_name, seed=seed, model_name=model_name)
@@ -197,7 +211,7 @@ def run_pipeline(dataset_name, backbones, model_name="TMLPN_Downstream_v3"):
 
         # --- PART 2: ABLATION STUDIES ---
         print("\n" + "="*70)
-        print(f"🔬 INITIATING PART 2: ABLATION STUDIES (Target: {optimal_backbone} | N=5)")
+        print(f"溌 INITIATING PART 2: ABLATION STUDIES (Target: {optimal_backbone} | N=5)")
         print("="*70)
 
         for seed in academic_seeds:
@@ -212,20 +226,34 @@ def run_pipeline(dataset_name, backbones, model_name="TMLPN_Downstream_v3"):
                 else: 
                     print(f"[>>] Ablation Phase 1 completed for {trial_name}. Skipping.")
 
-                if get_completed_downstream_phases(dataset_name, optimal_backbone, trial_name=trial_name, model_name=model_name) == 0:
-                    execute_command(["uv", "run", "train_downstream.py"], f"Ablation Phase 2: {trial_name}")
-                else: 
+                completed_phases = get_completed_downstream_phases(dataset_name, optimal_backbone, trial_name=trial_name, model_name=model_name)
+                remaining_calls = 5 - completed_phases
+                if remaining_calls == 0: 
                     print(f"[>>] Ablation Phase 2 completed for {trial_name}. Skipping.")
+                else:
+                    for i in range(remaining_calls):
+                        current_phase_index = completed_phases + i + 1
+                        execute_command(["uv", "run", "train_downstream.py"], f"Ablation Phase 2 Call [{current_phase_index}/5] ({trial_name})")
                     
-        # --- PART 3: V3 COMPONENT ISOLATION ---
+        # PATCH B: Expand V3 Component Isolation & Synergy Matrix
         v3_isolation_matrix = {
+            # 1. Individual Component Isolation
             "Ablation_NoLoRA": {**control_optimal, "use_lora": False},
             "Ablation_NoLLRD": {**control_optimal, "llrd_decay": 1.0},
-            "Ablation_NoFeatureKD": {**control_optimal, "enable_kd": False}
+            "Ablation_NoFeatureKD": {**control_optimal, "enable_kd": False},
+            
+            # 2. Combinatorial Synergy (Eliminating Catastrophic Shattering)
+            "Ablation_NoLoRA_NoLLRD": {**control_optimal, "use_lora": False, "llrd_decay": 1.0},
+            "Ablation_Vanilla_V1": {**control_optimal, "use_lora": False, "llrd_decay": 1.0, "enable_kd": False},
+            
+            # 3. LoRA Rank Sensitivity Analysis
+            "LoRA_Rank_4": {**control_optimal, "use_lora": True, "lora_r": 4},
+            "LoRA_Rank_16": {**control_optimal, "use_lora": True, "lora_r": 16},
+            "LoRA_Rank_32": {**control_optimal, "use_lora": True, "lora_r": 32}
         }
         
         print("\n" + "="*70)
-        print(f"🧬 INITIATING PART 3: V3 COMPONENT ISOLATION (Target: {optimal_backbone} | N=5)")
+        print(f"ｧｬ INITIATING PART 3: V3 COMPONENT ISOLATION (Target: {optimal_backbone} | N=5)")
         print("="*70)
         
         for seed in academic_seeds:
@@ -240,10 +268,14 @@ def run_pipeline(dataset_name, backbones, model_name="TMLPN_Downstream_v3"):
                 else: 
                     print(f"[>>] Isolation Phase 1 completed for {trial_name}. Skipping.")
 
-                if get_completed_downstream_phases(dataset_name, optimal_backbone, trial_name=trial_name, model_name=model_name) == 0:
-                    execute_command(["uv", "run", "train_downstream.py"], f"Isolation Phase 2: {trial_name}")
-                else: 
+                completed_phases = get_completed_downstream_phases(dataset_name, optimal_backbone, trial_name=trial_name, model_name=model_name)
+                remaining_calls = 5 - completed_phases
+                if remaining_calls == 0: 
                     print(f"[>>] Isolation Phase 2 completed for {trial_name}. Skipping.")
+                else:
+                    for i in range(remaining_calls):
+                        current_phase_index = completed_phases + i + 1
+                        execute_command(["uv", "run", "train_downstream.py"], f"Isolation Phase 2 Call [{current_phase_index}/5] ({trial_name})")
 
         print("\n[+] SUCCESS: Entire execution matrix completed.")
 

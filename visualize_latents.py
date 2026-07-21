@@ -14,12 +14,11 @@ from torch.utils.data import DataLoader
 from dataset_jepa import DownstreamSegmentationDataset
 import models
 
-# Suppress UMAP multi-threading warnings to maintain clean terminal output
 warnings.filterwarnings("ignore", message=".*n_jobs value 1 overridden.*")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="TMLPN Batch Latent Visualization Engine (Dark Mode)")
-    parser.add_argument("--model", type=str, default="TMLPN_Downstream_v2", help="Target model architecture directory")
+    parser.add_argument("--model", type=str, default="TMLPN_Downstream_v3", help="Target model architecture directory")
     parser.add_argument("--dataset", type=str, default="MM5", help="Target dataset directory")
     parser.add_argument("--weights", type=str, default=None, help="Optional: Path to a specific model artifact to run in isolation")
     parser.add_argument("--backbone", type=str, default="mit_b5", help="Required only if using --weights to specify the backbone")
@@ -27,33 +26,50 @@ def parse_args():
     return parser.parse_args()
 
 def configure_dark_mode():
-    """Injects a high-contrast dark aesthetic for spatial token visualization."""
     plt.style.use('dark_background')
     sns.set_theme(
         style="dark", 
         context="paper", 
         rc={
-            "axes.facecolor": "#0d1117",       # Deep charcoal background
+            "axes.facecolor": "#0d1117",       
             "figure.facecolor": "#0d1117", 
-            "grid.color": "#30363d",           # Subtle slate gridlines
+            "grid.color": "#30363d",           
             "axes.edgecolor": "#30363d",
-            "text.color": "#c9d1d9",           # Soft white text
+            "text.color": "#c9d1d9",           
             "xtick.color": "#c9d1d9",
             "ytick.color": "#c9d1d9"
         }
     )
 
-def extract_modality_embeddings(model, dataloader, device, max_samples):
+def extract_modality_embeddings(model, dataloader, device, max_samples, d_mean, d_std, t_mean, t_std):
     model.eval()
     rgb_features_list, dt_features_list = [], []
     with torch.no_grad():
         for batch in dataloader:
             x_full = batch['x_full'].to(device)
-            stem = model.context_encoder.patch_embed1.proj
             
+            # PATCH: Z-Score Reversal prior to stem evaluation to prevent NaN cascades
+            x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
+            x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
+            
+            stem = model.context_encoder.patch_embed1.proj
             rgb_aligned = stem.rgb_proj(x_full[:, :3, :, :])
-            dt_raw = stem.depth_therm_proj((x_full[:, 3:, :, :] * stem.dt_scale) + stem.dt_bias)
-            dt_aligned = stem.dt_alignment(dt_raw)
+            
+            x_depth = x_full[:, 3:4, :, :]
+            x_therm = x_full[:, 4:5, :, :]
+            
+            # PATCH: V3 Dynamic physical stem logic
+            if hasattr(stem, 'depth_scale'):
+                depth_mean_val = x_depth.mean(dim=(2, 3), keepdim=True) + 1e-8
+                x_depth_calibrated = ((x_depth / depth_mean_val) * stem.depth_scale) + stem.depth_bias
+                x_therm_calibrated = (x_therm * torch.sigmoid(stem.therm_scale)) + stem.therm_bias
+                x_dt_calibrated = torch.cat([x_depth_calibrated, x_therm_calibrated], dim=1)
+                
+                dt_raw = stem.depth_therm_proj(x_dt_calibrated)
+                dt_aligned = stem.dt_alignment(dt_raw)
+            else:
+                dt_raw = stem.depth_therm_proj((x_full[:, 3:, :, :] * getattr(stem, 'dt_scale', 1.0)) + getattr(stem, 'dt_bias', 0.0))
+                dt_aligned = stem.dt_alignment(dt_raw)
             
             rgb_features_list.append(rgb_aligned.permute(0, 2, 3, 1).reshape(-1, rgb_aligned.shape[1]).cpu().numpy())
             dt_features_list.append(dt_aligned.permute(0, 2, 3, 1).reshape(-1, dt_aligned.shape[1]).cpu().numpy())
@@ -67,12 +83,17 @@ def extract_modality_embeddings(model, dataloader, device, max_samples):
     
     return np.vstack((rgb_np[rgb_idx], dt_np[dt_idx])), np.array(['RGB Manifold'] * sample_size + ['Depth+Thermal Manifold'] * sample_size)
 
-def extract_semantic_embeddings(model, dataloader, device, max_samples):
+def extract_semantic_embeddings(model, dataloader, device, max_samples, d_mean, d_std, t_mean, t_std):
     model.eval()
     semantic_features, semantic_labels = [], []
     with torch.no_grad():
         for batch in dataloader:
             x_full, seg_mask = batch['x_full'].to(device), batch['seg_mask'].to(device)
+            
+            # PATCH: Z-Score Reversal 
+            x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
+            x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
+            
             _, features = model(x_full, return_features=True)
             c4_latent = features[-1] 
             
@@ -103,12 +124,10 @@ def compute_and_plot(features, labels, title, ax_tsne, ax_umap, palette_type, cl
     else:
         display_labels = labels
         hue_order = ["RGB Manifold", "Depth+Thermal Manifold"]
-        # Adjusted modality colors to be highly visible against dark backgrounds
         palette = {"RGB Manifold": "#58a6ff", "Depth+Thermal Manifold": "#ff7b72"}
 
     df = pd.DataFrame({'TSNE_1': tsne_results[:, 0], 'TSNE_2': tsne_results[:, 1], 'UMAP_1': umap_results[:, 0], 'UMAP_2': umap_results[:, 1], 'Label': display_labels})
     
-    # Render scatter plots without edge borders to prevent dark-mode blurring
     sns.scatterplot(data=df, x='TSNE_1', y='TSNE_2', hue='Label', hue_order=hue_order, palette=palette, s=15, alpha=0.85, ax=ax_tsne, edgecolor='none')
     ax_tsne.set_title(f"t-SNE: {title}", fontweight='bold', color='white')
     ax_tsne.set_xticks([]); ax_tsne.set_yticks([]) 
@@ -118,7 +137,6 @@ def compute_and_plot(features, labels, title, ax_tsne, ax_umap, palette_type, cl
     ax_umap.set_xticks([]); ax_umap.set_yticks([]) 
     
     if palette_type == "semantic":
-        # Format legends for dark aesthetic
         for ax in [ax_tsne, ax_umap]:
             legend = ax.legend(title="Structural Class", bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., fontsize='small')
             plt.setp(legend.get_title(), color='white')
@@ -147,18 +165,28 @@ def main():
     splits_root = os.path.join("data", "splits")
     try:
         with open(os.path.join(splits_root, args.dataset, "classes.txt"), "r") as f:
-            # FIXED: Corrected Regex to preserve string spaces while dropping bracket tags
             class_names = [re.sub(r'\\s*', '', line).strip() for line in f if line.strip()]
             NUM_CLASSES = len(class_names)
     except FileNotFoundError:
         print(f"[-] CRITICAL: classes.txt not found. Cannot perform latent rendering for {args.dataset}")
         return
         
-    eval_dataset = DownstreamSegmentationDataset(dataset_name=args.dataset, split="eval", splits_root=splits_root, image_size=(480, 640))
+    # PATCH: Hardcoded eval split removed, updated to dynamic test split
+    eval_dataset = DownstreamSegmentationDataset(dataset_name=args.dataset, split="test", splits_root=splits_root, image_size=(480, 640))
     eval_loader = DataLoader(eval_dataset, batch_size=4, shuffle=True, num_workers=4)
+    
+    # Extract structural statistics for un-normalization
+    d_mean, d_std = eval_dataset.mean[3], eval_dataset.std[3]
+    t_mean, t_std = eval_dataset.mean[4], eval_dataset.std[4]
     
     out_dir = os.path.join("results", args.model, args.dataset, "visualizations")
     os.makedirs(out_dir, exist_ok=True)
+
+    # PATCH: Dynamic architecture routing strictly enforced
+    ModelClass = getattr(models, args.model, None)
+    if ModelClass is None:
+        print(f"[-] CRITICAL: Architecture class '{args.model}' not found in models.py. Cannot extract latents.")
+        return
 
     runs_to_process = []
     
@@ -196,21 +224,21 @@ def main():
         has_p2 = p2_weights and os.path.exists(p2_weights)
         
         cols = 4 if (has_p1 and has_p2) else 2
-        # Use #0d1117 (Deep Charcoal) to match the dark aesthetic matrix
         fig, axes = plt.subplots(2, cols, figsize=(8*cols, 16), facecolor="#0d1117")
         if cols == 2: axes = axes.reshape(2, 2)
         
         try:
             if has_p1:
                 print("    -> Extracting Phase 1 (Foundation) manifolds...")
-                model_p1 = models.TMLPN_Downstream_v2(num_classes=NUM_CLASSES, backbone_name=backbone, use_lora=False).to(DEVICE)
+                # PATCH: Dynamic Instantiation utilizing ModelClass
+                model_p1 = ModelClass(num_classes=NUM_CLASSES, backbone_name=backbone, use_lora=False).to(DEVICE)
                 
                 raw_checkpoint = torch.load(p1_weights, map_location=DEVICE)
                 ce_weights = raw_checkpoint.get('context_encoder_state_dict', raw_checkpoint)
                 model_p1.load_state_dict({f"context_encoder.{k}": v for k, v in ce_weights.items()}, strict=False)
                 
-                m_f1, m_l1 = extract_modality_embeddings(model_p1, eval_loader, DEVICE, args.samples)
-                s_f1, s_l1 = extract_semantic_embeddings(model_p1, eval_loader, DEVICE, args.samples)
+                m_f1, m_l1 = extract_modality_embeddings(model_p1, eval_loader, DEVICE, args.samples, d_mean, d_std, t_mean, t_std)
+                s_f1, s_l1 = extract_semantic_embeddings(model_p1, eval_loader, DEVICE, args.samples, d_mean, d_std, t_mean, t_std)
                 
                 col_offset = 0
                 compute_and_plot(m_f1, m_l1, "Phase 1: Modality Alignment", axes[0, col_offset], axes[0, col_offset+1], "modality", class_names)
@@ -218,11 +246,12 @@ def main():
                 
             if has_p2:
                 print("    -> Extracting Phase 2 (Fine-Tuned) manifolds...")
-                model_p2 = models.TMLPN_Downstream_v2(num_classes=NUM_CLASSES, backbone_name=backbone, use_lora=False).to(DEVICE)
+                # PATCH: Dynamic Instantiation utilizing ModelClass
+                model_p2 = ModelClass(num_classes=NUM_CLASSES, backbone_name=backbone, use_lora=False).to(DEVICE)
                 model_p2.load_state_dict(torch.load(p2_weights, map_location=DEVICE), strict=False)
                 
-                m_f2, m_l2 = extract_modality_embeddings(model_p2, eval_loader, DEVICE, args.samples)
-                s_f2, s_l2 = extract_semantic_embeddings(model_p2, eval_loader, DEVICE, args.samples)
+                m_f2, m_l2 = extract_modality_embeddings(model_p2, eval_loader, DEVICE, args.samples, d_mean, d_std, t_mean, t_std)
+                s_f2, s_l2 = extract_semantic_embeddings(model_p2, eval_loader, DEVICE, args.samples, d_mean, d_std, t_mean, t_std)
                 
                 col_offset = 2 if (has_p1 and has_p2) else 0
                 compute_and_plot(m_f2, m_l2, "Phase 2: Modality Alignment", axes[0, col_offset], axes[0, col_offset+1], "modality", class_names)
