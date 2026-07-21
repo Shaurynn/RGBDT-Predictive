@@ -171,6 +171,10 @@ Visualizing the latent embeddings confirms that the V2 supervised downstream dec
 
 The TMLPN_v3 pipeline represents a comprehensive overhaul of the data ingestion and objective formulation strategies, systematically addressing memory inefficiencies, latent manifold degeneracy, and physically contradictory normalization priors.
 
+> ![v3 Network Architecture Diagram](assets/v3_Network_Architecture_Diagram.png)
+>
+> **Figure 8: The master Tri-Modal Latent Predictive Network (TMLPN_v3) architecture diagram.** Demonstrates the complete V3 pipeline including the configurable $1 \times 1$ alignment stem projection (Dirac / Kaiming Normal), strip-level camera mirroring logic, fortified JEPA pre-training objectives (Context Anchor Loss and VICReg-inspired Covariance Penalty), and Phase 2 LoRA/LLRD fine-tuning with feature-level distillation.
+
 ### 7.1 Modality-Decoupled Physical Calibration
 
 In prior iterations, geometric depth and thermal intensities shared bundled affine scaling parameters. This design was physically contradictory. Depth values represent scale-invariant distance measurements, whereas thermal tensors represent temperature-dependent radiometric variances [20]. TMLPN_v3 physically isolates these priors at the tensor level (`depth_scale` and `therm_scale`), allowing the network to empirically learn independent calibration mappings:
