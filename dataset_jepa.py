@@ -3,6 +3,7 @@ import cv2
 import csv
 import json
 import math
+import random
 import torch
 import numpy as np
 import pandas as pd
@@ -131,12 +132,12 @@ class BaseRGBDTDataset(Dataset):
 
     def _get_or_compute_stats(self) -> Tuple[List[float], List[float]]:
         """Safely computes and caches empirical mean and std using float64 precision."""
-        cache_path = os.path.join(self.data_dir, 'dataset_stats.json')
+        # Upgraded to .pt to preserve 64-bit IEEE float precision
+        cache_path = os.path.join(self.data_dir, 'dataset_stats.pt')
         
         if os.path.exists(cache_path):
-            with open(cache_path, 'r') as f:
-                stats = json.load(f)
-            return stats['mean'], stats['std']
+            stats = torch.load(cache_path, weights_only=True)
+            return stats['mean'].tolist(), stats['std'].tolist()
             
         if self.split != 'train':
             raise RuntimeError(f"[!] CRITICAL: Missing '{cache_path}'. Initialize 'train' split first.")
@@ -151,24 +152,27 @@ class BaseRGBDTDataset(Dataset):
             channels_sum += x_5ch.sum(dim=(1, 2))
             channels_sq_sum += (x_5ch ** 2).sum(dim=(1, 2))
             num_pixels += (self.image_size[0] * self.image_size[1])
+            
+            # Explicit memory release to prevent PyTorch/OpenCV memory spikes
+            del x_5ch 
 
         mean = channels_sum / num_pixels
         variance = torch.clamp((channels_sq_sum / num_pixels) - (mean ** 2), min=1e-8)
         std = torch.sqrt(variance)
         
-        mean_list, std_list = mean.tolist(), std.tolist()
-        with open(cache_path, 'w') as f:
-            json.dump({'mean': mean_list, 'std': std_list}, f, indent=4)
+        # Save exact float64 tensors
+        torch.save({'mean': mean, 'std': std}, cache_path)
             
-        return mean_list, std_list
+        return mean.tolist(), std.tolist()
 
 
 class JEPAPretrainDataset(BaseRGBDTDataset):
     """Phase 1 Dataset utilizing isolated base components with dynamic mask routing."""
     
-    def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train', splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640), mask_strategy: str = "multi_block"):
+    def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train', splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640), mask_strategy: str = "multi_block", enable_augmentation: bool = True):
         super().__init__(data_dir=data_dir, dataset_name=dataset_name, split=split, splits_root=splits_root, image_size=image_size)
         self.mask_strategy = mask_strategy
+        self.enable_augmentation = enable_augmentation
 
     def _generate_multiblock_mask(self, h: int, w: int, num_blocks: int = 4) -> torch.Tensor:
         mask = torch.zeros((1, h, w), dtype=torch.float32)
@@ -213,6 +217,25 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
         base_name = self.image_files[idx]
         x_full = self._load_multimodal_tensors(base_name)
         
+        # Spatial and Radiometric Data Augmentation for MM5 Structural Anomaly Dataset
+        if self.enable_augmentation and self.split == 'train':
+            # Spatial augmentations must apply symmetrically to all 5 modalities
+            if torch.rand(1).item() > 0.5:
+                x_full = TF.hflip(x_full)
+            if torch.rand(1).item() > 0.5:
+                x_full = TF.vflip(x_full)
+                
+            # Radiometric (color) augmentations must apply STRICTLY to the RGB channels (indices 0, 1, 2)
+            # This simulates factory lighting variance while mathematically isolating and protecting 
+            # the absolute physical measurements of the Depth and Thermal modalities.
+            if torch.rand(1).item() > 0.5:
+                rgb = x_full[:3, :, :]
+                rgb = TF.adjust_brightness(rgb, brightness_factor=1.0 + (torch.rand(1).item() - 0.5) * 0.4)
+                rgb = TF.adjust_contrast(rgb, contrast_factor=1.0 + (torch.rand(1).item() - 0.5) * 0.4)
+                rgb = TF.adjust_saturation(rgb, saturation_factor=1.0 + (torch.rand(1).item() - 0.5) * 0.4)
+                rgb = TF.adjust_hue(rgb, hue_factor=(torch.rand(1).item() - 0.5) * 0.2)
+                x_full[:3, :, :] = rgb
+        
         x_normalized = TF.normalize(x_full, mean=self.mean, std=self.std)
         
         # Route the mask topology based on the orchestrator's injected state
@@ -229,8 +252,9 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
 class DownstreamSegmentationDataset(BaseRGBDTDataset):
     """Phase 2 Dataset utilizing isolated base components."""
     
-    def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train', splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640)):
+    def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train', splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640), enable_augmentation: bool = True):
         super().__init__(data_dir=data_dir, dataset_name=dataset_name, split=split, splits_root=splits_root, image_size=image_size)
+        self.enable_augmentation = enable_augmentation
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         base_name = self.image_files[idx]
@@ -240,9 +264,32 @@ class DownstreamSegmentationDataset(BaseRGBDTDataset):
         gt_path = os.path.join(self.data_dir, 'Class_Annotations', f"{base_name}.png")
         gt_mask = self._safe_imread(gt_path, cv2.IMREAD_GRAYSCALE)
         gt_mask = cv2.resize(gt_mask, (self.image_size[1], self.image_size[0]), interpolation=cv2.INTER_NEAREST)
+        gt_t = torch.as_tensor(gt_mask, dtype=torch.long)
+        
+        # Ensure Phase 2 Downstream fine-tuning applies the identical augmentation strategy
+        if self.enable_augmentation and self.split == 'train':
+            # Seed locking is required to ensure the mask flips exactly parallel to the 5-channel tensor
+            seed = torch.randint(0, 2**32, (1,)).item()
+            
+            torch.manual_seed(seed)
+            if torch.rand(1).item() > 0.5:
+                x_full = TF.hflip(x_full)
+                gt_t = TF.hflip(gt_t.unsqueeze(0)).squeeze(0)
+                
+            torch.manual_seed(seed + 1)
+            if torch.rand(1).item() > 0.5:
+                x_full = TF.vflip(x_full)
+                gt_t = TF.vflip(gt_t.unsqueeze(0)).squeeze(0)
+                
+            if torch.rand(1).item() > 0.5:
+                rgb = x_full[:3, :, :]
+                rgb = TF.adjust_brightness(rgb, brightness_factor=1.0 + (torch.rand(1).item() - 0.5) * 0.4)
+                rgb = TF.adjust_contrast(rgb, contrast_factor=1.0 + (torch.rand(1).item() - 0.5) * 0.4)
+                rgb = TF.adjust_saturation(rgb, saturation_factor=1.0 + (torch.rand(1).item() - 0.5) * 0.4)
+                rgb = TF.adjust_hue(rgb, hue_factor=(torch.rand(1).item() - 0.5) * 0.2)
+                x_full[:3, :, :] = rgb
         
         x_normalized = TF.normalize(x_full, mean=self.mean, std=self.std)
-        gt_t = torch.as_tensor(gt_mask, dtype=torch.long)
         gt_t[gt_t == 255] = 255 
 
         return {'x_full': x_normalized, 'seg_mask': gt_t}

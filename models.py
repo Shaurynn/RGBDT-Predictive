@@ -26,8 +26,13 @@ class ModalityIsolatedPatchEmbed(nn.Module):
         if self.depth_therm_proj.bias is not None:
             nn.init.zeros_(self.depth_therm_proj.bias)
             
-        self.dt_scale = nn.Parameter(torch.ones(1, 2, 1, 1))
-        self.dt_bias = nn.Parameter(torch.zeros(1, 2, 1, 1))
+        # Explicitly decoupled physical calibration priors for V3 Architecture
+        self.depth_scale = nn.Parameter(torch.ones(1, 1, 1, 1))
+        self.depth_bias = nn.Parameter(torch.zeros(1, 1, 1, 1))
+        
+        # Bounded radiometric scaling for thermal calibration
+        self.therm_scale = nn.Parameter(torch.ones(1, 1, 1, 1))
+        self.therm_bias = nn.Parameter(torch.zeros(1, 1, 1, 1))
         
         self.dt_alignment = nn.Conv2d(
             in_channels=original_proj.out_channels,
@@ -39,9 +44,19 @@ class ModalityIsolatedPatchEmbed(nn.Module):
 
     def forward(self, x):
         x_rgb = x[:, :3, :, :]
-        x_dt = x[:, 3:, :, :]
+        x_depth = x[:, 3:4, :, :]
+        x_therm = x[:, 4:5, :, :]
         
-        x_dt_calibrated = (x_dt * self.dt_scale) + self.dt_bias
+        # 1. Encode Depth Scale-Invariance: Normalize by spatial mean to ensure geometric scale invariance
+        depth_mean = x_depth.mean(dim=(2, 3), keepdim=True).clamp(min=1e-5)
+        x_depth_normalized = x_depth / depth_mean
+        x_depth_calibrated = (x_depth_normalized * self.depth_scale) + self.depth_bias
+        
+        # 2. Encode Thermal Radiometric Calibration: Bounded scaling via sigmoid to prevent uncalibrated drift
+        x_therm_calibrated = (x_therm * torch.sigmoid(self.therm_scale)) + self.therm_bias
+        
+        # Re-concatenate calibrated physical tensors
+        x_dt_calibrated = torch.cat([x_depth_calibrated, x_therm_calibrated], dim=1)
         
         dt_features = self.depth_therm_proj(x_dt_calibrated)
         dt_aligned = self.dt_alignment(dt_features)
@@ -218,7 +233,9 @@ class SegFormerAllMLPDecoder(nn.Module):
 
         self.linear_fuse = nn.Sequential(
             nn.Conv2d(embedding_dim * 4, embedding_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(embedding_dim),
+            # Substituted standard BN with GroupNorm(1, C) to act natively as LayerNorm 
+            # across channels, preserving stability under bounded hardware batch constraints.
+            nn.GroupNorm(1, embedding_dim),
             nn.ReLU(inplace=True),
             nn.Dropout2d(p=0.1)
         )
@@ -259,16 +276,44 @@ class TMLPN_Downstream_v1(nn.Module):
         return F.interpolate(logits, size=x_full.shape[2:], mode='bilinear', align_corners=False)
 
 class TMLPN_Downstream_v2(nn.Module):
+    """Legacy V2 Architecture (Preserved for compatibility and fallback)"""
+    def __init__(self, num_classes=10, backbone_name='mit_b1', isolated_stem=True, use_lora=False, lora_r=8, lora_alpha=16):
+        super().__init__()
+        self.isolated_stem = isolated_stem
+        self.context_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, weights=None)
+        
+        original_proj = self.context_encoder.patch_embed1.proj
+        if self.isolated_stem:
+            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj)
+        else:
+            self.context_encoder.patch_embed1.proj = NaiveEarlyFusionPatchEmbed(original_proj)
+            
+        if use_lora:
+            apply_lora_to_mit(self.context_encoder, r=lora_r, alpha=lora_alpha)
+        
+        encoder_channels = self.context_encoder.out_channels[-4:]
+        self.decode_head = SegFormerAllMLPDecoder(in_channels_list=encoder_channels, embedding_dim=256, num_classes=num_classes)
+
+    def forward(self, x_full, return_features=False):
+        features = self.context_encoder(x_full)
+        logits = self.decode_head(features)
+        logits_upsampled = F.interpolate(logits, size=x_full.shape[2:], mode='bilinear', align_corners=False)
+        
+        if return_features:
+            return logits_upsampled, features[-4:]
+        return logits_upsampled
+
+class TMLPN_Downstream_v3(nn.Module):
     """
-    PHASE 2: V2 Supervised Semantic Segmentation Architecture.
-    Features Native LoRA Injection and Feature-Level Output for Advanced KD.
+    PHASE 2: V3 Supervised Semantic Segmentation Architecture.
+    Integrates Modality-Decoupled Physical Priors, LoRA, and Feature-Level KD.
     """
     def __init__(self, num_classes=10, backbone_name='mit_b1', isolated_stem=True, use_lora=False, lora_r=8, lora_alpha=16):
         super().__init__()
         self.isolated_stem = isolated_stem
         self.context_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, weights=None)
         
-        # Stem Extraction
+        # Stem Extraction with explicit V3 Physical Priors
         original_proj = self.context_encoder.patch_embed1.proj
         if self.isolated_stem:
             self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj)

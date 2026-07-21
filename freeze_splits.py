@@ -3,10 +3,11 @@ import argparse
 import shutil
 import pandas as pd
 
-def adapt_canonical_splits(data_root, dataset_name):
+def adapt_canonical_splits(data_root, dataset_name, seed=42):
     """
     Reads the canonical dataset splits and maps them to explicit modality subdirectories,
     preserving the official benchmark distribution for fair baseline comparisons.
+    Splits the canonical evaluation set strictly into 50% validation and 50% test sets.
     """
     canonical_train_path = os.path.join(data_root, "train_dataset.csv")
     canonical_eval_path = os.path.join(data_root, "eval_dataset.csv")
@@ -58,7 +59,14 @@ def adapt_canonical_splits(data_root, dataset_name):
             })
         return pd.DataFrame(records)
 
-    return process_split(train_df_raw), process_split(eval_df_raw)
+    train_df = process_split(train_df_raw)
+    processed_eval_df = process_split(eval_df_raw)
+    
+    # Programmatically split the evaluation dataset 50/50 using a locked seed
+    val_df = processed_eval_df.sample(frac=0.5, random_state=seed)
+    test_df = processed_eval_df.drop(val_df.index)
+
+    return train_df, val_df, test_df
 
 def main():
     parser = argparse.ArgumentParser(description="Adapt canonical dataset splits into the agnostic framework.")
@@ -77,17 +85,19 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     print(f"[*] Adapting agnostic manifest for dataset: {args.dataset} from {data_root}")
 
-    # Process and preserve the canonical splits
-    train_df, val_df = adapt_canonical_splits(data_root, args.dataset)
+    # Process and preserve the canonical splits with a strict 3-way split
+    train_df, val_df, test_df = adapt_canonical_splits(data_root, args.dataset, seed=42)
     
     # Serialize to the locked routing directory
     train_df.to_csv(os.path.join(output_dir, "train.csv"), index=False)
     val_df.to_csv(os.path.join(output_dir, "val.csv"), index=False)
+    test_df.to_csv(os.path.join(output_dir, "test.csv"), index=False)
     shutil.copyfile(os.path.join(data_root, "classes.txt"), os.path.join(output_dir, "classes.txt"))
     
-    print(f"[+] Canonical splits preserved and frozen to {output_dir}")
+    print(f"[+] Canonical splits adapted and frozen to {output_dir}")
     print(f"    Train: {len(train_df)} samples")
-    print(f"    Eval:  {len(val_df)} samples")
+    print(f"    Val:   {len(val_df)} samples")
+    print(f"    Test:  {len(test_df)} samples")
 
 if __name__ == "__main__":
     main()

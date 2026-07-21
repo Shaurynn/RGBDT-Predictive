@@ -10,6 +10,7 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 from scipy import stats
+from statsmodels.stats.multitest import multipletests
 from sklearn.manifold import TSNE
 import umap.umap_ as umap
 from torch.utils.data import DataLoader
@@ -22,7 +23,7 @@ warnings.filterwarnings("ignore", message=".*n_jobs value 1 overridden.*")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="TMLPN Unified CVPR Evaluation & Latent Visualization Engine")
-    parser.add_argument("--model", type=str, default="TMLPN_Downstream_v2", help="Target architecture directory (e.g., TMLPN_Downstream_v2)")
+    parser.add_argument("--model", type=str, default="TMLPN_Downstream_v3", help="Target architecture namespace (e.g., TMLPN_Downstream_v3)")
     parser.add_argument("--dataset", type=str, default="MM5", help="Target dataset name")
     parser.add_argument("--samples", type=int, default=8000, help="Max spatial tokens to sample per latent projection")
     parser.add_argument("--skip_latents", action="store_true", help="Flag to bypass the heavy UMAP/t-SNE rendering")
@@ -60,11 +61,14 @@ def generate_metric_visualizations(primary_baselines, ablation_stats, output_dir
         for backbone, phases in primary_baselines.items():
             for phase in ["baseline", "hero", "microtune"]:
                 if phase in phases:
-                    trajectory_records.append({"Backbone": backbone, "Phase": phase.capitalize(), "mIoU": phases[phase]["mIoU"]})
+                    # Append all seed instances; Seaborn automatically plots Mean with Error Bands
+                    for seed, metrics in phases[phase].items():
+                        trajectory_records.append({"Backbone": backbone, "Phase": phase.capitalize(), "mIoU": metrics["mIoU"]})
+        
         df_traj = pd.DataFrame(trajectory_records)
         if not df_traj.empty:
             ax = sns.lineplot(data=df_traj, x='Phase', y='mIoU', hue='Backbone', marker='o', linewidth=2.5, markersize=8, palette='viridis')
-            ax.set_title("Architecture Progression Trajectory", fontweight='bold')
+            ax.set_title("Architecture Progression Trajectory (Multi-Seed)", fontweight='bold')
             ax.set_ylabel("Mean Intersection over Union (mIoU)")
             ax.set_xlabel("Training Phase")
             plt.tight_layout()
@@ -204,29 +208,64 @@ def main():
         match = ablation_pattern.match(isolated_backbone)
         if match:
             backbone, trial_base_name, seed = match.groups()
-            if trial_base_name not in ablation_trials: ablation_trials[trial_base_name] = {}
-            if score >= ablation_trials[trial_base_name].get(seed, {}).get("mIoU", 0.0):
+            
+            # --- Multi-Seed Grouping Logic ---
+            if trial_base_name == "baseline":
+                if backbone not in primary_baselines: primary_baselines[backbone] = {}
+                if phase not in primary_baselines[backbone]: primary_baselines[backbone][phase] = {}
+                primary_baselines[backbone][phase][seed] = {"mIoU": score, "train_loss": t_loss, "val_loss": v_loss}
+            else:
+                if trial_base_name not in ablation_trials: ablation_trials[trial_base_name] = {}
                 ablation_trials[trial_base_name][seed] = {"mIoU": score, "train_loss": t_loss, "val_loss": v_loss}
         else:
+            # Fallback for old single-run baselines
             if isolated_backbone not in primary_baselines: primary_baselines[isolated_backbone] = {}
-            if score >= primary_baselines[isolated_backbone].get(phase, {}).get("mIoU", 0.0):
-                primary_baselines[isolated_backbone][phase] = {"mIoU": score, "train_loss": t_loss, "val_loss": v_loss}
+            if phase not in primary_baselines[isolated_backbone]: primary_baselines[isolated_backbone][phase] = {}
+            primary_baselines[isolated_backbone][phase]["42"] = {"mIoU": score, "train_loss": t_loss, "val_loss": v_loss}
 
-    analysis_payload = {"metadata": {"model": args.model, "dataset": args.dataset}, "primary_baselines": primary_baselines, "ablation_statistics": {}}
+    analysis_payload = {"metadata": {"model": args.model, "dataset": args.dataset}, "primary_baselines": {}, "ablation_statistics": {}}
+    
+    # Process Primary Baselines Stats for Payload
+    for bb, phases in primary_baselines.items():
+        analysis_payload["primary_baselines"][bb] = {}
+        for phase, seed_data in phases.items():
+            scores = [m["mIoU"] for m in seed_data.values()]
+            analysis_payload["primary_baselines"][bb][phase] = {
+                "mean_mIoU": round(np.mean(scores), 4),
+                "std_dev": round(np.std(scores), 4),
+                "raw_scores": scores
+            }
+
     control_key = "Control_Optimal"
     control_scores = [metrics["mIoU"] for seed, metrics in ablation_trials[control_key].items()] if control_key in ablation_trials else []
+
+    # Prepare structures for Benjamini-Hochberg Correction
+    raw_p_values = []
+    trial_order = []
 
     for trial_name, seed_data in ablation_trials.items():
         scores = [metrics["mIoU"] for seed, metrics in seed_data.items()]
         stat_entry = {"seeds_evaluated": len(scores), "raw_scores": scores, "mean_mIoU": round(np.mean(scores), 4), "std_dev": round(np.std(scores), 4)}
+        
         if trial_name == control_key:
-            stat_entry["p_value_vs_control"] = stat_entry["is_statistically_significant"] = "Reference"
+            stat_entry["p_value_vs_control"] = "Reference"
+            stat_entry["is_statistically_significant"] = "Reference"
         elif len(control_scores) > 1 and len(scores) > 1:
             _, p_value = stats.ttest_ind(control_scores, scores, equal_var=False)
-            stat_entry["p_value_vs_control"], stat_entry["is_statistically_significant"] = round(p_value, 4), bool(p_value < 0.05)
+            raw_p_values.append(p_value)
+            trial_order.append(trial_name)
         else:
-            stat_entry["p_value_vs_control"], stat_entry["is_statistically_significant"] = "Insufficient Data", False
+            stat_entry["p_value_vs_control"] = "Insufficient Data"
+            stat_entry["is_statistically_significant"] = False
+            
         analysis_payload["ablation_statistics"][trial_name] = stat_entry
+
+    # Apply FDR (Benjamini-Hochberg) Correction
+    if raw_p_values:
+        reject, pvals_corrected, _, _ = multipletests(raw_p_values, alpha=0.05, method='fdr_bh')
+        for i, trial_name in enumerate(trial_order):
+            analysis_payload["ablation_statistics"][trial_name]["p_value_vs_control"] = round(pvals_corrected[i], 4)
+            analysis_payload["ablation_statistics"][trial_name]["is_statistically_significant"] = bool(reject[i])
 
     with open(os.path.join(base_dir, "analysis.json"), 'w') as f: json.dump(analysis_payload, f, indent=4)
     vis_dir = os.path.join(base_dir, "analysis_plots")
@@ -234,15 +273,24 @@ def main():
 
     print("\n" + "="*85)
     print(f"📊 CVPR STATISTICAL SUMMARY: {args.model} | {args.dataset}")
-    print("="*85 + "\n[ PRIMARY FLAGSHIP TRAJECTORIES ]\n" + f"{'Backbone':<15} | {'Phase':<12} | {'Max mIoU':<10} | {'Train Loss':<12} | {'Val Loss':<12}\n" + "-" * 70)
+    print("="*85 + "\n[ PRIMARY FLAGSHIP TRAJECTORIES ]\n" + f"{'Backbone':<15} | {'Phase':<12} | {'Mean ± Std':<15} | {'Train Loss':<12} | {'Val Loss':<12}\n" + "-" * 75)
     for bb in sorted(primary_baselines.keys()):
         for phase in ["baseline", "hero", "microtune"]:
             if phase in primary_baselines[bb]:
-                data = primary_baselines[bb][phase]
-                print(f"{bb:<15} | {phase.capitalize():<12} | {data['mIoU']:.4f}     | {str(data.get('train_loss'))[:8]:<12} | {str(data.get('val_loss'))[:8]:<12}")
-        print("-" * 70)
+                data = analysis_payload["primary_baselines"][bb][phase]
+                mu_sigma = f"{data['mean_mIoU']:.4f} ± {data['std_dev']:.4f}"
+                
+                # Average losses across seeds for clean reporting
+                raw_t_loss = [m["train_loss"] for m in primary_baselines[bb][phase].values() if isinstance(m["train_loss"], (int, float))]
+                raw_v_loss = [m["val_loss"] for m in primary_baselines[bb][phase].values() if isinstance(m["val_loss"], (int, float))]
+                
+                t_loss_str = f"{np.mean(raw_t_loss):.4f}" if raw_t_loss else "N/A"
+                v_loss_str = f"{np.mean(raw_v_loss):.4f}" if raw_v_loss else "N/A"
+                
+                print(f"{bb:<15} | {phase.capitalize():<12} | {mu_sigma:<15} | {t_loss_str:<12} | {v_loss_str:<12}")
+        print("-" * 75)
         
-    print("\n[ ABLATION MATRIX STATISTICS (N={} Seeds) ]\n".format(len(control_scores)) + f"{'Ablation Variant':<30} | {'Mean ± Std':<15} | {'p-value':<12} | {'Sig (<0.05)'}\n" + "-" * 80)
+    print("\n[ ABLATION MATRIX STATISTICS (N={} Seeds) ]\n".format(len(control_scores)) + f"{'Ablation Variant':<30} | {'Mean ± Std':<15} | {'p-val (FDR)':<12} | {'Sig (<0.05)'}\n" + "-" * 80)
     for trial, stats_data in analysis_payload["ablation_statistics"].items():
         mu_sigma = f"{stats_data['mean_mIoU']:.4f} ± {stats_data['std_dev']:.4f}"
         p_val, sig = stats_data.get("p_value_vs_control"), str(stats_data.get("is_statistically_significant"))
@@ -290,6 +338,10 @@ def main():
         run_name = os.path.basename(os.path.dirname(wf))
         parent_backbone_folder = os.path.basename(os.path.dirname(os.path.dirname(wf)))
         
+        # Filter: Avoid rendering identical latents for all 5 seeds. Restrict purely to Seed 42.
+        if "seed" in parent_backbone_folder and "seed42" not in parent_backbone_folder:
+            continue
+            
         match = re.match(r"^(mit_b\d+)(?:_(.*))?$", parent_backbone_folder)
         backbone = match.group(1) if match else "mit_b1"
         trial_name = match.group(2) if (match and match.group(2)) else "baseline"

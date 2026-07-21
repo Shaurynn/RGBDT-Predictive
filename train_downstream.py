@@ -240,7 +240,7 @@ class ExperimentManager:
         state["is_resume"] = True
         return state
 
-def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_loader, eval_loader, num_classes, empirical_alpha, global_gdl, device, cfg_hpo):
+def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_loader, val_loader, num_classes, empirical_alpha, global_gdl, device, cfg_hpo):
     db_path = os.path.join(run_dir, "hpo_sweep.db")
     
     def objective(trial):
@@ -283,7 +283,7 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
             model.eval()
             val_iou = IoUMetric(num_classes, device)
             with torch.no_grad():
-                for batch in eval_loader:
+                for batch in val_loader:
                     x_full, seg_mask = batch['x_full'].to(device), batch['seg_mask'].to(device)
                     with autocast('cuda', dtype=torch.bfloat16):
                         pred_seg = model(x_full)
@@ -298,6 +298,12 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
         return best_miou
 
     study = optuna.create_study(study_name="TMLPN_HPO_Sweep", storage=f"sqlite:///{db_path}", direction="maximize", pruner=optuna.pruners.HyperbandPruner(), load_if_exists=True)
+    
+    print("\n" + "="*80)
+    print("📊 [MONITOR HPO] To track the Optuna sweep in real-time, run in a new terminal:")
+    print(f"    optuna-dashboard sqlite:///{db_path}")
+    print("="*80 + "\n")
+    
     study.optimize(objective, n_trials=cfg_hpo['n_trials'])
     with open(os.path.join(run_dir, "best_params.json"), "w") as f: json.dump(study.best_params, f, indent=4)
     return study.best_value
@@ -371,22 +377,30 @@ def main():
     active_seed = cfg.get('seed', 42)
     enforce_reproducibility(active_seed)
 
+    # --- DYNAMIC ARCHITECTURE EXTRACTION ---
+    model_name = getattr(args, 'model', config.get('metadata', {}).get('model', 'TMLPN_Downstream_v3'))
+    ModelClass = getattr(models, model_name, None)
+    if ModelClass is None:
+        raise ValueError(f"[-] CRITICAL: Architecture class '{model_name}' not found in models.py")
+
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     splits_root = os.path.join("data", "splits")
     NUM_CLASSES = get_dynamic_class_count(os.path.join(splits_root, dataset_name))
     
     train_dataset = DownstreamSegmentationDataset(dataset_name=dataset_name, split="train", splits_root=splits_root, image_size=img_size)
-    eval_dataset = DownstreamSegmentationDataset(dataset_name=dataset_name, split="eval", splits_root=splits_root, image_size=img_size)
+    val_dataset = DownstreamSegmentationDataset(dataset_name=dataset_name, split="val", splits_root=splits_root, image_size=img_size)
+    test_dataset = DownstreamSegmentationDataset(dataset_name=dataset_name, split="test", splits_root=splits_root, image_size=img_size)
     
     train_loader = DataLoader(train_dataset, batch_size=cfg['batch_size'], shuffle=True, num_workers=4)
-    eval_loader = DataLoader(eval_dataset, batch_size=cfg['batch_size'], shuffle=False, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=cfg['batch_size'], shuffle=False, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=cfg['batch_size'], shuffle=False, num_workers=4)
     
     empirical_alpha, global_gdl = compute_dataset_statistics(train_loader, NUM_CLASSES)
     
     ablation_cfg = cfg.get('ablations', {})
     gdl_type = ablation_cfg.get('gdl_type', 'global_anchored')
     enable_kd = ablation_cfg.get('enable_kd', True)
-    use_lora = cfg.get('use_lora', True)
+    use_lora = ablation_cfg.get('use_lora', cfg.get('use_lora', True))
     
     model_kwargs = {
         "num_classes": NUM_CLASSES,
@@ -397,15 +411,16 @@ def main():
         "lora_alpha": cfg.get('lora', {}).get('alpha', 16)
     }
 
-    # Model upgraded to V2 Architecture
-    model = models.TMLPN_Downstream_v2(**model_kwargs).to(DEVICE)
+    # Dynamically Instantiate the Primary Network
+    model = ModelClass(**model_kwargs).to(DEVICE)
     
     teacher_model = None
     if enable_kd and getattr(args, 'teacher_weights', None) and os.path.exists(args.teacher_weights):
         t_kwargs = model_kwargs.copy()
         t_kwargs['backbone_name'] = cfg['teacher_backbone']
         t_kwargs['use_lora'] = False
-        teacher_model = models.TMLPN_Downstream_v2(**t_kwargs).to(DEVICE)
+        # Dynamically Instantiate the Teacher Network
+        teacher_model = ModelClass(**t_kwargs).to(DEVICE)
         teacher_model.load_state_dict(torch.load(args.teacher_weights))
         teacher_model.eval()
         for p in teacher_model.parameters(): p.requires_grad = False
@@ -417,7 +432,7 @@ def main():
     run_dir, phase = state["run_dir"], state["phase"]
 
     if phase == "baseline" and not state["is_resume"]:
-        # UPDATED: Enforce exact weights/ namespace hierarchy using model class name
+        # The weight path inherently uses model.__class__.__name__, safely mapping dynamically
         pt_weights = os.path.join("weights", model.__class__.__name__, dataset_name, trial_name, f"jepa_context_encoder_{cfg['backbone']}.pt")
         if os.path.exists(pt_weights):
             print(f"[*] Injecting Phase 1 MM-JEPA Foundation Weights: {pt_weights}")
@@ -425,7 +440,8 @@ def main():
             for param in model.context_encoder.parameters(): param.requires_grad = False
 
     if phase == "hpo":
-        score = run_hpo_phase(run_dir, state["inherit_weights"], models.TMLPN_Downstream_v2, model_kwargs, train_loader, eval_loader, NUM_CLASSES, empirical_alpha, global_gdl, DEVICE, cfg['hpo'])
+        # Pass the dynamic ModelClass to the Optuna search
+        score = run_hpo_phase(run_dir, state["inherit_weights"], ModelClass, model_kwargs, train_loader, val_loader, NUM_CLASSES, empirical_alpha, global_gdl, DEVICE, cfg['hpo'])
         with open(os.path.join(run_dir, "results.json"), 'w') as f: json.dump({"phase": phase, "best_mIoU": score}, f)
         return
     elif phase == "export":
@@ -467,7 +483,7 @@ def main():
             for param in model.parameters():
                 param.requires_grad = True
 
-    optimizer = build_llrd_optimizer(model, lr, weight_decay, cfg.get('llrd_decay', 0.85), phase)
+    optimizer = build_llrd_optimizer(model, lr, weight_decay, ablation_cfg.get('llrd_decay', cfg.get('llrd_decay', 0.85)), phase)
     scaler = GradScaler('cuda', enabled=True)
     
     criterion = AlphaBalancedFocalGDLLoss(
@@ -480,6 +496,14 @@ def main():
     
     writer = SummaryWriter(log_dir=os.path.join(run_dir, "logs"))
     writer.add_text("Configuration/Hyperparameters", json.dumps(active_hparams, indent=4), 0)
+    
+    print("\n" + "="*80)
+    print(f"📈 [MONITOR CURRENT PHASE] To track this specific {phase} phase, run:")
+    print(f"    tensorboard --logdir {os.path.join(run_dir, 'logs')}")
+    print(f"🌐 [MONITOR FULL PIPELINE] To track all architectures concurrently, run:")
+    print(f"    tensorboard --logdir {os.path.dirname(os.path.dirname(run_dir))}")
+    print("="*80 + "\n")
+    
     cam_extractor = SegmentationGradCAM(model, model.decode_head.linear_pred)
 
     start_epoch = 0
@@ -538,7 +562,7 @@ def main():
         logged_image = False 
         
         with torch.no_grad(): 
-            for batch in eval_loader:
+            for batch in val_loader:
                 x_full, seg_mask = batch['x_full'].to(DEVICE), batch['seg_mask'].to(DEVICE)
                 with autocast('cuda', dtype=torch.bfloat16):
                     pred_seg = model(x_full)
@@ -559,7 +583,7 @@ def main():
                     logged_image = True
         
         avg_val_miou = val_iou.get_miou()
-        writer.add_scalar("Loss/Validation", val_loss / len(eval_loader), epoch)
+        writer.add_scalar("Loss/Validation", val_loss / len(val_loader), epoch)
         writer.add_scalar("Metrics/mIoU_Validation", avg_val_miou, epoch)
         
         if avg_val_miou > state.get("best_miou", 0.0):
@@ -573,8 +597,39 @@ def main():
         }, os.path.join(run_dir, "checkpoint.pt"))
         with open(os.path.join(run_dir, "state.json"), 'w') as f: json.dump(state, f, indent=4)
             
+    # --- BLIND TEST SET EVALUATION ---
+    print("\n[*] Training complete. Loading best weights for Blind Test Set Evaluation...")
+    best_model_path = os.path.join(run_dir, "best_model.pt")
+    if os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path, map_location=DEVICE))
+        
+    model.eval()
+    test_loss = 0.0
+    test_iou = IoUMetric(NUM_CLASSES, DEVICE)
+    
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Testing"):
+            x_full, seg_mask = batch['x_full'].to(DEVICE), batch['seg_mask'].to(DEVICE)
+            with autocast('cuda', dtype=torch.bfloat16):
+                pred_seg = model(x_full)
+                loss = criterion(pred_seg, seg_mask)
+                test_loss += loss.item()
+            test_iou.update(pred_seg, seg_mask)
+            
+    final_test_miou = test_iou.get_miou()
+    final_test_loss = test_loss / len(test_loader)
+    print(f"[*] Final Test mIoU: {final_test_miou:.4f} | Final Test Loss: {final_test_loss:.4f}")
+    
     with open(os.path.join(run_dir, "results.json"), 'w') as f:
-        json.dump({"phase": phase, "hyperparameters": active_hparams, "best_mIoU": state.get("best_miou", 0.0), "final_train_loss": train_loss / len(train_loader), "final_val_loss": val_loss / len(eval_loader)}, f, indent=4)
+        json.dump({
+            "phase": phase, 
+            "hyperparameters": active_hparams, 
+            "best_mIoU": final_test_miou, 
+            "val_mIoU_checkpoint": state.get("best_miou", 0.0),
+            "final_train_loss": train_loss / max(1, len(train_loader)), 
+            "final_val_loss": val_loss / max(1, len(val_loader)),
+            "test_loss": final_test_loss
+        }, f, indent=4)
 
 if __name__ == '__main__':
     main()
