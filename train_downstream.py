@@ -77,7 +77,10 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
         valid_mask = (targets != self.ignore_index) & (~illegal_mask)
         alpha_t = torch.ones_like(targets, dtype=torch.float32)
         safe_targets = torch.clamp(targets, min=0, max=self.num_classes - 1)
-        alpha_t[valid_mask] = self.alpha[safe_targets[valid_mask]]
+        
+        # PATCH: Guard against empty tensor advanced indexing on fully unannotated batches
+        if valid_mask.any():
+            alpha_t[valid_mask] = self.alpha[safe_targets[valid_mask]]
         
         focal_loss = (alpha_t * (1 - pt) ** self.gamma * ce_loss).mean()
 
@@ -252,7 +255,7 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
         model = ModelClass(**model_kwargs).to(device)
         if inherit_weights and os.path.exists(inherit_weights): model.load_state_dict(torch.load(inherit_weights))
         
-        # PATCH 3: Enforce frozen foundation during HPO sweep to prevent erroneous hyperparameter logic
+        # Enforce frozen foundation during HPO sweep to prevent erroneous hyperparameter logic
         for param in model.context_encoder.parameters():
             param.requires_grad = False
         
@@ -272,7 +275,7 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
             for batch in train_loader:
                 x_full, seg_mask = batch['x_full'].to(device), batch['seg_mask'].to(device)
                 
-                # PATCH 1: Z-Score Reversal (Physical Domain Recovery)
+                # Z-Score Reversal (Physical Domain Recovery)
                 x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
                 x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
                 
@@ -300,7 +303,6 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
                 for batch in val_loader:
                     x_full, seg_mask = batch['x_full'].to(device), batch['seg_mask'].to(device)
                     
-                    # PATCH 1: Z-Score Reversal (Physical Domain Recovery)
                     x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
                     x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
                     
@@ -310,7 +312,6 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
             score = val_iou.get_miou()
             if score > best_miou: 
                 best_miou = score
-                # Explicitly save the absolute best weights found during the sweep
                 torch.save(model.state_dict(), os.path.join(run_dir, "best_model.pt"))
             trial.report(score, epoch)
             if trial.should_prune(): raise optuna.exceptions.TrialPruned()
@@ -425,7 +426,7 @@ def main():
         "num_classes": NUM_CLASSES,
         "backbone_name": cfg['backbone'],
         "isolated_stem": ablation_cfg.get('enable_modality_isolation', True),
-        "enable_dirac": ablation_cfg.get('enable_dirac', True), # PATCH: Extract and route flag
+        "enable_dirac": ablation_cfg.get('enable_dirac', True),
         "use_lora": use_lora,
         "lora_r": cfg.get('lora', {}).get('r', 8),
         "lora_alpha": cfg.get('lora', {}).get('alpha', 16)
@@ -452,13 +453,11 @@ def main():
     run_dir, phase = state["run_dir"], state["phase"]
 
     if phase == "baseline" and not state["is_resume"]:
-        # The weight path inherently uses model.__class__.__name__, safely mapping dynamically
         pt_weights = os.path.join("weights", model.__class__.__name__, dataset_name, trial_name, f"jepa_context_encoder_{cfg['backbone']}.pt")
         if os.path.exists(pt_weights):
             print(f"[*] Injecting Phase 1 MM-JEPA Foundation Weights: {pt_weights}")
             torch.nn.Module.load_state_dict(model.context_encoder, torch.load(pt_weights), strict=False)
 
-    # PATCH 2: Hero Phase Catastrophic Shattering Fix
     # Enforce strict freezing for all foundational phases prior to microtune
     if phase in ["baseline", "hpo", "hero"]:
         print(f"[*] Enforcing frozen foundation for phase: {phase}")
@@ -466,7 +465,6 @@ def main():
             param.requires_grad = False
 
     if phase == "hpo":
-        # Pass the dynamic ModelClass to the Optuna search
         score = run_hpo_phase(run_dir, state["inherit_weights"], ModelClass, model_kwargs, train_loader, val_loader, NUM_CLASSES, empirical_alpha, global_gdl, DEVICE, cfg['hpo'])
         with open(os.path.join(run_dir, "results.json"), 'w') as f: json.dump({"phase": phase, "best_mIoU": score}, f)
         return
@@ -532,7 +530,6 @@ def main():
     
     cam_extractor = SegmentationGradCAM(model, model.decode_head.linear_pred)
 
-    # Extract statistical cache parameters to safely un-normalize physical priors
     d_mean, d_std = train_dataset.mean[3], train_dataset.std[3]
     t_mean, t_std = train_dataset.mean[4], train_dataset.std[4]
 
@@ -557,7 +554,6 @@ def main():
         for batch in loop:
             x_full, seg_mask = batch['x_full'].to(DEVICE), batch['seg_mask'].to(DEVICE)
             
-            # PATCH 1: Z-Score Reversal (Physical Domain Recovery)
             x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
             x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
             
@@ -600,7 +596,6 @@ def main():
             for batch in val_loader:
                 x_full, seg_mask = batch['x_full'].to(DEVICE), batch['seg_mask'].to(DEVICE)
                 
-                # PATCH 1: Z-Score Reversal (Physical Domain Recovery)
                 x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
                 x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
                 
@@ -617,8 +612,6 @@ def main():
                     rgb_vis = (rgb_vis - rgb_vis.min()) / (rgb_vis.max() - rgb_vis.min() + 1e-8)
                     heatmap_resized = cv2.resize(heatmap, (rgb_vis.shape[1], rgb_vis.shape[0]))
                     
-                    # --- NaN GUARD INJECTION ---
-                    # Sanitizes the extracted heatmap to prevent numpy cv2.applyColorMap casting exceptions
                     heatmap_resized = np.nan_to_num(heatmap_resized, nan=0.0)
                     
                     heatmap_color = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
@@ -642,7 +635,6 @@ def main():
         }, os.path.join(run_dir, "checkpoint.pt"))
         with open(os.path.join(run_dir, "state.json"), 'w') as f: json.dump(state, f, indent=4)
             
-    # --- BLIND TEST SET EVALUATION ---
     print("\n[*] Training complete. Loading best weights for Blind Test Set Evaluation...")
     best_model_path = os.path.join(run_dir, "best_model.pt")
     if os.path.exists(best_model_path):
@@ -656,7 +648,6 @@ def main():
         for batch in tqdm(test_loader, desc="Testing"):
             x_full, seg_mask = batch['x_full'].to(DEVICE), batch['seg_mask'].to(DEVICE)
             
-            # PATCH 1: Z-Score Reversal (Physical Domain Recovery)
             x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
             x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
             
