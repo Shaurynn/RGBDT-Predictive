@@ -94,7 +94,7 @@ def identify_optimal_backbone(dataset_name, backbones, seeds, model_name="TMLPN_
     best performing architecture based on mean mIoU, dynamically routing the pipeline.
     """
     print("\n" + "="*70)
-    print(f"投 AUTO-EVALUATING BASELINES FOR OPTIMAL BACKBONE SELECTION ({model_name})")
+    print(f"⚙️ AUTO-EVALUATING BASELINES FOR OPTIMAL BACKBONE SELECTION ({model_name})")
     print("="*70)
     
     best_backbone = backbones[0]
@@ -150,6 +150,7 @@ def run_pipeline(dataset_name, backbones, model_name="TMLPN_Downstream_v3"):
     
     academic_seeds = [42, 1024, 2048, 4096, 8192] 
     
+    # PATCH: Added dynamic capacity constraints to the optimal baseline configuration
     control_optimal = {
         "enable_modality_isolation": True,
         "variance_type": "spatial",
@@ -160,13 +161,15 @@ def run_pipeline(dataset_name, backbones, model_name="TMLPN_Downstream_v3"):
         "enable_context_consistency": True,
         "use_lora": True,               
         "llrd_decay": 0.85,
-        "enable_dirac": True
+        "enable_dirac": True,
+        "dynamic_lora_rank": True,
+        "adaptive_llrd_decay": True
     }
 
     ablation_matrix = {
         "Control_Optimal": control_optimal,
         "Ablation_NaiveFusion": {**control_optimal, "enable_modality_isolation": False},
-        "Ablation_NoDirac": {**control_optimal, "enable_dirac": False}, # Added Dirac Isolation Evaluation
+        "Ablation_NoDirac": {**control_optimal, "enable_dirac": False},
         "Ablation_BatchVariance": {**control_optimal, "variance_type": "batch"},
         "Ablation_NoVariance": {**control_optimal, "variance_type": "none"}, 
         "Ablation_NoKD": {**control_optimal, "enable_kd": False},            
@@ -185,7 +188,7 @@ def run_pipeline(dataset_name, backbones, model_name="TMLPN_Downstream_v3"):
                 trial_name = f"baseline_seed{seed}"
                 
                 print("\n" + "="*70)
-                print(f"噫 INITIATING CYCLE: Backbone [{backbone}] | Seed: {seed}")
+                print(f"⚙️ INITIATING CYCLE: Backbone [{backbone}] | Seed: {seed}")
                 print("="*70)
                 
                 inject_configuration(config_path, backbone, control_optimal, trial_name=trial_name, seed=seed, model_name=model_name)
@@ -211,7 +214,7 @@ def run_pipeline(dataset_name, backbones, model_name="TMLPN_Downstream_v3"):
 
         # --- PART 2: ABLATION STUDIES ---
         print("\n" + "="*70)
-        print(f"溌 INITIATING PART 2: ABLATION STUDIES (Target: {optimal_backbone} | N=5)")
+        print(f"⚙️ INITIATING PART 2: ABLATION STUDIES (Target: {optimal_backbone} | N=5)")
         print("="*70)
 
         for seed in academic_seeds:
@@ -249,11 +252,15 @@ def run_pipeline(dataset_name, backbones, model_name="TMLPN_Downstream_v3"):
             # 3. LoRA Rank Sensitivity Analysis
             "LoRA_Rank_4": {**control_optimal, "use_lora": True, "lora_r": 4},
             "LoRA_Rank_16": {**control_optimal, "use_lora": True, "lora_r": 16},
-            "LoRA_Rank_32": {**control_optimal, "use_lora": True, "lora_r": 32}
+            "LoRA_Rank_32": {**control_optimal, "use_lora": True, "lora_r": 32},
+            
+            # 4. PATCH: Structural Capacity Safeguard Efficacy Ablations
+            "Ablation_NoDynamicLoRA": {**control_optimal, "dynamic_lora_rank": False},
+            "Ablation_NoAdaptiveLLRD": {**control_optimal, "adaptive_llrd_decay": False}
         }
         
         print("\n" + "="*70)
-        print(f"ｧｬ INITIATING PART 3: V3 COMPONENT ISOLATION (Target: {optimal_backbone} | N=5)")
+        print(f"⚙️ INITIATING PART 3: V3 COMPONENT ISOLATION (Target: {optimal_backbone} | N=5)")
         print("="*70)
         
         for seed in academic_seeds:

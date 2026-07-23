@@ -178,11 +178,8 @@ The TMLPN_v3 pipeline represents a comprehensive overhaul of the data ingestion 
 ### 7.1 Modality-Decoupled Physical Calibration
 
 In prior iterations, geometric depth and thermal intensities shared bundled affine scaling parameters. This design was physically contradictory. Depth values represent scale-invariant distance measurements, whereas thermal tensors represent temperature-dependent radiometric variances [20]. TMLPN_v3 physically isolates these priors at the tensor level (`depth_scale` and `therm_scale`), allowing the network to empirically learn independent calibration mappings:
-* **Scale-Invariant Depth:** Depth matrices are normalized by their spatial mean prior to calibration, ensuring the network penalizes geometric structural differences rather than absolute global distances [20].
-* **Radiometrically Bounded Thermal:** The thermal scaling factor is heavily bounded to prevent the network from incorrectly memorizing ambient factory temperature drift instead of physical anomalies [20].
-
-### 7.1.1 Dirac Initialization Isolation (`enable_dirac`)
-To rigorously distinguish whether performance gains stem from modality isolation per se or the specific Dirac delta initialization of the $1 \times 1$ alignment projection, the `ModalityIsolatedPatchEmbed` module incorporates an explicit `enable_dirac` boolean flag. Disabling this flag via configuration overrides replaces the Dirac identity initialization with standard Kaiming initialization while retaining the dual-stem modality separation, enabling precise isolation of initialization effects.
+* **Scale-Invariant Depth:** Depth matrices are normalized by their spatial mean prior to calibration, ensuring the network penalizes geometric structural differences rather than absolute global distances.
+* **Radiometrically Bounded Thermal:** The thermal scaling factor is heavily bounded to prevent the network from incorrectly memorizing ambient factory temperature drift instead of physical anomalies.
 
 ### 7.2 Fortified Pre-Training Objective
 
@@ -190,11 +187,33 @@ Relying exclusively on an Exponential Moving Average (EMA) teacher network [11] 
 1. **Context Consistency Restoration:** The objective was updated to compute Mean Squared Error explicitly on the *unmasked* spatial coordinates. This physically anchors the context encoder, preventing the network from allowing unmasked geometry to drift into a degenerate, low-rank manifold [2].
 2. **Covariance Penalty (VICReg-Inspired):** To actively immunize the network against dimensional collapse, a covariance penalty was injected into the objective. By calculating the covariance matrix of the channel embeddings and explicitly penalizing the off-diagonal correlations, the network is forced to utilize its entire representational capacity to map orthogonal, independent features [12].
 
+---
+
 ### 7.3 Multimodal Data Augmentation & Precision
 
-The `JEPAPretrainDataset` engine was structurally rewritten to prevent PyTorch/OpenCV garbage collection memory spikes, ensuring scalable execution on datasets exceeding 10,000 samples. Furthermore, statistical caches were transitioned to IEEE 64-bit float PyTorch binaries (`.pt`), eliminating the numerical precision loss previously caused by standard JSON serialization.
+Crucially, TMLPN_v3 introduces physically-aware Multimodal Data Augmentation. To preserve alignment integrity, radiometric augmentations (brightness, contrast, hue, and saturation jitter) are strictly isolated to the RGB manifold. This simulates factory ambient lighting variance while permanently protecting the absolute physical measurement metrics inherent to the Depth and Thermal modalities.
 
-Crucially, TMLPN_v3 introduces physically-aware Multimodal Data Augmentation. To preserve alignment integrity, radiometric augmentations (brightness, contrast, hue, and saturation jitter) are strictly isolated to the RGB manifold. This simulates factory ambient lighting variance while permanently protecting the absolute physical measurement metrics inherent to the Depth and Thermal modalities. Furthermore, spatial geometry augmentations (horizontal/vertical individual strip flips) are strictly applied to individual camera strips during the initial ingestion phase to accurately simulate physical post-installation lane adjustments. Global spatial tensor flips are explicitly omitted from the dataloader to prevent the generation of physically impossible structural layouts on the final composite manifold.
+* **Eradication of the Vertical Flip:** All top-to-bottom spatial mirroring operations were permanently removed from the data ingestion logic. Because the dataset evaluates gravity-bound objects on flat surfaces, a vertical flip artificially inverts gravity, creating physically impossible orientations and shadow mappings. Data augmentations must accurately simulate real-world physical variability to ensure valid out-of-distribution generalization.
+* **Horizontal Strip Flipping:** Horizontal spatial geometry augmentations are strictly applied to individual camera strips during the initial ingestion phase to accurately simulate physical post-installation lane adjustments. Global spatial tensor flips are explicitly omitted from the dataloader to prevent the generation of physically impossible structural layouts on the final composite manifold.
+* **Z-Axis Planar Rotation:** To recover the regularization density lost by the removal of the vertical flip, a continuous physical rotation bounded between -15° and +15° was introduced. This utilizes bilinear interpolation for the image tensors and nearest-neighbor interpolation for the discrete semantic masks. This simulates natural variance (e.g., an object placed slightly askew) while strictly adhering to real-world physical boundaries.
+
+### 7.4 Downstream Optimization and Architectural Safeguards
+
+To secure the robustness of the fine-tuning phase and prevent gradient shattering across high-capacity backbones, the pipeline enforces strict downstream optimization safeguards:
+
+* **Gradient Accumulation:** Loss evaluation is divided by the number of accumulation steps, and optimizer updates are deferred to aggregate gradients over sequential micro-batches. This simulates a larger overall batch size to maintain stable optimization under strict hardware memory limits, yielding more accurate gradient estimates and reducing variance [29].
+* **Metric-Bound Early Stopping:** A patience tracking mechanism halts training if the validation mIoU fails to improve. This acts as an implicit form of structural regularization, restricting the hypothesis space to the point of highest validation accuracy and preventing the network from memorizing training set artifacts [30].
+* **Constrained Focal Loss Boundaries:** The Hyperparameter Optimization (HPO) search space for the gamma parameter is strictly bound between 1.0 and 2.5. Restricting this parameter prevents the Optuna engine from suggesting boundary values that cause highly volatile, steep gradients, ensuring the network effectively down-weights well-classified examples without numeric instability [13].
+* **Adaptive Capacity Scaling:** The LoRA rank and alpha are halved, and a steeper Layer-Wise Learning Rate Decay (LLRD) is applied for high-capacity backbones (`mit_b3` and `mit_b4`). Lowering the intrinsic matrix rank dynamically limits the trainable parameter space, which restricts the model from dedicating parameters to noise memorization [25], while steeper LLRD stabilizes fine-tuning by heavily penalizing the variance of the top layers [27].
+* **Defensive Boundary Constraints in LoRA:** Programmatic guardrails ensure the rank dimensionality remains strictly positive prior to execution. This protects the network from crashing or collapsing into an invalid mathematical state if dynamic ablation operations scale the rank down too aggressively [25].
+
+### 7.5 Test-Time Augmentation (TTA)
+
+To accurately measure the peak generalization limits of the TMLPN pipeline without structurally altering the trained weights, the final evaluation stage integrates a custom Test-Time Augmentation suite:
+
+* **Physically Valid Multi-View Aggregation:** A customized dataset wrapper yields a 4-view mini-batch (Base, H-Flip, +15° Rotation, -15° Rotation) per physical sample during the final blind test loop.
+* **Inverse Transformation and Averaging:** The predicted logits for the augmented views are geometrically inverted using bilinear interpolation to prevent spatial tearing and discrete label hallucination. The aligned logits are then averaged to produce a highly stabilized final prediction.
+* **Metric Maximization & Boundary Smoothing:** Aggregating multi-view predictions acts as an ensemble method for a single network, natively reducing high-frequency noise and boundary flickering at the pixel edges [31]. This maximizes final performance metrics on the blind test set by exploiting the network's equivariance properties, achieving maximum stability without requiring an expansion of the primary ablation matrix [31].
 
 ---
 
@@ -221,12 +240,9 @@ The Benjamini-Hochberg FDR was explicitly chosen over the standard Bonferroni co
 
 To rigorously attribute exactly which architectural upgrades definitively prevented catastrophic gradient shattering, the automated pipeline extracts the overall optimal performing backbone and executes a targeted Component Isolation matrix (N=5 seeds per variant). This ensures empirical validation on whether these strategies are individually necessary or if they rely on synergistic interactions to prevent collapse:
 
-* **Without LoRA (`Ablation_NoLoRA`):** Fully unfreezes the $N \times N$ network weights to prove whether allowing unbounded gradient flows natively overwrites the generalized multimodal representations [25].
-* **Without LLRD (`Ablation_NoLLRD`):** Overrides the hierarchical optimization by applying a flat learning rate multiplier of 1.0 across all layers to measure the impact of uniform tuning [27].
-* **Without Feature-Level KD (`Ablation_NoFeatureKD`):** Severs the student-teacher MSE spatial alignment constraint, forcing the isolated student backbone to train strictly on the supervised downstream semantic segmentation labels [26].
-* **Without Dirac Initialization (`Ablation_NoDirac`):** Evaluates performance when modality isolation is active but the Dirac projection initialization is replaced by standard Kaiming initialization.
-* **Combinatorial Synergy Trials (`Ablation_NoLoRA_NoLLRD`, `Ablation_Vanilla_V1`):** Multi-component combination tests that evaluate whether anti-collapse mechanisms act synergistically to completely eliminate catastrophic gradient shattering during downstream unfreezing.
-* **LoRA Rank Sensitivity Analysis (`LoRA_Rank_4`, `LoRA_Rank_16`, `LoRA_Rank_32`):** Sweeps adapter capacity across the frozen MiT backbone to determine the optimal trade-off between task-bending flexibility and parameter overhead [25].
+* **Without LoRA (`Ablation_NoLoRA`):** Fully unfreezes the $N \times N$ network weights to prove whether allowing unbounded gradient flows natively overwrites the generalized multimodal representations.
+* **Without LLRD (`Ablation_NoLLRD`):** Overrides the hierarchical optimization by applying a flat learning rate multiplier of 1.0 across all layers to measure the impact of uniform tuning.
+* **Without Feature-Level KD (`Ablation_NoFeatureKD`):** Severs the student-teacher MSE spatial alignment constraint, forcing the isolated student backbone to train strictly on the supervised downstream semantic segmentation labels.
 * **Without Context / Covariance:** Validates the efficacy of the newly fortified Phase 1 objective by selectively disabling the unmasked MSE [2] and VICReg mathematical penalties [12].
 
 ---
@@ -239,7 +255,7 @@ To ensure explainability is preserved during deployment, Segmentation Grad-CAM h
 
 > ![V2 GradCAM Explainability](assets/v2_Gradcam_mit_b2_b3.png)
 >
-> **Figure 8: Segmentation Grad-CAM Defect Focus.** Explanability heatmaps tracking visual attention across the Baseline, Hero, and Microtune phases [23]. The spatial attention confirms the network successfully localizes on physical anomalies rather than overfitting to background noise or uniform artifacting [23].
+> **Figure 8: Segmentation Grad-CAM Defect Focus.** Explanability heatmaps tracking visual attention across the Baseline, Hero, and Microtune phases. The spatial attention confirms the network successfully localizes on physical anomalies rather than overfitting to background noise or uniform artifacting.
 
 ---
 
@@ -247,8 +263,8 @@ To ensure explainability is preserved during deployment, Segmentation Grad-CAM h
 
 To fully complete our evaluation suite and validate its utility in physical infrastructure settings, our future work is explicitly outlined below:
 
-1. **SOTA Empirical Benchmarking:** Execute direct, head-to-head architectural comparisons against SFDFNet [18] and leading RGB-D-T semantic segmentation baselines. This future evaluation will strictly utilize the locked dataset splits and identical Benjamini-Hochberg multi-seed correction framework to secure fair statistical validity [24].
-2. **Edge Deployment Validation (FPS):** While cross-platform compilation logic is confirmed, completing formal edge deployment validation remains outstanding. Physical benchmarking will evaluate execution latency, specifically reporting the absolute Frames Per Second (FPS) achievable via our generated TensorRT engine directly on Jetson Orin Nano and Orange Pi 5 edge endpoints [20].
+1. **SOTA Empirical Benchmarking:** Execute direct, head-to-head architectural comparisons against SFDFNet and leading RGB-D-T semantic segmentation baselines. This future evaluation will strictly utilize the locked dataset splits and identical Benjamini-Hochberg multi-seed correction framework to secure fair statistical validity.
+2. **Edge Deployment Validation (FPS):** While cross-platform compilation logic is confirmed, completing formal edge deployment validation remains outstanding. Physical benchmarking will evaluate execution latency, specifically reporting the absolute Frames Per Second (FPS) achievable via our generated TensorRT engine directly on Jetson Orin Nano and Orange Pi 5 edge endpoints.
 
 ---
 
@@ -308,20 +324,28 @@ To fully complete our evaluation suite and validate its utility in physical infr
 
 [27] Clark, K., Luong, M. T., Le, Q. V., & Manning, C. D. (2020). ELECTRA: Pre-training Text Encoders as Discriminators Rather Than Generators. *ICLR*.
 
+[28] Shorten, C., & Khoshgoftaar, T. M. (2019). A survey on Image Data Augmentation for Deep Learning. *Journal of Big Data*, 6(1), 1-48.
+
+[29] Goyal, P., Dollár, P., Girshick, R., Noordhuis, P., Wesolowski, L., Kyrola, A., ... & He, K. (2017). Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour. *arXiv preprint arXiv:1706.02677*.
+
+[30] Prechelt, L. (1998). Early Stopping - But When?. In *Neural Networks: Tricks of the Trade* (pp. 55-69). Springer, Berlin, Heidelberg.
+
+[31] Shanmugam, D., Blalock, Davis., Balakrishnan, Guha., & Guttag, John. (2020). Better Aggregation in Test-Time Augmentation. *ICCV*.
+
 ---
 
 ## 🙏 Acknowledgments & Citations
 
-This project would not be possible without the MM5 Dataset [20, 21]. We sincerely thank the original creators and authors for their foundational work in multi-modal data collection, hardware synchronization, and curation, which enabled the training and evaluation of this architecture [20, 21].
+This project would not be possible without the MM5 Dataset. We sincerely thank the original creators and authors for their foundational work in multi-modal data collection, hardware synchronization, and curation, which enabled the training and evaluation of this architecture.
 
 If you utilize this pipeline, the underlying architecture, or the data, please cite the primary publication alongside the dataset repository:
 
 **Primary Publication:**
 
-> Brenner, M., Reyes, N. H., Susnjak, T., & Barczak, A. L. C. (2026). MM5: Multimodal image capture and dataset generation for RGB, depth, thermal, UV, and NIR. Information Fusion, 126, 103516. [20]
-> DOI: [https://doi.org/10.1016/j.inffus.2025.103516](https://doi.org/10.1016/j.inffus.2025.103516) [20]
+> Brenner, M., Reyes, N. H., Susnjak, T., & Barczak, A. L. C. (2026). MM5: Multimodal image capture and dataset generation for RGB, depth, thermal, UV, and NIR. Information Fusion, 126, 103516.
+> DOI: [https://doi.org/10.1016/j.inffus.2025.103516](https://doi.org/10.1016/j.inffus.2025.103516)
 
 **Dataset:**
 
-> Brenner, M., Reyes, N., Susnjak, T., & Barczak, A. (2025). MM5: Multimodal Image Dataset. figshare. Dataset. [21]
-> DOI: [https://doi.org/10.6084/m9.figshare.28722164](https://www.google.com/search?q=https://doi.org/10.6084/m9.figshare.28722164) [21]
+> Brenner, M., Reyes, N., Susnjak, T., & Barczak, A. (2025). MM5: Multimodal Image Dataset. figshare. Dataset.
+> DOI: [https://doi.org/10.6084/m9.figshare.28722164](https://www.google.com/search?q=https://doi.org/10.6084/m9.figshare.28722164)

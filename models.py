@@ -149,6 +149,11 @@ class LoRALinear(nn.Module):
     """Wraps an existing nn.Linear layer to inject low-rank adaptation matrices A and B."""
     def __init__(self, original_layer, r=8, alpha=16):
         super().__init__()
+        
+        # PATCH: Defensive boundary constraint to protect against dynamic ablation down-scaling
+        if r <= 0:
+            raise ValueError(f"[-] CRITICAL: LoRA rank 'r' must be strictly positive. Received scaling value: {r}")
+            
         self.original_layer = original_layer
         self.r = r
         self.alpha = alpha
