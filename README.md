@@ -8,7 +8,7 @@ Structural defect detection in industrial environments necessitates the robust i
 
 ## 1. Introduction
 
-The integration of high-resolution, unaligned multimodal sensors provides critical advantages in structural defect and anomaly detection [20]. Deploying continuous multi-channel arrays—specifically those originating from 16-bit Baumer GigE industrial sensors—onto edge compute modules necessitates strict algorithmic efficiency [20].
+The integration of high-resolution, unaligned multimodal sensors provides critical advantages in structural defect and anomaly detection [20]. Deploying continuous multi-channel arrays—specifically those originating from the Nuwa-HP60C-Depth-Camera and 640x512 LWIR Vanadium Oxide thermal sensors—onto edge compute modules necessitates strict algorithmic efficiency [20].
 
 Early iterations of multimodal learning utilized generative pixel-space decoders [1]. However, reconstructing pixel-space values forces the network to map irrelevant high-frequency radiometric noise, wasting representational capacity [1]. To address this, we transitioned to Latent Space Prediction, building upon recent advancements in self-supervised architectures [2]. This repository executes genuine target-selective spatial inference via an empirically rigorous two-phase pipeline [2, 10].
 
@@ -18,7 +18,7 @@ Recent literature highlights Multimodal JEPA (MuMo-JEPA) architectures, which re
 
 1. **Memory-Bandwidth Bottlenecks:** Holding multiple independent ViT trunks in VRAM violates the shared-memory and bandwidth constraints of edge devices, as standard non-hierarchical Transformers incur prohibitive parameter counts and memory access costs during inference [19].
 2. **Quadratic Scaling:** Standard self-attention mechanisms scale with $O(N^2)$ complexity relative to spatial resolution, prohibiting real-time inference on high-resolution industrial image strips [4].
-3. **Hardware-Aware Early Fusion:** TMLPN utilizes a single hierarchical MiT trunk with a structurally isolated modality stem [10]. The MiT sequence reduction process ensures linear $O(N)$ computational scaling [10], while our Dirac-initialized $1 \times 1$ projections neutralize the latent alignment flaws typically associated with simplistic early fusion [5, 7].
+3. **Hardware-Aware Early Fusion:** TMLPN utilizes a single hierarchical MiT trunk with a structurally isolated modality stem [10]. The MiT sequence reduction process ensures linear $O(N)$ computational scaling [10], while our Dirac-initialized 1x1 projections neutralize the latent alignment flaws typically associated with simplistic early fusion [5, 7].
 
 ---
 
@@ -28,7 +28,7 @@ To ensure strict academic reproducibility of our evaluation benchmarks, all arti
 
 * **Pre-Trained Weights:** Converged `best_model.pt` checkpoints will be provided for identical inference replication [24].
 * **Dataset Splits & Blind Testing:** Exact training and evaluation subsets are mapped via CSV data splits (`data/splits/`) to eliminate distribution variance [21]. To correct statistical inference and address validation leakage, the framework employs a strictly separated blind test set. The original evaluation pool is programmatically split into a 50% validation set (used strictly for hyperparameter sweep monitoring and early stopping) and a 50% test set reserved exclusively for the final gradient-free metrics generation.
-* **Deterministic Execution & Multi-Seed Verification:** The execution engines utilize strict environmental locking (`seed=42`) across PyTorch, NumPy, and CUDA backends to eliminate stochastic gradient variance [24]. To definitively eliminate single-run optimistic bias, all main architectural baselines and ablation experiments output multi-seed main results (N=5) to capture the true Mean mIoU $\pm$ Standard Deviation.
+* **Deterministic Execution & Multi-Seed Verification:** The execution engines utilize strict environmental locking (`seed=42`) across PyTorch, NumPy, and CUDA backends to eliminate stochastic gradient variance [24]. To definitively eliminate single-run optimistic bias, all main architectural baselines and ablation experiments output multi-seed main results (N=5) to capture the true Mean mIoU ± Standard Deviation.
 
 ---
 
@@ -42,7 +42,7 @@ Initializing a multi-channel stream directly from 3-channel weights introduces s
 
 * **RGB Stream:** Inherits pristine, unmodified 3-channel ImageNet kernels to leverage generalized edge-detection priors [22].
 * **D+T Stream:** Utilizes independent, Kaiming-initialized convolutions to prevent early-epoch activation vanishing in the high-variance depth and thermal tensors [6].
-* **1x1 Dirac Alignment:** To bridge this dimensional gap prior to additive fusion, TMLPN utilizes a $1 \times 1$ convolutional projection initialized via a Dirac delta distribution [7]: 
+* **1x1 Dirac Alignment:** To bridge this dimensional gap prior to additive fusion, TMLPN utilizes a 1x1 convolutional projection initialized via a Dirac delta distribution [7]: 
 
 $$ W_{i,j,k,l} = \begin{cases} 1 & \text{if } i=j \text{ and } k,l \text{ are the center} \\ 0 & \text{otherwise} \end{cases} $$
 
@@ -55,7 +55,7 @@ To satisfy the theoretical mandates of latent prediction, the network executes t
 * **Token Replacement Masking:** Masked spatial coordinates are explicitly replaced with a broadcasted, learnable parameter (`encoder_mask_token`), aligning with proven masked image modeling protocols [1, 9].
 * **Multi-Block Strategy:** The architecture samples 4 independent overlapping target blocks with varying scales (0.15–0.20) and aspect ratios (0.75–1.5) [2].
 * **Target-Conditioned Spatial Predictor:** Pure 2D Positional Encodings are concatenated *only* alongside the context feature map and target mask within the depthwise-separable predictor, ensuring the network knows exactly *where* to predict [10].
-* **EMA Cosine Annealing & Gradient Isolation:** Target network outputs are severed from the computational graph, updated strictly via a Cosine Annealing Exponential Moving Average (EMA) schedule from $0.996$ to $1.0$ to combat representation collapse [11].
+* **EMA Cosine Annealing & Gradient Isolation:** Target network outputs are severed from the computational graph, updated strictly via a Cosine Annealing Exponential Moving Average (EMA) schedule from 0.996 to 1.0 to combat representation collapse [11].
 
 ---
 
@@ -65,13 +65,13 @@ Phase 2 transfers the pre-trained Context Encoder to the downstream task of sema
 
 ### 4.1 The Multi-Scale All-MLP Decoder
 
-Heavy transposed convolution decoders violate the latency constraints required for real-time edge processing [19]. TMLPN synthesizes sub-pixel spatial boundaries using an All-MLP Decoder [10]. **Batch Normalization within the SegFormer decoder was substituted with Layer Normalization to maintain activation stability under bounded hardware batch constraints (N=6).** By projecting the $1/4$, $1/8$, $1/16$, and $1/32$ hierarchical feature grids to a unified embedding dimension, applying LayerNorms, upsampling exclusively to a common $1/4$ resolution, and concatenating them, the network achieves boundary delineation while maintaining an edge-compliant footprint [10].
+Heavy transposed convolution decoders violate the latency constraints required for real-time edge processing [19]. TMLPN synthesizes sub-pixel spatial boundaries using an All-MLP Decoder [10]. **Batch Normalization within the SegFormer decoder was substituted with Layer Normalization to maintain activation stability under bounded hardware batch constraints (N=6).** By projecting the 1/4, 1/8, 1/16, and 1/32 hierarchical feature grids to a unified embedding dimension, applying LayerNorms, upsampling exclusively to a common 1/4 resolution, and concatenating them, the network achieves boundary delineation while maintaining an edge-compliant footprint [10].
 
 ### 4.2 Mitigating Imbalance: Alpha-Balanced Focal GDL
 
 Industrial datasets exhibit extreme foreground-background class imbalance [20]. The downstream engine utilizes a rigorous bipartite loss objective:
 
-1. **$\alpha$-Balanced Focal Loss:** Mitigates background dominance by explicitly weighting classes according to their empirical dataset frequencies via Median Frequency Balancing [13].
+1. **Alpha-Balanced Focal Loss:** Mitigates background dominance by explicitly weighting classes according to their empirical dataset frequencies via Median Frequency Balancing [13].
 2. **Global Volume Anchored Generalized Dice Loss (GDL):** TMLPN utilizes *Global Volume Anchoring*, where GDL weights are permanently anchored to the inverse square of the global dataset frequencies [14]. Additive Laplace Smoothing ensures theoretical bounds are naturally constrained by the dataset's native volume [24].
 
 ---
@@ -108,7 +108,7 @@ A rigorous N=5 ablation study isolated the empirical necessity of our initial ar
 >
 > **Figure 3: N=5 Ablation Study Results (V1).** Validated using Welch's t-test for statistical significance against the optimal control.
 
-* **Modality Isolation is Critical:** The `NaiveFusion` ablation collapsed the network to a **0.4476 mIoU** ($p=0.0001$), proving that forcing 3-channel pretrained weights to blindly accept 5-channel unaligned data destroys ImageNet priors. The Dirac-initialized $1 \times 1$ alignment stem is empirically necessary.
+* **Modality Isolation is Critical:** The `NaiveFusion` ablation collapsed the network to a **0.4476 mIoU** ($p=0.0001$), proving that forcing 3-channel pretrained weights to blindly accept 5-channel unaligned data destroys ImageNet priors. The Dirac-initialized 1x1 alignment stem is empirically necessary.
 * **Logit-Level KD is Noisy:** Disabling Knowledge Distillation (`NoKD`) yielded no statistically significant penalty ($p=0.7603$). In dense pixel-prediction tasks, raw logit distributions are highly noisy, meaning traditional KD provided zero measurable gain while doubling VRAM requirements.
 
 ---
@@ -123,7 +123,7 @@ To address the plateau vulnerabilities discovered in the `v1` pipeline, the `v2`
 
 ### 6.1 Low-Rank Adaptation (LoRA)
 
-To completely neutralize gradient shattering during the `microtune` phase, the `v2` pipeline integrates Low-Rank Adaptation (LoRA) [25]. Rather than fully unfreezing the $N \times N$ weight matrices inside the MiT backbone, the foundation remains mathematically locked. We inject tiny, trainable low-rank matrices ($A$ and $B$) specifically into the Query and Value projection layers of the transformer blocks [25]. 
+To completely neutralize gradient shattering during the `microtune` phase, the `v2` pipeline integrates Low-Rank Adaptation (LoRA) [25]. Rather than fully unfreezing the N x N weight matrices inside the MiT backbone, the foundation remains mathematically locked. We inject tiny, trainable low-rank matrices (A and B) specifically into the Query and Value projection layers of the transformer blocks [25]. 
 
 ### 6.2 Layer-Wise Learning Rate Decay (LLRD)
 
@@ -131,7 +131,7 @@ To safely couple the LoRA modules with the high-capacity decoder, we deploy Laye
 
 ### 6.3 Feature-Level Knowledge Distillation
 
-To compress the performant `mit_b5` architecture into an edge-ready `mit_b1` without the noise of logit-level distillation, `v2` upgrades to Feature-Level KD [26]. By $L_2$-normalizing and aligning the intermediate feature grids of the teacher directly with the student via MSE loss, the student mathematically inherits the complex representational structure of the teacher, circumventing spatial boundary noise [26].
+To compress the performant `mit_b5` architecture into an edge-ready `mit_b1` without the noise of logit-level distillation, `v2` upgrades to Feature-Level KD [26]. By L2-normalizing and aligning the intermediate feature grids of the teacher directly with the student via MSE loss, the student mathematically inherits the complex representational structure of the teacher, circumventing spatial boundary noise [26].
 
 ### 6.4 V2 Experimental Results & Scaling Laws
 
@@ -173,7 +173,7 @@ The TMLPN_v3 pipeline represents a comprehensive overhaul of the data ingestion 
 
 > ![v3 Network Architecture Diagram](assets/v3_Network_Architecture_Diagram.png)
 >
-> **Figure 8: The master Tri-Modal Latent Predictive Network (TMLPN_v3) architecture diagram.** Demonstrates the complete V3 pipeline including the configurable $1 \times 1$ alignment stem projection (Dirac / Kaiming Normal), strip-level camera mirroring logic, fortified JEPA pre-training objectives (Context Anchor Loss and VICReg-inspired Covariance Penalty), and Phase 2 LoRA/LLRD fine-tuning with feature-level distillation.
+> **Figure 8: The master Tri-Modal Latent Predictive Network (TMLPN_v3) architecture diagram.** Demonstrates the complete V3 pipeline including the configurable 1x1 alignment stem projection (Dirac / Kaiming Normal), strip-level camera mirroring logic, fortified JEPA pre-training objectives (Context Anchor Loss and VICReg-inspired Covariance Penalty), and Phase 2 LoRA/LLRD fine-tuning with feature-level distillation.
 
 ### 7.1 Modality-Decoupled Physical Calibration
 
@@ -195,7 +195,7 @@ Crucially, TMLPN_v3 introduces physically-aware Multimodal Data Augmentation. To
 
 * **Eradication of the Vertical Flip:** All top-to-bottom spatial mirroring operations were permanently removed from the data ingestion logic. Because the dataset evaluates gravity-bound objects on flat surfaces, a vertical flip artificially inverts gravity, creating physically impossible orientations and shadow mappings. Data augmentations must accurately simulate real-world physical variability to ensure valid out-of-distribution generalization.
 * **Horizontal Strip Flipping:** Horizontal spatial geometry augmentations are strictly applied to individual camera strips during the initial ingestion phase to accurately simulate physical post-installation lane adjustments. Global spatial tensor flips are explicitly omitted from the dataloader to prevent the generation of physically impossible structural layouts on the final composite manifold.
-* **Z-Axis Planar Rotation:** To recover the regularization density lost by the removal of the vertical flip, a continuous physical rotation bounded between -15° and +15° was introduced. This utilizes bilinear interpolation for the image tensors and nearest-neighbor interpolation for the discrete semantic masks. This simulates natural variance (e.g., an object placed slightly askew) while strictly adhering to real-world physical boundaries.
+* **Z-Axis Planar Rotation:** To recover the regularization density lost by the removal of the vertical flip, a continuous physical rotation bounded between -15° and +15° was introduced. To prevent the network from hallucinating non-existent physical boundaries along rotation edges, **split interpolation** is enforced: Bilinear smoothing is applied to the RGB manifold, while Nearest-Neighbor interpolation strictly preserves the absolute scales of the Depth and Thermal tensors. Furthermore, the ground-truth semantic mask explicitly fills empty rotational corners with the ignored index (`255.0`), permanently blinding the objective function to synthetic spatial artifacts.
 
 ### 7.4 Downstream Optimization and Architectural Safeguards
 
@@ -211,9 +211,9 @@ To secure the robustness of the fine-tuning phase and prevent gradient shatterin
 
 To accurately measure the peak generalization limits of the TMLPN pipeline without structurally altering the trained weights, the final evaluation stage integrates a custom Test-Time Augmentation suite:
 
-* **Physically Valid Multi-View Aggregation:** A customized dataset wrapper yields a 4-view mini-batch (Base, H-Flip, +15° Rotation, -15° Rotation) per physical sample during the final blind test loop.
-* **Inverse Transformation and Averaging:** The predicted logits for the augmented views are geometrically inverted using bilinear interpolation to prevent spatial tearing and discrete label hallucination. The aligned logits are then averaged to produce a highly stabilized final prediction.
-* **Metric Maximization & Boundary Smoothing:** Aggregating multi-view predictions acts as an ensemble method for a single network, natively reducing high-frequency noise and boundary flickering at the pixel edges [31]. This maximizes final performance metrics on the blind test set by exploiting the network's equivariance properties, achieving maximum stability without requiring an expansion of the primary ablation matrix [31].
+* **Lossless Multi-View Aggregation:** A customized dataset wrapper yields a strictly 2-view mini-batch (Base View and Horizontally Flipped View) per physical sample during the final blind test loop.
+* **Boundary Dilution Prevention:** Rotational augmentations (e.g., ±15°) were explicitly purged from the TTA ensemble. Rotating dense pixel-space logits injects zero-padded probabilities into the image corners; when mathematically inverted and averaged against the base view, these padding artifacts artificially dilute valid predictions, crashing the final mIoU along the perimeter.
+* **Metric Maximization & Boundary Smoothing:** The predicted logits for the horizontally flipped augmented views are geometrically inverted using bilinear interpolation to prevent spatial tearing. Averaging strictly lossless probability manifolds natively reduces high-frequency noise and boundary flickering at the pixel edges [31]. This maximizes final performance metrics on the blind test set by exploiting the network's equivariance properties, achieving maximum stability without requiring an expansion of the primary ablation matrix [31].
 
 ---
 
@@ -240,7 +240,7 @@ The Benjamini-Hochberg FDR was explicitly chosen over the standard Bonferroni co
 
 To rigorously attribute exactly which architectural upgrades definitively prevented catastrophic gradient shattering, the automated pipeline extracts the overall optimal performing backbone and executes a targeted Component Isolation matrix (N=5 seeds per variant). This ensures empirical validation on whether these strategies are individually necessary or if they rely on synergistic interactions to prevent collapse:
 
-* **Without LoRA (`Ablation_NoLoRA`):** Fully unfreezes the $N \times N$ network weights to prove whether allowing unbounded gradient flows natively overwrites the generalized multimodal representations.
+* **Without LoRA (`Ablation_NoLoRA`):** Fully unfreezes the N x N network weights to prove whether allowing unbounded gradient flows natively overwrites the generalized multimodal representations.
 * **Without LLRD (`Ablation_NoLLRD`):** Overrides the hierarchical optimization by applying a flat learning rate multiplier of 1.0 across all layers to measure the impact of uniform tuning.
 * **Without Feature-Level KD (`Ablation_NoFeatureKD`):** Severs the student-teacher MSE spatial alignment constraint, forcing the isolated student backbone to train strictly on the supervised downstream semantic segmentation labels.
 * **Without Context / Covariance:** Validates the efficacy of the newly fortified Phase 1 objective by selectively disabling the unmasked MSE [2] and VICReg mathematical penalties [12].
