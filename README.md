@@ -96,7 +96,7 @@ As detailed in the experimental results below, architectures such as `mit_b1`, `
 | **TMLPN_v1** | **MiT-b4** | 60.8M | **MM-JEPA** | 0.7896 / 0.7969 | 0.7960 / 0.8014 |
 | **TMLPN_v1** | **MiT-b5** | 81.4M | **MM-JEPA** | 0.7829 / 0.7870 | 0.7827 / 0.7865 |
 
-> ![v1 Phase Progression](assets/v1_phase_progression_trajectory_2.jpg)
+> ![v1 Phase Progression](assets/v1_phase_progression_trajectory.png)
 >
 > **Figure 2: Architecture Progression Trajectory (V1).** Visualizes the performance plateau when the massive multi-scale decoder's gradients clash with the delicate JEPA-pretrained foundation during the Microtune phase.
 
