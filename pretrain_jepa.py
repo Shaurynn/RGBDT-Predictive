@@ -58,10 +58,14 @@ def main():
     variance_type = ablation_cfg.get('variance_type', 'spatial')
     mask_strategy = ablation_cfg.get('mask_strategy', 'multi_block')
     
-    # Extract V3 Fortification Flags
+    # Extract V3 Fortification Flags & Modality Dropout
     enable_context = ablation_cfg.get('enable_context_consistency', True)
     enable_covariance = ablation_cfg.get('enable_covariance_penalty', True)
     enable_dirac = ablation_cfg.get('enable_dirac', True)
+    enable_modality_dropout = ablation_cfg.get('enable_modality_dropout', True)
+    
+    # Route Modality Dropout Probability (Default to 15% if active)
+    modality_dropout_prob = cfg.get('modality_dropout_prob', 0.15) if enable_modality_dropout else 0.0
 
     print("\n" + "="*60)
     print("🔬 ABLATION STATE [PHASE 1: PRE-TRAINING (V3 PHYSICAL PRIORS)]")
@@ -72,6 +76,7 @@ def main():
     print(f"[*] Masking Strategy                   : {mask_strategy.upper()}")
     print(f"[*] Context Consistency Evaluated      : {enable_context}")
     print(f"[*] Covariance Penalty Evaluated       : {enable_covariance}")
+    print(f"[*] Modality Dropout Regularizer       : {enable_modality_dropout} (Rate: {modality_dropout_prob})")
     print("="*60 + "\n")
 
     # --- Agnostic Configuration Routing ---
@@ -82,7 +87,8 @@ def main():
         split="train",
         splits_root=splits_root, 
         image_size=img_size,
-        mask_strategy=mask_strategy
+        mask_strategy=mask_strategy,
+        modality_dropout_prob=modality_dropout_prob
     )
     
     dataloader = DataLoader(
@@ -122,6 +128,12 @@ def main():
             x_full = batch['x_full'].to(DEVICE)
             x_visible = batch['x_visible'].to(DEVICE)
             high_res_mask = batch['mask'].to(DEVICE)
+            
+            # --- DYNAMIC DROPOUT DETECTION ---
+            # Detect exactly which tensors were dropped before un-normalization shifts them to the dataset mean.
+            # Tensors that were dropped via Modality Dropout are exactly 0.0 across all spatial dimensions.
+            valid_depth_mask = ~(x_full[:, 3, :, :] == 0.0).all(dim=1).all(dim=1)
+            valid_therm_mask = ~(x_full[:, 4, :, :] == 0.0).all(dim=1).all(dim=1)
             
             # --- Z-SCORE REVERSAL (PHYSICAL DOMAIN RECOVERY) ---
             # Un-normalize Depth and Thermal manifolds to prevent zero-division explosions 
@@ -163,10 +175,18 @@ def main():
                 calibrated_depth = ((raw_depth / d_mean_tensor) * stem.depth_scale) + stem.depth_bias
                 calibrated_therm = (raw_therm * torch.sigmoid(stem.therm_scale)) + stem.therm_bias
                 
-                # Scale-Invariant Depth Consistency Penalty
-                loss_depth_phys = scale_invariant_depth_loss(calibrated_depth, raw_depth)
-                # Radiometric Thermal Bounded Regularization
-                loss_therm_phys = torch.mean((calibrated_therm - raw_therm) ** 2)
+                # Protect Scale-Invariant Depth Consistency Penalty from corrupted (mean-shifted) dropout tensors
+                if valid_depth_mask.any():
+                    loss_depth_phys = scale_invariant_depth_loss(calibrated_depth[valid_depth_mask], raw_depth[valid_depth_mask])
+                else:
+                    loss_depth_phys = torch.tensor(0.0, device=DEVICE)
+                    
+                # Protect Radiometric Thermal Bounded Regularization
+                if valid_therm_mask.any():
+                    loss_therm_phys = torch.mean((calibrated_therm[valid_therm_mask] - raw_therm[valid_therm_mask]) ** 2)
+                else:
+                    loss_therm_phys = torch.tensor(0.0, device=DEVICE)
+                    
                 loss_physics = 0.05 * (loss_depth_phys + loss_therm_phys)
             else:
                 loss_physics = torch.tensor(0.0, device=DEVICE)

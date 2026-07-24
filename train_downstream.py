@@ -36,16 +36,13 @@ def enforce_reproducibility(seed=42):
 # --- LOSSES & METRICS ---
 # ====================================================================================
 
-# [ALGORITHM COMMENT: Alpha-Balanced Focal Loss & Generalized Dice Loss (GDL)]
-# Implements the rigorously weighted bipartite loss objective designed for extreme foreground-background class imbalance[cite: 4].
-# 1. Focal Loss (Lin et al., 2017) modulates standard cross-entropy by down-weighting well-classified examples via the (1 - pt)^gamma scaling factor[cite: 4].
-# 2. Global Volume Anchored GDL (Sudre et al., 2017) anchors the Dice weights to the inverse square of the global dataset frequencies, ensuring natural theoretical bounds for highly unbalanced industrial segmentations[cite: 4].
 class AlphaBalancedFocalGDLLoss(nn.Module):
-    def __init__(self, num_classes, alpha=None, global_gdl_weights=None, gamma=2.0, dice_weight=1.0, ignore_index=255, eps=1e-6, use_batch_dynamic=False):
+    def __init__(self, num_classes, alpha=None, global_gdl_weights=None, gamma=2.0, dice_weight=1.0, boundary_weight=0.5, ignore_index=255, eps=1e-6, use_batch_dynamic=False):
         super().__init__()
         self.num_classes = num_classes
         self.gamma = gamma
         self.base_dice_weight = dice_weight
+        self.boundary_weight = boundary_weight
         self.ignore_index = ignore_index
         self.eps = eps
         self.use_batch_dynamic = use_batch_dynamic
@@ -65,6 +62,14 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
             if gdl_t.size(0) != num_classes:
                 gdl_t = gdl_t[:num_classes] if gdl_t.size(0) > num_classes else torch.cat([gdl_t, torch.ones(num_classes - gdl_t.size(0))])
             self.register_buffer('gdl_weights', gdl_t)
+
+        self.register_buffer('sobel_weight_x', torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], dtype=torch.float32).view(1, 1, 3, 3).repeat(num_classes, 1, 1, 1))
+        self.register_buffer('sobel_weight_y', torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], dtype=torch.float32).view(1, 1, 3, 3).repeat(num_classes, 1, 1, 1))
+
+    def _compute_edge_map(self, x):
+        grad_x = F.conv2d(x, self.sobel_weight_x, padding=1, groups=self.num_classes)
+        grad_y = F.conv2d(x, self.sobel_weight_y, padding=1, groups=self.num_classes)
+        return torch.sqrt(grad_x ** 2 + grad_y ** 2 + self.eps)
 
     def forward(self, inputs, targets):
         inputs = torch.clamp(inputs.float(), min=-20.0, max=20.0)
@@ -89,19 +94,19 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
         
         focal_loss = (alpha_t * (1 - pt) ** self.gamma * ce_loss).mean()
 
-        valid_inputs = inputs.permute(0, 2, 3, 1)[valid_mask] 
+        inputs_soft = F.softmax(inputs, dim=1)
         valid_targets = targets[valid_mask]                   
         
         if valid_targets.numel() == 0:
             dice_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
         else:
-            inputs_soft = F.softmax(valid_inputs, dim=1)
+            valid_inputs_soft = inputs_soft.permute(0, 2, 3, 1)[valid_mask]
             safe_valid_targets = torch.clamp(valid_targets, min=0, max=self.num_classes - 1)
             targets_one_hot = F.one_hot(safe_valid_targets, num_classes=self.num_classes).float()
             
-            intersection = (inputs_soft * targets_one_hot).sum(dim=0)
+            intersection = (valid_inputs_soft * targets_one_hot).sum(dim=0)
             ground_truth_volume = targets_one_hot.sum(dim=0)
-            pred_volume = inputs_soft.sum(dim=0)
+            pred_volume = valid_inputs_soft.sum(dim=0)
             
             if self.use_batch_dynamic:
                 w = 1.0 / (ground_truth_volume ** 2 + self.eps)
@@ -117,12 +122,22 @@ class AlphaBalancedFocalGDLLoss(nn.Module):
             else:
                 dice_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
 
-        return focal_loss + (self.base_dice_weight * dice_loss)
+        if self.boundary_weight > 0:
+            targets_one_hot_spatial = F.one_hot(safe_targets, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+            ignore_spatial_mask = (targets == self.ignore_index).unsqueeze(1).expand(-1, self.num_classes, -1, -1)
+            targets_one_hot_spatial[ignore_spatial_mask] = 0.0
+            inputs_soft_masked = inputs_soft.clone()
+            inputs_soft_masked[ignore_spatial_mask] = 0.0
+            
+            pred_edges = self._compute_edge_map(inputs_soft_masked)
+            target_edges = self._compute_edge_map(targets_one_hot_spatial)
+            
+            boundary_loss = F.l1_loss(pred_edges, target_edges)
+        else:
+            boundary_loss = torch.tensor(0.0, device=inputs.device)
 
-# [ALGORITHM COMMENT: Feature-Level Knowledge Distillation]
-# Implements the spatial alignment constraint originally derived from FitNets (Romero et al., 2014)[cite: 4].
-# Bypasses the highly noisy logit-level distillation vectors common in pixel-prediction tasks[cite: 4]. 
-# By L2-normalizing and calculating MSE directly on the intermediate feature grids, the student architecture mathematically inherits the complex representational structure of the teacher[cite: 4].
+        return focal_loss + (self.base_dice_weight * dice_loss) + (self.boundary_weight * boundary_loss)
+
 def feature_distillation_loss(student_features, teacher_features):
     loss = 0.0
     valid_stages = 0
@@ -195,9 +210,6 @@ def export_to_onnx(model, weights_path, run_dir, device):
 # --- PIPELINE MANAGEMENT & TRAINING ---
 # ====================================================================================
 
-# [ALGORITHM COMMENT: Layer-Wise Learning Rate Decay (LLRD)]
-# Based on the ELECTRA pre-training methodology (Clark et al., 2020), this algorithm explicitly penalizes the variance of top-level gradients[cite: 4].
-# Gradients flowing deeper into the high-capacity MiT backbone are exponentially decayed (e.g., base_lr * decay_rate^depth), preventing the downstream high-capacity decoder from inducing catastrophic forgetting of the MM-JEPA foundation[cite: 4].
 def build_llrd_optimizer(model, base_lr, weight_decay, decay_rate, phase):
     if phase != "microtune":
         trainable = [p for p in model.parameters() if p.requires_grad]
@@ -275,10 +287,11 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
         gamma_max = cfg_hpo.get('gamma_max', 2.5)
         gamma = trial.suggest_float("gamma", gamma_min, gamma_max)
         dice = trial.suggest_float("dice_weight", 0.5, 2.0)
+        boundary_weight = trial.suggest_float("boundary_weight", 0.1, 1.0)
         
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=wd)
         
-        criterion = AlphaBalancedFocalGDLLoss(num_classes=num_classes, alpha=empirical_alpha, global_gdl_weights=global_gdl, gamma=gamma, dice_weight=dice).to(device)
+        criterion = AlphaBalancedFocalGDLLoss(num_classes=num_classes, alpha=empirical_alpha, global_gdl_weights=global_gdl, gamma=gamma, dice_weight=dice, boundary_weight=boundary_weight).to(device)
         scaler = GradScaler('cuda', enabled=True)
         best_miou = 0.0
         
@@ -288,8 +301,15 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
             for batch_idx, batch in enumerate(train_loader):
                 x_full, seg_mask = batch['x_full'].to(device), batch['seg_mask'].to(device)
                 
-                x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
-                x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
+                # INJECTED: Dynamic Dropout Detection (HPO Training Loop)
+                valid_depth_mask = ~(x_full[:, 3, :, :] == 0.0).view(x_full.shape[0], -1).all(dim=1)
+                valid_therm_mask = ~(x_full[:, 4, :, :] == 0.0).view(x_full.shape[0], -1).all(dim=1)
+                
+                for b in range(x_full.shape[0]):
+                    if valid_depth_mask[b]:
+                        x_full[b, 3, :, :] = (x_full[b, 3, :, :] * d_std) + d_mean
+                    if valid_therm_mask[b]:
+                        x_full[b, 4, :, :] = (x_full[b, 4, :, :] * t_std) + t_mean
                 
                 with autocast('cuda', dtype=torch.bfloat16):
                     pred_seg = model(x_full)
@@ -318,6 +338,7 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
                 for batch in val_loader:
                     x_full, seg_mask = batch['x_full'].to(device), batch['seg_mask'].to(device)
                     
+                    # Validation sets do not utilize Modality Dropout; vectorized execution is mathematically safe here.
                     x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
                     x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
                     
@@ -335,7 +356,7 @@ def run_hpo_phase(run_dir, inherit_weights, ModelClass, model_kwargs, train_load
     study = optuna.create_study(study_name="TMLPN_HPO_Sweep", storage=f"sqlite:///{db_path}", direction="maximize", pruner=optuna.pruners.HyperbandPruner(), load_if_exists=True)
     
     print("\n" + "="*80)
-    print("📊 [MONITOR HPO] To track the Optuna sweep in real-time, run in a new terminal:")
+    print("投 [MONITOR HPO] To track the Optuna sweep in real-time, run in a new terminal:")
     print(f"    optuna-dashboard sqlite:///{db_path}")
     print("="*80 + "\n")
     
@@ -373,9 +394,6 @@ def compute_dataset_statistics(dataloader, num_classes, ignore_index=255, max_ba
     gdl = gdl_raw / gdl_raw.max()
     return [round(a, 4) for a in alpha.tolist()], [round(g, 4) for g in gdl.tolist()]
 
-# [ALGORITHM COMMENT: Segmentation Grad-CAM]
-# Based on Gradient-weighted Class Activation Mapping (Selvaraju et al., 2017)[cite: 4].
-# Captures spatial attention heatmaps directly from the target linear prediction layer to verify structural defect focus, ensuring the model isolates physical anomalies over background noise or artifacts[cite: 4].
 class SegmentationGradCAM:
     def __init__(self, model, target_layer):
         self.model = model
@@ -424,26 +442,32 @@ def main():
     splits_root = os.path.join("data", "splits")
     NUM_CLASSES = get_dynamic_class_count(os.path.join(splits_root, dataset_name))
     
-    train_dataset = DownstreamSegmentationDataset(dataset_name=dataset_name, split="train", splits_root=splits_root, image_size=img_size)
-    val_dataset = DownstreamSegmentationDataset(dataset_name=dataset_name, split="val", splits_root=splits_root, image_size=img_size)
+    # --- INJECTED: ABLATION & REGULARIZATION CONFIGURATION ROUTING ---
+    ablation_cfg = cfg.get('ablations', {})
+    enable_modality_dropout = ablation_cfg.get('enable_modality_dropout', True)
+    modality_dropout_prob = cfg.get('modality_dropout_prob', 0.15) if enable_modality_dropout else 0.0
     
+    train_dataset = DownstreamSegmentationDataset(
+        dataset_name=dataset_name, 
+        split="train", 
+        splits_root=splits_root, 
+        image_size=img_size,
+        modality_dropout_prob=modality_dropout_prob
+    )
+    val_dataset = DownstreamSegmentationDataset(dataset_name=dataset_name, split="val", splits_root=splits_root, image_size=img_size)
     test_dataset_tta = TTA_DownstreamSegmentationDataset(dataset_name=dataset_name, split="test", splits_root=splits_root, image_size=img_size)
     
     train_loader = DataLoader(train_dataset, batch_size=cfg['batch_size'], shuffle=True, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=cfg['batch_size'], shuffle=False, num_workers=4)
-    
     test_loader_tta = DataLoader(test_dataset_tta, batch_size=1, shuffle=False, num_workers=4)
     
     empirical_alpha, global_gdl = compute_dataset_statistics(train_loader, NUM_CLASSES)
     
-    ablation_cfg = cfg.get('ablations', {})
     gdl_type = ablation_cfg.get('gdl_type', 'global_anchored')
     enable_kd = ablation_cfg.get('enable_kd', True)
     use_lora = ablation_cfg.get('use_lora', cfg.get('use_lora', True))
     
     accum_steps = cfg.get('gradient_accumulation_steps', 4)
-    early_stop_patience = cfg.get('early_stopping_patience', 20)
-    
     lora_r = cfg.get('lora', {}).get('r', 8)
     lora_alpha = cfg.get('lora', {}).get('alpha', 16)
     llrd_decay = ablation_cfg.get('llrd_decay', cfg.get('llrd_decay', 0.85))
@@ -462,6 +486,7 @@ def main():
         "backbone_name": cfg['backbone'],
         "isolated_stem": ablation_cfg.get('enable_modality_isolation', True),
         "enable_dirac": ablation_cfg.get('enable_dirac', True),
+        "enable_scse": ablation_cfg.get('enable_scse', True), 
         "use_lora": use_lora,
         "lora_r": lora_r,
         "lora_alpha": lora_alpha
@@ -484,6 +509,12 @@ def main():
     state = manager.detect_state()
     if state is None: return 
     run_dir, phase = state["run_dir"], state["phase"]
+
+    patience_cfg = cfg.get('early_stopping_patience', {'default': 20})
+    if isinstance(patience_cfg, dict):
+        early_stop_patience = patience_cfg.get(phase, patience_cfg.get('default', 20))
+    else:
+        early_stop_patience = int(patience_cfg)
 
     if phase == "baseline" and not state["is_resume"]:
         pt_weights = os.path.join("weights", model.__class__.__name__, dataset_name, trial_name, f"jepa_context_encoder_{cfg['backbone']}.pt")
@@ -508,7 +539,7 @@ def main():
     MAX_EPOCHS = cfg['epochs'].get(phase, cfg['epochs']['default'])
     lr = cfg['learning_rates'].get(phase, cfg['learning_rates']['default'])
     weight_decay = cfg.get('optimizer', {}).get('weight_decay', 1e-4)
-    gamma, dice_weight = 2.0, 1.0
+    gamma, dice_weight, boundary_weight = 2.0, 1.0, 0.5
     
     if phase in ["hero", "microtune"] and state.get("inherit_weights"):
         hpo_params_path = os.path.join(os.path.dirname(state["inherit_weights"]), "best_params.json")
@@ -518,6 +549,7 @@ def main():
             weight_decay = best_params.get("weight_decay", weight_decay)
             gamma = best_params.get("gamma", gamma)
             dice_weight = best_params.get("dice_weight", dice_weight)
+            boundary_weight = best_params.get("boundary_weight", boundary_weight)
             if phase == "microtune":
                 lr = cfg['learning_rates'].get('microtune', 1e-5)
                 
@@ -544,10 +576,21 @@ def main():
     
     criterion = AlphaBalancedFocalGDLLoss(
         num_classes=NUM_CLASSES, alpha=empirical_alpha, global_gdl_weights=global_gdl if gdl_type == 'global_anchored' else None,
-        gamma=gamma, dice_weight=dice_weight, use_batch_dynamic=(gdl_type == 'batch_dynamic')
+        gamma=gamma, dice_weight=dice_weight, boundary_weight=boundary_weight, use_batch_dynamic=(gdl_type == 'batch_dynamic')
     ).to(DEVICE)
     
-    active_hparams = {"lr": lr, "weight_decay": weight_decay, "gamma": gamma, "dice_weight": dice_weight, "batch_size": cfg['batch_size'], "use_lora": use_lora, **ablation_cfg}
+    # INJECTED: Ensure ablation state is strictly propagated to the config telemetry
+    active_hparams = {
+        "lr": lr, 
+        "weight_decay": weight_decay, 
+        "gamma": gamma, 
+        "dice_weight": dice_weight, 
+        "boundary_weight": boundary_weight, 
+        "batch_size": cfg['batch_size'], 
+        "use_lora": use_lora, 
+        "modality_dropout_prob": modality_dropout_prob,
+        **ablation_cfg
+    }
     state["hyperparameters"] = active_hparams
     
     writer = SummaryWriter(log_dir=os.path.join(run_dir, "logs"))
@@ -591,8 +634,16 @@ def main():
         for batch_idx, batch in enumerate(loop):
             x_full, seg_mask = batch['x_full'].to(DEVICE), batch['seg_mask'].to(DEVICE)
             
-            x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
-            x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
+            # INJECTED: Dynamic Dropout Detection (Main Training Loop)
+            # Ensures zeroed-out sensors are not shifted by the global dataset mean.
+            valid_depth_mask = ~(x_full[:, 3, :, :] == 0.0).view(x_full.shape[0], -1).all(dim=1)
+            valid_therm_mask = ~(x_full[:, 4, :, :] == 0.0).view(x_full.shape[0], -1).all(dim=1)
+            
+            for b in range(x_full.shape[0]):
+                if valid_depth_mask[b]:
+                    x_full[b, 3, :, :] = (x_full[b, 3, :, :] * d_std) + d_mean
+                if valid_therm_mask[b]:
+                    x_full[b, 4, :, :] = (x_full[b, 4, :, :] * t_std) + t_mean
             
             with autocast('cuda', dtype=torch.bfloat16):
                 pred_seg, s_feats = model(x_full, return_features=True)
@@ -636,6 +687,7 @@ def main():
             for batch in val_loader:
                 x_full, seg_mask = batch['x_full'].to(DEVICE), batch['seg_mask'].to(DEVICE)
                 
+                # Validation sets do not utilize Modality Dropout; vectorized execution is mathematically safe here.
                 x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
                 x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
                 
@@ -701,11 +753,10 @@ def main():
             x_tta_batch = batch['x_tta_batch'].to(DEVICE)
             seg_mask = batch['seg_mask'].to(DEVICE)
             
-            # MODIFIED: Unpacks only the 2 valid views (Base, H-Flip) established in the updated dataset_jepa.py.
-            # JUSTIFICATION: Attempting to unpack index 2 and 3 will cause an Out-of-Bounds crash since the rotational views were stripped from the dataloader. Furthermore, removing the rotational inverses here entirely prevents the zero-padding boundary dilution that was artificially crashing the mIoU.
             x_base = x_tta_batch[:, 0]
             x_hflip = x_tta_batch[:, 1]
             
+            # The Blind Test Evaluation does not utilize Modality Dropout; vectorized execution is mathematically safe here.
             for x_view in [x_base, x_hflip]:
                 x_view[:, 3, :, :] = (x_view[:, 3, :, :] * d_std) + d_mean
                 x_view[:, 4, :, :] = (x_view[:, 4, :, :] * t_std) + t_mean
@@ -716,8 +767,6 @@ def main():
             
             pred_hflip_inv = torch.flip(pred_hflip, dims=[3]) 
             
-            # MODIFIED: Averages strictly the two lossless probability manifolds.
-            # JUSTIFICATION: Removing the zero-padded rotational predictions prevents the dilution of accurate perimeters. This mathematical adjustment ensures the TTA ensemble natively reduces high-frequency noise without compromising edge geometries.
             pred_tta = (pred_base + pred_hflip_inv) / 2.0
             
             base_test_iou.update(pred_base, seg_mask)

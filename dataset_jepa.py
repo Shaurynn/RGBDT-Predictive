@@ -169,25 +169,20 @@ class BaseRGBDTDataset(Dataset):
 
 
 class JEPAPretrainDataset(BaseRGBDTDataset):
-    def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train', splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640), mask_strategy: str = "multi_block", enable_augmentation: bool = True):
+    def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train', splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640), mask_strategy: str = "multi_block", enable_augmentation: bool = True, modality_dropout_prob: float = 0.0):
         super().__init__(data_dir=data_dir, dataset_name=dataset_name, split=split, splits_root=splits_root, image_size=image_size)
         self.mask_strategy = mask_strategy
         self.enable_augmentation = enable_augmentation
+        self.modality_dropout_prob = modality_dropout_prob
 
     # [ALGORITHM COMMENT: Multi-Block Masking Engine]
-    # Implements the block-wise masking spatial constraints introduced in BEiT and utilized by MM-JEPA[cite: 2].
-    # Instead of random individual patches, contiguous spatial blocks are masked.
-    # This specifically prevents the network from taking local shortcuts (e.g., interpolating from immediate neighboring pixels)
-    # forcing the architecture to learn long-range semantic dependencies and true physical geometry[cite: 2].
     def _generate_multiblock_mask(self, h: int, w: int, num_blocks: int = 4) -> torch.Tensor:
         mask = torch.zeros((1, h, w), dtype=torch.float32)
-        # Iterates through n-blocks, computing randomized bounding box geometries.
         for _ in range(num_blocks):
             scale = np.random.uniform(0.15, 0.20)
             aspect_ratio = np.random.uniform(0.75, 1.5)
             target_area = scale * h * w
             
-            # Derives exact block dimensions algebraically to ensure proper scale variance[cite: 2].
             exact_w, exact_h = math.sqrt(target_area * aspect_ratio), math.sqrt(target_area / aspect_ratio)
             w_f, h_f = max(1, int(math.floor(exact_w))), max(1, int(math.floor(exact_h)))
             w_c, h_c = max(1, int(math.ceil(exact_w))), max(1, int(math.ceil(exact_h)))
@@ -199,21 +194,17 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
                 
             block_w, block_h = min(block_w, w - 1), min(block_h, h - 1)
             top, left = np.random.randint(0, h - block_h + 1), np.random.randint(0, w - block_w + 1)
-            # Projects the computed block boundary onto the binary 2D mask representation[cite: 2].
             mask[:, top:top + block_h, left:left + block_w] = 1.0
             
         return mask
 
     # [ALGORITHM COMMENT: High-Sparsity Random Patch Masking]
-    # Implements the highly sparse random patch masking strategy popularized by Masked Autoencoders (MAE)[cite: 1].
     def _generate_random_patch_mask(self, h: int, w: int, patch_size: int = 16, mask_ratio: float = 0.60) -> torch.Tensor:
         mask = torch.zeros((1, h, w), dtype=torch.float32)
         num_patches_h, num_patches_w = h // patch_size, w // patch_size
         total_patches = num_patches_h * num_patches_w
         num_mask_patches = int(total_patches * mask_ratio)
         
-        # Removes a massive percentage (e.g., 60-75%) of non-overlapping patches uniformly at random[cite: 1].
-        # The extreme sparsity prevents the network from relying on low-level visual textures[cite: 1].
         mask_indices = np.random.choice(total_patches, num_mask_patches, replace=False)
         
         for idx in mask_indices:
@@ -236,9 +227,6 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
         x_full = self._load_multimodal_tensors(idx, hflip=hflip)
         
         if rotation_angle != 0.0:
-            # MODIFIED: Split rotational interpolation mechanics.
-            # RGB channels require Bilinear smoothing to prevent pixelation, whilst Depth/Thermal require Nearest Neighbor 
-            # to strictly preserve scale-invariant depth measurements and radiometrically bounded thermal data without hallucinating edge geometries.
             rgb_rot = TF.rotate(x_full[:3], rotation_angle, interpolation=InterpolationMode.BILINEAR)
             dt_rot = TF.rotate(x_full[3:], rotation_angle, interpolation=InterpolationMode.NEAREST)
             x_full = torch.cat([rgb_rot, dt_rot], dim=0)
@@ -253,6 +241,14 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
                 x_full[:3, :, :] = rgb
         
         x_normalized = TF.normalize(x_full, mean=self.mean, std=self.std)
+
+        # INJECTED: Modality Dropout Regularizer
+        # Evaluated strictly post-normalization to prevent distribution shift corruption.
+        if self.split == 'train' and self.modality_dropout_prob > 0.0:
+            if random.random() < self.modality_dropout_prob:
+                x_normalized[3, :, :] = 0.0  # Drop Depth Modal Tensor
+            if random.random() < self.modality_dropout_prob:
+                x_normalized[4, :, :] = 0.0  # Drop Thermal Modal Tensor
         
         if self.mask_strategy == "random":
             mask = self._generate_random_patch_mask(self.image_size[0], self.image_size[1])
@@ -265,9 +261,10 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
 
 
 class DownstreamSegmentationDataset(BaseRGBDTDataset):
-    def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train', splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640), enable_augmentation: bool = True):
+    def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train', splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640), enable_augmentation: bool = True, modality_dropout_prob: float = 0.0):
         super().__init__(data_dir=data_dir, dataset_name=dataset_name, split=split, splits_root=splits_root, image_size=image_size)
         self.enable_augmentation = enable_augmentation
+        self.modality_dropout_prob = modality_dropout_prob
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         hflip = False
@@ -293,7 +290,6 @@ class DownstreamSegmentationDataset(BaseRGBDTDataset):
         gt_t = torch.as_tensor(gt_mask, dtype=torch.long)
         
         if rotation_angle != 0.0:
-            # MODIFIED: Split rotational interpolation mechanics for x_full.
             rgb_rot = TF.rotate(x_full[:3], rotation_angle, interpolation=InterpolationMode.BILINEAR)
             dt_rot = TF.rotate(x_full[3:], rotation_angle, interpolation=InterpolationMode.NEAREST)
             x_full = torch.cat([rgb_rot, dt_rot], dim=0)
@@ -310,6 +306,15 @@ class DownstreamSegmentationDataset(BaseRGBDTDataset):
                 x_full[:3, :, :] = rgb
         
         x_normalized = TF.normalize(x_full, mean=self.mean, std=self.std)
+
+        # INJECTED: Modality Dropout Regularizer
+        # Evaluated strictly post-normalization to prevent distribution shift corruption.
+        if self.split == 'train' and self.modality_dropout_prob > 0.0:
+            if random.random() < self.modality_dropout_prob:
+                x_normalized[3, :, :] = 0.0  # Drop Depth Modal Tensor
+            if random.random() < self.modality_dropout_prob:
+                x_normalized[4, :, :] = 0.0  # Drop Thermal Modal Tensor
+                
         gt_t[gt_t == 255] = 255 
 
         return {'x_full': x_normalized, 'seg_mask': gt_t}

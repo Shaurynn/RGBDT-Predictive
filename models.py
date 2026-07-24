@@ -6,14 +6,53 @@ import segmentation_models_pytorch as smp
 import copy
 
 # ====================================================================================
-# --- 1. MODALITY-SPECIFIC TOKENIZATION ---
+# --- 1. MODALITY-SPECIFIC TOKENIZATION & GATING ---
 # ====================================================================================
 
+class ConcurrentSpatialChannelSE(nn.Module):
+    """
+    Concurrent Spatial and Channel Squeeze & Excitation (scSE)
+    Reference: Roy et al., MICCAI 2018
+    
+    Dynamically recalibrates multi-modal feature grids by applying both 
+    global channel-wise attention and localized per-pixel spatial attention.
+    """
+    def __init__(self, channels: int, reduction_ratio: int = 16):
+        super(ConcurrentSpatialChannelSE, self).__init__()
+        
+        # Channel Squeeze & Excitation (cSE)
+        # Suppresses or boosts entire modalities (e.g., RGB vs Thermal) globally
+        self.cSE = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, max(1, channels // reduction_ratio), kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(max(1, channels // reduction_ratio), channels, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+        
+        # Spatial Squeeze & Excitation (sSE)
+        # Suppresses or boosts specific localized regions per-pixel across all modalities
+        self.sSE = nn.Sequential(
+            nn.Conv2d(channels, 1, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Apply Channel Attention (broadcasts 1D vector across HxW)
+        cSE_out = x * self.cSE(x)
+        
+        # Apply Spatial Attention (broadcasts 2D map across Channels)
+        sSE_out = x * self.sSE(x)
+        
+        # Concurrent fusion combines global modality weighting with local pixel weighting
+        return cSE_out + sSE_out
+
 class ModalityIsolatedPatchEmbed(nn.Module):
-    # PATCH: Added enable_dirac flag to isolate initialization effects from dual-stem topology
-    def __init__(self, original_proj, enable_dirac=True):
+    # PATCH: Added enable_dirac and enable_scse flags to isolate initialization effects
+    def __init__(self, original_proj, enable_dirac=True, enable_scse=True):
         super().__init__()
         self.rgb_proj = original_proj
+        self.enable_scse = enable_scse
         
         self.depth_therm_proj = nn.Conv2d(
             in_channels=2, 
@@ -47,6 +86,10 @@ class ModalityIsolatedPatchEmbed(nn.Module):
             nn.init.dirac_(self.dt_alignment.weight)
         else:
             nn.init.kaiming_normal_(self.dt_alignment.weight, mode='fan_out', nonlinearity='relu')
+            
+        # INJECTED: Dynamic Cross-Modal Gating (scSE)
+        if self.enable_scse:
+            self.scse_gate = ConcurrentSpatialChannelSE(channels=original_proj.out_channels, reduction_ratio=16)
 
     def forward(self, x):
         x_rgb = x[:, :3, :, :]
@@ -54,7 +97,6 @@ class ModalityIsolatedPatchEmbed(nn.Module):
         x_therm = x[:, 4:5, :, :]
         
         # 1. Encode Depth Scale-Invariance: Normalize by spatial mean to ensure geometric scale invariance
-        # INJECTED EPSILON (+ 1e-8) to prevent zero-division NaN generation during perfectly uniform edge regions
         depth_mean = x_depth.mean(dim=(2, 3), keepdim=True) + 1e-8
         x_depth_normalized = x_depth / depth_mean
         x_depth_calibrated = (x_depth_normalized * self.depth_scale) + self.depth_bias
@@ -68,7 +110,14 @@ class ModalityIsolatedPatchEmbed(nn.Module):
         dt_features = self.depth_therm_proj(x_dt_calibrated)
         dt_aligned = self.dt_alignment(dt_features)
         
-        return self.rgb_proj(x_rgb) + dt_aligned
+        # Combine modalities 
+        fused_features = self.rgb_proj(x_rgb) + dt_aligned
+        
+        # Apply scSE dynamic gating conditionally based on ablation configuration
+        if self.enable_scse:
+            fused_features = self.scse_gate(fused_features)
+        
+        return fused_features
 
 class NaiveEarlyFusionPatchEmbed(nn.Module):
     def __init__(self, original_proj):
@@ -150,7 +199,6 @@ class LoRALinear(nn.Module):
     def __init__(self, original_layer, r=8, alpha=16):
         super().__init__()
         
-        # PATCH: Defensive boundary constraint to protect against dynamic ablation down-scaling
         if r <= 0:
             raise ValueError(f"[-] CRITICAL: LoRA rank 'r' must be strictly positive. Received scaling value: {r}")
             
@@ -168,7 +216,6 @@ class LoRALinear(nn.Module):
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x):
-        # Y = Wx + (ABx) * scaling
         return self.original_layer(x) + (x @ self.lora_A @ self.lora_B) * self.scaling
 
 def apply_lora_to_mit(model, r=8, alpha=16):
@@ -177,7 +224,6 @@ def apply_lora_to_mit(model, r=8, alpha=16):
     projection layers to allow safe task-bending without catastrophic forgetting.
     """
     for name, module in model.named_modules():
-        # MiT SRA blocks name their Q and KV projections `.q` and `.kv`
         if name.endswith('.q') or name.endswith('.kv'):
             parent_name = name.rsplit('.', 1)[0]
             child_name = name.rsplit('.', 1)[1]
@@ -192,14 +238,18 @@ def apply_lora_to_mit(model, r=8, alpha=16):
 # ====================================================================================
     
 class MultimodalJEPA(nn.Module):
-    def __init__(self, backbone_name='mit_b1', isolated_stem=True, enable_dirac=True):
+    def __init__(self, backbone_name='mit_b1', isolated_stem=True, enable_dirac=True, enable_scse=True):
         super().__init__()
         self.isolated_stem = isolated_stem
         self.context_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, weights='imagenet')
         original_proj = self.context_encoder.patch_embed1.proj
         
         if self.isolated_stem:
-            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj, enable_dirac=enable_dirac)
+            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(
+                original_proj, 
+                enable_dirac=enable_dirac, 
+                enable_scse=enable_scse
+            )
         else:
             self.context_encoder.patch_embed1.proj = NaiveEarlyFusionPatchEmbed(original_proj)
         
@@ -245,8 +295,6 @@ class SegFormerAllMLPDecoder(nn.Module):
 
         self.linear_fuse = nn.Sequential(
             nn.Conv2d(embedding_dim * 4, embedding_dim, kernel_size=1, bias=False),
-            # Substituted standard BN with GroupNorm(1, C) to act natively as LayerNorm 
-            # across channels, preserving stability under bounded hardware batch constraints.
             nn.GroupNorm(1, embedding_dim),
             nn.ReLU(inplace=True),
             nn.Dropout2d(p=0.1)
@@ -275,7 +323,12 @@ class TMLPN_Downstream_v1(nn.Module):
         self.context_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, weights=None)
         original_proj = self.context_encoder.patch_embed1.proj
         if self.isolated_stem:
-            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj)
+            # Enforce legacy parameters to preserve strict ablation matrices
+            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(
+                original_proj, 
+                enable_dirac=False, 
+                enable_scse=False
+            )
         else:
             self.context_encoder.patch_embed1.proj = NaiveEarlyFusionPatchEmbed(original_proj)
         
@@ -296,7 +349,12 @@ class TMLPN_Downstream_v2(nn.Module):
         
         original_proj = self.context_encoder.patch_embed1.proj
         if self.isolated_stem:
-            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj)
+            # Enforce legacy parameters to preserve strict ablation matrices
+            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(
+                original_proj, 
+                enable_dirac=False, 
+                enable_scse=False
+            )
         else:
             self.context_encoder.patch_embed1.proj = NaiveEarlyFusionPatchEmbed(original_proj)
             
@@ -320,7 +378,7 @@ class TMLPN_Downstream_v3(nn.Module):
     PHASE 2: V3 Supervised Semantic Segmentation Architecture.
     Integrates Modality-Decoupled Physical Priors, LoRA, and Feature-Level KD.
     """
-    def __init__(self, num_classes=10, backbone_name='mit_b1', isolated_stem=True, enable_dirac=True, use_lora=False, lora_r=8, lora_alpha=16):
+    def __init__(self, num_classes=10, backbone_name='mit_b1', isolated_stem=True, enable_dirac=True, enable_scse=True, use_lora=False, lora_r=8, lora_alpha=16):
         super().__init__()
         self.isolated_stem = isolated_stem
         self.context_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, weights=None)
@@ -328,7 +386,11 @@ class TMLPN_Downstream_v3(nn.Module):
         # Stem Extraction with explicit V3 Physical Priors
         original_proj = self.context_encoder.patch_embed1.proj
         if self.isolated_stem:
-            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(original_proj, enable_dirac=enable_dirac)
+            self.context_encoder.patch_embed1.proj = ModalityIsolatedPatchEmbed(
+                original_proj, 
+                enable_dirac=enable_dirac, 
+                enable_scse=enable_scse
+            )
         else:
             self.context_encoder.patch_embed1.proj = NaiveEarlyFusionPatchEmbed(original_proj)
             
