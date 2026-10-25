@@ -11,8 +11,18 @@ from PIL import Image
 from typing import Tuple, List, Dict, Any
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
-
 from torchvision.transforms import InterpolationMode
+
+
+def seed_worker(worker_id: int) -> None:
+    """
+    Seeds Python random and NumPy random generators deterministically inside
+    each DataLoader worker process using the PyTorch worker initial seed.
+    """
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 
 class PredictiveMultimodalDataset(Dataset):
     def __init__(self, dataset_name, split="train", splits_root="data/splits", transform=None):
@@ -53,7 +63,8 @@ class PredictiveMultimodalDataset(Dataset):
             sample = self.transform(sample)
             
         return sample
-    
+
+
 class BaseRGBDTDataset(Dataset):
     def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train', splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640)):
         if dataset_name is not None:
@@ -136,6 +147,15 @@ class BaseRGBDTDataset(Dataset):
         
         return torch.cat([rgb_t, depth_t, therm_t], dim=0)
 
+    def _normalize_rgb_only(self, x_full: torch.Tensor) -> torch.Tensor:
+        """
+        Normalizes only the photometric RGB channels (0, 1, 2) using global dataset statistics,
+        preserving Depth (channel 3) and Thermal (channel 4) in their native [0, 1] physical domain.
+        """
+        x_norm = x_full.clone()
+        x_norm[:3, :, :] = TF.normalize(x_full[:3, :, :], mean=self.mean[:3], std=self.std[:3])
+        return x_norm
+
     def _get_or_compute_stats(self) -> Tuple[List[float], List[float]]:
         cache_path = os.path.join(self.data_dir, 'dataset_stats.pt')
         
@@ -175,7 +195,6 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
         self.enable_augmentation = enable_augmentation
         self.modality_dropout_prob = modality_dropout_prob
 
-    # [ALGORITHM COMMENT: Multi-Block Masking Engine]
     def _generate_multiblock_mask(self, h: int, w: int, num_blocks: int = 4) -> torch.Tensor:
         mask = torch.zeros((1, h, w), dtype=torch.float32)
         for _ in range(num_blocks):
@@ -198,7 +217,6 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
             
         return mask
 
-    # [ALGORITHM COMMENT: High-Sparsity Random Patch Masking]
     def _generate_random_patch_mask(self, h: int, w: int, patch_size: int = 16, mask_ratio: float = 0.60) -> torch.Tensor:
         mask = torch.zeros((1, h, w), dtype=torch.float32)
         num_patches_h, num_patches_w = h // patch_size, w // patch_size
@@ -240,22 +258,22 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
                 rgb = TF.adjust_hue(rgb, hue_factor=(random.random() - 0.5) * 0.2)
                 x_full[:3, :, :] = rgb
         
-        x_normalized = TF.normalize(x_full, mean=self.mean, std=self.std)
+        # Isolate normalization to RGB channels; keep Depth/Thermal in [0, 1] physical domain
+        x_normalized = self._normalize_rgb_only(x_full)
 
-        # INJECTED: Modality Dropout Regularizer
-        # Evaluated strictly post-normalization to prevent distribution shift corruption.
-        if self.split == 'train' and self.modality_dropout_prob > 0.0:
-            if random.random() < self.modality_dropout_prob:
-                x_normalized[3, :, :] = 0.0  # Drop Depth Modal Tensor
-            if random.random() < self.modality_dropout_prob:
-                x_normalized[4, :, :] = 0.0  # Drop Thermal Modal Tensor
-        
         if self.mask_strategy == "random":
             mask = self._generate_random_patch_mask(self.image_size[0], self.image_size[1])
         else:
             mask = self._generate_multiblock_mask(self.image_size[0], self.image_size[1])
             
         x_visible = x_normalized * (1.0 - mask)
+
+        # Apply Modality Dropout strictly to x_visible so the EMA Target Encoder receives clean x_full
+        if self.split == 'train' and self.modality_dropout_prob > 0.0:
+            if random.random() < self.modality_dropout_prob:
+                x_visible[3, :, :] = 0.0
+            if random.random() < self.modality_dropout_prob:
+                x_visible[4, :, :] = 0.0
         
         return {'x_full': x_normalized, 'x_visible': x_visible, 'mask': mask}
 
@@ -305,15 +323,14 @@ class DownstreamSegmentationDataset(BaseRGBDTDataset):
                 rgb = TF.adjust_hue(rgb, hue_factor=(random.random() - 0.5) * 0.2)
                 x_full[:3, :, :] = rgb
         
-        x_normalized = TF.normalize(x_full, mean=self.mean, std=self.std)
+        # Isolate normalization to RGB channels; keep Depth/Thermal in [0, 1] physical domain
+        x_normalized = self._normalize_rgb_only(x_full)
 
-        # INJECTED: Modality Dropout Regularizer
-        # Evaluated strictly post-normalization to prevent distribution shift corruption.
         if self.split == 'train' and self.modality_dropout_prob > 0.0:
             if random.random() < self.modality_dropout_prob:
-                x_normalized[3, :, :] = 0.0  # Drop Depth Modal Tensor
+                x_normalized[3, :, :] = 0.0
             if random.random() < self.modality_dropout_prob:
-                x_normalized[4, :, :] = 0.0  # Drop Thermal Modal Tensor
+                x_normalized[4, :, :] = 0.0
                 
         gt_t[gt_t == 255] = 255 
 
@@ -334,10 +351,10 @@ class TTA_DownstreamSegmentationDataset(BaseRGBDTDataset):
         gt_t[gt_t == 255] = 255
 
         x_base = self._load_multimodal_tensors(idx, hflip=False)
-        x_base_norm = TF.normalize(x_base, mean=self.mean, std=self.std)
+        x_base_norm = self._normalize_rgb_only(x_base)
 
         x_hflip = self._load_multimodal_tensors(idx, hflip=True)
-        x_hflip_norm = TF.normalize(x_hflip, mean=self.mean, std=self.std)
+        x_hflip_norm = self._normalize_rgb_only(x_hflip)
         
         x_tta_batch = torch.stack([x_base_norm, x_hflip_norm], dim=0)
 

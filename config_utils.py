@@ -1,16 +1,20 @@
 import yaml
 import argparse
 
+
 def load_config(config_path="config.yaml"):
     """Loads the YAML configuration file."""
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
     return config
 
+
 def parse_with_config(description):
     """Parses CLI arguments, allowing the config path to be specified alongside dynamic ablation overrides."""
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to configuration YAML")
+    parser.add_argument("--model", type=str, default=None, help="Override target architecture class name")
+    parser.add_argument("--teacher_weights", type=str, default=None, help="Explicit path to teacher checkpoint for Feature-Level KD")
     
     # --- V3 Structural Overrides for rapid ablation testing via ml_pipeline.py ---
     parser.add_argument("--patience", type=int, default=None, help="Override early stopping patience")
@@ -21,7 +25,18 @@ def parse_with_config(description):
     args = parser.parse_args()
     config = load_config(args.config)
     
-    # Inject CLI overrides into the parsed dictionary dictionary at runtime
+    # Inject CLI overrides into the parsed configuration dictionary at runtime
+    if args.model is not None:
+        if 'metadata' not in config:
+            config['metadata'] = {}
+        config['metadata']['model'] = args.model
+    elif 'metadata' in config and 'model' in config['metadata']:
+        args.model = config['metadata']['model']
+
+    if args.teacher_weights is not None:
+        if 'phase2_downstream' in config:
+            config['phase2_downstream']['teacher_weights'] = args.teacher_weights
+            
     if args.patience is not None:
         if 'phase2_downstream' in config:
             config['phase2_downstream']['early_stopping_patience'] = args.patience

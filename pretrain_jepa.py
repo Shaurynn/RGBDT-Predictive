@@ -8,10 +8,11 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from models import MultimodalJEPA
-from dataset_jepa import JEPAPretrainDataset
+from dataset_jepa import JEPAPretrainDataset, seed_worker
 from config_utils import parse_with_config 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def enforce_reproducibility(seed=42):
     """Locks the computational graph for rigorous ablation statistics."""
@@ -24,54 +25,90 @@ def enforce_reproducibility(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def scale_invariant_depth_loss(pred_depth, target_depth, eps=1e-6):
+
+def compute_vicreg_regularization(z_online, variance_type='spatial', enable_covariance=True, eps=1e-4):
     """
-    Computes a scale-invariant error for depth tensors, enforcing geometric 
-    structure consistency invariant to absolute distance scale changes.
+    Computes Variance and Covariance regularization on the unnormalized online
+    predictor representations (z_pred) to prevent dimensional collapse with active gradients.
+    Reference: Bardes et al., VICReg, ICLR 2022.
     """
-    # Double ReLU clamp to guarantee strict positivity before logarithmic evaluation
-    log_diff = torch.log(F.relu(pred_depth) + eps) - torch.log(F.relu(target_depth) + eps)
-    n = log_diff.numel()
-    return torch.mean(log_diff ** 2) - (torch.sum(log_diff) ** 2) / (n ** 2)
+    B, C, H, W = z_online.shape
+
+    if variance_type == 'spatial':
+        # Flatten across batch and spatial coordinates: [C, B * H * W]
+        flat = z_online.permute(1, 0, 2, 3).reshape(C, -1)
+        N = flat.shape[1]
+        if N <= 1:
+            return torch.tensor(0.0, device=z_online.device)
+
+        std = torch.sqrt(flat.var(dim=1) + eps)
+        loss_var = torch.mean(F.relu(1.0 - std))
+
+        if enable_covariance:
+            centered = flat - flat.mean(dim=1, keepdim=True)
+            cov_matrix = (centered @ centered.T) / (N - 1)
+            off_diag_mask = ~torch.eye(C, dtype=torch.bool, device=z_online.device)
+            loss_cov = (cov_matrix[off_diag_mask] ** 2).sum() / C
+        else:
+            loss_cov = torch.tensor(0.0, device=z_online.device)
+
+        return loss_var + (0.05 * loss_cov)
+
+    elif variance_type == 'batch':
+        # Pool across spatial coordinates: [B, C]
+        pooled = z_online.mean(dim=(2, 3))
+        if B <= 1:
+            return torch.tensor(0.0, device=z_online.device)
+
+        std = torch.sqrt(pooled.var(dim=0) + eps)
+        loss_var = torch.mean(F.relu(1.0 - std))
+
+        if enable_covariance:
+            centered = pooled - pooled.mean(dim=0, keepdim=True)
+            cov_matrix = (centered.T @ centered) / (B - 1)
+            off_diag_mask = ~torch.eye(C, dtype=torch.bool, device=z_online.device)
+            loss_cov = (cov_matrix[off_diag_mask] ** 2).sum() / C
+        else:
+            loss_cov = torch.tensor(0.0, device=z_online.device)
+
+        return loss_var + (0.05 * loss_cov)
+
+    return torch.tensor(0.0, device=z_online.device)
+
 
 def main():
     args, config = parse_with_config("Phase 1: MM-JEPA Self-Supervised Pre-Training")
     
-    # --- Extracted Configuration Parameters ---
     cfg = config['phase1_pretraining']
     img_size = (config['dataset']['image_height'], config['dataset']['image_width'])
     dataset_name = config['dataset']['name']
     
-    # Extract the target model architecture namespace for weight isolation
-    # Defaults natively to the TMLPN_Downstream_v3 structural namespace
     model_name = getattr(args, 'model', config.get('metadata', {}).get('model', 'TMLPN_Downstream_v3'))
     
-    # --- Isolate namespace and extract dynamic seed ---
     trial_name = cfg.get('trial_name', 'baseline')
     active_seed = cfg.get('seed', 42)
     enforce_reproducibility(active_seed)
     print(f"[*] Locked PyTorch computational graph to Seed: {active_seed}")
 
-    # --- ABLATION STATE INJECTION ---
     ablation_cfg = cfg.get('ablations', {})
     enable_isolation = ablation_cfg.get('enable_modality_isolation', True)
     variance_type = ablation_cfg.get('variance_type', 'spatial')
     mask_strategy = ablation_cfg.get('mask_strategy', 'multi_block')
     
-    # Extract V3 Fortification Flags & Modality Dropout
     enable_context = ablation_cfg.get('enable_context_consistency', True)
     enable_covariance = ablation_cfg.get('enable_covariance_penalty', True)
     enable_dirac = ablation_cfg.get('enable_dirac', True)
+    enable_scse = ablation_cfg.get('enable_scse', True)
     enable_modality_dropout = ablation_cfg.get('enable_modality_dropout', True)
     
-    # Route Modality Dropout Probability (Default to 15% if active)
     modality_dropout_prob = cfg.get('modality_dropout_prob', 0.15) if enable_modality_dropout else 0.0
 
     print("\n" + "="*60)
     print("🔬 ABLATION STATE [PHASE 1: PRE-TRAINING (V3 PHYSICAL PRIORS)]")
     print("="*60)
     print(f"[*] Target Architecture Namespace      : {model_name}")
-    print(f"[*] Modality Isolated Stem (1x1 Dirac) : {enable_isolation}")
+    print(f"[*] Modality Isolated Stem (1x1 Dirac) : {enable_isolation} (Dirac: {enable_dirac})")
+    print(f"[*] Dynamic Cross-Modal Gating (scSE)  : {enable_scse}")
     print(f"[*] Variance Regularization Topology   : {variance_type.upper()}")
     print(f"[*] Masking Strategy                   : {mask_strategy.upper()}")
     print(f"[*] Context Consistency Evaluated      : {enable_context}")
@@ -79,7 +116,6 @@ def main():
     print(f"[*] Modality Dropout Regularizer       : {enable_modality_dropout} (Rate: {modality_dropout_prob})")
     print("="*60 + "\n")
 
-    # --- Agnostic Configuration Routing ---
     splits_root = os.path.join("data", "splits")
     
     dataset = JEPAPretrainDataset(
@@ -91,20 +127,29 @@ def main():
         modality_dropout_prob=modality_dropout_prob
     )
     
+    dl_generator = torch.Generator()
+    dl_generator.manual_seed(active_seed)
+
     dataloader = DataLoader(
         dataset, 
         batch_size=cfg['batch_size'], 
         shuffle=True, 
         num_workers=4, 
         pin_memory=True, 
-        drop_last=True
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=dl_generator
     )
     
-    model = MultimodalJEPA(backbone_name=cfg['backbone'], isolated_stem=enable_isolation, enable_dirac=enable_dirac).to(DEVICE)
+    model = MultimodalJEPA(
+        backbone_name=cfg['backbone'], 
+        isolated_stem=enable_isolation, 
+        enable_dirac=enable_dirac,
+        enable_scse=enable_scse
+    ).to(DEVICE)
     
     optimizer = optim.AdamW(model.parameters(), lr=cfg['optimizer']['lr'], weight_decay=cfg['optimizer']['weight_decay'])
     
-    # Enforce strict isolated namespace for artifact generation matching the results/ tree
     weight_dir = os.path.join("weights", model_name, dataset_name, trial_name)
     os.makedirs(weight_dir, exist_ok=True)
     
@@ -114,10 +159,6 @@ def main():
     base_tau = cfg['jepa']['tau_base']
     total_steps = len(dataloader) * cfg['epochs']
     global_step = start_epoch * len(dataloader)
-    
-    # Extract statistical cache parameters to safely un-normalize physical priors
-    d_mean, d_std = dataset.mean[3], dataset.std[3]
-    t_mean, t_std = dataset.mean[4], dataset.std[4]
     
     for epoch in range(start_epoch, cfg['epochs']):
         model.train()
@@ -129,104 +170,41 @@ def main():
             x_visible = batch['x_visible'].to(DEVICE)
             high_res_mask = batch['mask'].to(DEVICE)
             
-            # --- DYNAMIC DROPOUT DETECTION ---
-            # Detect exactly which tensors were dropped before un-normalization shifts them to the dataset mean.
-            # Tensors that were dropped via Modality Dropout are exactly 0.0 across all spatial dimensions.
-            valid_depth_mask = ~(x_full[:, 3, :, :] == 0.0).all(dim=1).all(dim=1)
-            valid_therm_mask = ~(x_full[:, 4, :, :] == 0.0).all(dim=1).all(dim=1)
-            
-            # --- Z-SCORE REVERSAL (PHYSICAL DOMAIN RECOVERY) ---
-            # Un-normalize Depth and Thermal manifolds to prevent zero-division explosions 
-            # within the V3 ModalityIsolatedPatchEmbed spatial mean operation.
-            x_full[:, 3, :, :] = (x_full[:, 3, :, :] * d_std) + d_mean
-            x_full[:, 4, :, :] = (x_full[:, 4, :, :] * t_std) + t_mean
-            
-            x_visible[:, 3, :, :] = (x_visible[:, 3, :, :] * d_std) + d_mean
-            x_visible[:, 4, :, :] = (x_visible[:, 4, :, :] * t_std) + t_mean
-            
             optimizer.zero_grad(set_to_none=True)
             
             z_pred, z_target, latent_mask = model(x_visible, x_full, high_res_mask)
             mask_exp = latent_mask.expand(-1, z_pred.shape[1], -1, -1)
             
+            # 1. Compute Variance & Covariance Regularization on unnormalized online z_pred
+            loss_reg = compute_vicreg_regularization(
+                z_pred, 
+                variance_type=variance_type, 
+                enable_covariance=enable_covariance
+            )
+
+            # 2. L2-Normalize Latent Representations for Direction-Aligned Prediction Loss
             z_pred_norm = F.normalize(z_pred, dim=1, eps=1e-8)
             z_target_norm = F.normalize(z_target, dim=1, eps=1e-8)
             
-            # =================================================================================
-            # --- V3 OBJECTIVE UPDATE: CONDITIONAL ALIGNMENT, DECORRELATION & PHYSICS ---
-            # =================================================================================
+            if (mask_exp == 1).any():
+                loss_target = F.mse_loss(z_pred_norm[mask_exp == 1], z_target_norm[mask_exp == 1])
+            else:
+                loss_target = F.mse_loss(z_pred_norm, z_target_norm)
             
-            # 1. Target Prediction Loss (Masked regions)
-            loss_target = F.mse_loss(z_pred_norm[mask_exp == 1], z_target_norm[mask_exp == 1])
-            
-            # 2. Context Consistency Loss (Unmasked regions)
-            if enable_context:
+            if enable_context and (mask_exp == 0).any():
                 loss_context = F.mse_loss(z_pred_norm[mask_exp == 0], z_target_norm[mask_exp == 0])
             else:
                 loss_context = torch.tensor(0.0, device=DEVICE)
                 
-            # 3. Explicit Physical Constraint Loss: Scale-Invariant Depth & Radiometric Thermal Regularization
-            raw_depth = x_full[:, 3:4, :, :]
-            raw_therm = x_full[:, 4:5, :, :]
-            
+            # 3. Physical Calibration Parameter Anchoring Prior
             stem = model.context_encoder.patch_embed1.proj
             if hasattr(stem, 'depth_scale'):
-                d_mean_tensor = raw_depth.mean(dim=(2, 3), keepdim=True).clamp(min=1e-5)
-                calibrated_depth = ((raw_depth / d_mean_tensor) * stem.depth_scale) + stem.depth_bias
-                calibrated_therm = (raw_therm * torch.sigmoid(stem.therm_scale)) + stem.therm_bias
-                
-                # Protect Scale-Invariant Depth Consistency Penalty from corrupted (mean-shifted) dropout tensors
-                if valid_depth_mask.any():
-                    loss_depth_phys = scale_invariant_depth_loss(calibrated_depth[valid_depth_mask], raw_depth[valid_depth_mask])
-                else:
-                    loss_depth_phys = torch.tensor(0.0, device=DEVICE)
-                    
-                # Protect Radiometric Thermal Bounded Regularization
-                if valid_therm_mask.any():
-                    loss_therm_phys = torch.mean((calibrated_therm[valid_therm_mask] - raw_therm[valid_therm_mask]) ** 2)
-                else:
-                    loss_therm_phys = torch.tensor(0.0, device=DEVICE)
-                    
-                loss_physics = 0.05 * (loss_depth_phys + loss_therm_phys)
+                loss_depth_prior = ((stem.depth_scale - 1.0) ** 2).mean() + (stem.depth_bias ** 2).mean()
+                loss_therm_prior = ((stem.therm_scale - 1.0) ** 2).mean() + (stem.therm_bias ** 2).mean()
+                loss_physics = 0.01 * (loss_depth_prior + loss_therm_prior)
             else:
                 loss_physics = torch.tensor(0.0, device=DEVICE)
             
-            # --- Fortified Variance & Covariance Regularization ---
-            if variance_type == 'spatial':
-                target_flat = z_target_norm.transpose(0, 1).reshape(z_target_norm.shape[1], -1)
-                
-                std_target = torch.sqrt(target_flat.var(dim=1) + 1e-04) 
-                loss_var = torch.mean(F.relu(1.0 - std_target))
-                
-                if enable_covariance:
-                    target_flat_centered = target_flat - target_flat.mean(dim=1, keepdim=True)
-                    cov_matrix = (target_flat_centered @ target_flat_centered.T) / (target_flat.shape[1] - 1)
-                    cov_matrix.fill_diagonal_(0.0)
-                    loss_cov = (cov_matrix ** 2).sum() / target_flat.shape[0]
-                else:
-                    loss_cov = torch.tensor(0.0, device=DEVICE)
-                
-                loss_reg = loss_var + (0.05 * loss_cov)
-
-            elif variance_type == 'batch':
-                target_pooled = z_target_norm.mean(dim=(2, 3))
-                
-                std_target = torch.sqrt(target_pooled.var(dim=0) + 1e-04)
-                loss_var = torch.mean(F.relu(1.0 - std_target))
-                
-                if enable_covariance:
-                    target_centered = target_pooled - target_pooled.mean(dim=0, keepdim=True)
-                    cov_matrix = (target_centered.T @ target_centered) / (target_centered.shape[0] - 1)
-                    cov_matrix.fill_diagonal_(0.0)
-                    loss_cov = (cov_matrix ** 2).sum() / target_pooled.shape[1]
-                else:
-                    loss_cov = torch.tensor(0.0, device=DEVICE)
-                
-                loss_reg = loss_var + (0.05 * loss_cov)
-            else:
-                loss_reg = torch.tensor(0.0, device=DEVICE)
-            
-            # Final Fortified Objective including V3 Physical Constraints
             loss = loss_target + (0.5 * loss_context) + (0.1 * loss_reg) + loss_physics
             
             loss.backward()
@@ -239,7 +217,7 @@ def main():
             epoch_loss += loss.item()
             loop.set_postfix(loss=loss.item(), tau=f"{current_tau:.5f}")
             
-        print(f"Epoch {epoch+1} | Latent MSE: {epoch_loss/len(dataloader):.4f}")
+        print(f"Epoch {epoch+1} | Latent Objective Loss: {epoch_loss/len(dataloader):.4f}")
         
         checkpoint = {
             'epoch': epoch + 1,
@@ -251,6 +229,7 @@ def main():
         }
         torch.save(checkpoint, os.path.join(weight_dir, f"jepa_checkpoint_{cfg['backbone']}.pt"))
         torch.save(model.context_encoder.state_dict(), os.path.join(weight_dir, f"jepa_context_encoder_{cfg['backbone']}.pt"))
+
 
 if __name__ == '__main__':
     main()
