@@ -715,6 +715,14 @@ wheels = [
 ]
 
 [[package]]
+name = "flatbuffers"
+version = "25.12.19"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e8/2d/d2a548598be01649e2d46231d151a6c56d10b964d94043a335ae56ea2d92/flatbuffers-25.12.19-py2.py3-none-any.whl", hash = "sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4", size = 26661, upload-time = "2025-12-19T23:16:13.622Z" },
+]
+
+[[package]]
 name = "flatten-dict"
 version = "0.5.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1612,6 +1620,24 @@ wheels = [
 ]
 
 [[package]]
+name = "onnxruntime"
+version = "1.32.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "flatbuffers" },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "protobuf" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/5d/50be370b540a6cb9ea173503f5418e8315dfe5757400ad7720542d348b94/onnxruntime-1.32.0-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:366b9e53d07812cc5c92822cecf7563b76a8a0f32ba3bb8dd232a206ac3bcb6c", size = 22506162, upload-time = "2026-11-13T11:05:56.87Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/30/103820b32e9dc1d1fcfc5b519fd2de5bd699d25a25895caf5d726350d1b5/onnxruntime-1.32.0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:2303372a85299b6757b0e11e1cbf13e410ddf7e10c37f4b37e99d1c90e7daf7c", size = 23195070, upload-time = "2026-11-13T11:06:00.34Z" },
+    { url = "https://files.pythonhosted.org/packages/1d/46/e6f356c9539d2eed44126de3421a81e217da2ad91b22dc11b379cb1e384f/onnxruntime-1.32.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:5a34fc4dfeb5a7b4a74c95dcba1e773d722abda720b474edf1b0c419dc6d163d", size = 27773237, upload-time = "2026-11-13T11:06:03.754Z" },
+    { url = "https://files.pythonhosted.org/packages/07/ff/c797464da311c580ec477077a5c65d7841599a46c35392b5978c0a5ae9a4/onnxruntime-1.32.0-cp311-cp311-win_amd64.whl", hash = "sha256:d7e0c45cc5f456ad7805e6dd256a7662736cda9c2fd17becae194eb3c2f6df72", size = 16695880, upload-time = "2026-11-13T11:06:06.877Z" },
+    { url = "https://files.pythonhosted.org/packages/bd/ff/e14181a5315745007f06612d963c6f739b371452b089b5b8109c2379bd32/onnxruntime-1.32.0-cp311-cp311-win_arm64.whl", hash = "sha256:23361cdf98afac352d10aa7d9e0a10ceaeb02d38430fb693c6eff370196db62d", size = 16027290, upload-time = "2026-11-13T11:06:10.172Z" },
+]
+
+[[package]]
 name = "onnxscript"
 version = "0.7.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2183,6 +2209,11 @@ dependencies = [
     { name = "umap-learn" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "onnxruntime" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "dvc", specifier = ">=3.67.1" },
@@ -2210,6 +2241,9 @@ requires-dist = [
     { name = "torchvision", specifier = ">=0.27.1", index = "https://download.pytorch.org/whl/cu130" },
     { name = "umap-learn", specifier = ">=0.5.12" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "onnxruntime", specifier = ">=1.32.0" }]
 
 [[package]]
 name = "rich"

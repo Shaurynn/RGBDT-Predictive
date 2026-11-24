@@ -38,3 +38,8 @@ explicit = true
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu130" }]
 torchvision = [{ index = "pytorch-cu130" }]
+
+[dependency-groups]
+dev = [
+    "onnxruntime>=1.32.0",
+]

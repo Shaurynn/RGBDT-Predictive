@@ -2,284 +2,294 @@
 
 ## Abstract
 
-Structural defect detection in industrial environments necessitates the robust integration of RGB, Depth, and Thermal (RGB-D-T) modalities [20]. In this repository, we document the evolution of a spatial perception engine designed specifically for bounded edge-hardware [19]. Recognizing the computational limits of deep cross-attention networks [4] and the high-frequency noise inherent to generative pixel-space autoencoders [1], this architecture introduces the Tri-Modal Latent Predictive Network (TMLPN_v3) utilizing a Multimodal Joint-Embedding Predictive Architecture (MM-JEPA) [2]. By decoupling representation learning from downstream segmentation [10] and applying rigorous spatial constraints—including Dirac-initialized alignment projections [7], Concurrent Spatial-Channel Gating [32], and Explicit Boundary Supervision [35]—the framework establishes a robust structural foundation model capable of real-time, high-resolution edge inference [20].
+Structural defect and organic anomaly detection in industrial environments requires the reliable integration of RGB, Depth, and Thermal (RGB-D-T) sensor modalities [17]. This repository documents the architecture, mathematical formulation, and MLOps engineering of a spatial perception engine designed for bounded edge hardware [16]. To avoid the quadratic memory cost of non-hierarchical cross-attention networks [4] and the high-frequency radiometric noise reconstruction of pixel-space autoencoders [1], we introduce the Tri-Modal Latent Predictive Network (`TMLPN_v3`) built upon a Multimodal Joint-Embedding Predictive Architecture (MM-JEPA) [2]. By decoupling self-supervised representation learning from downstream semantic segmentation [9] and enforcing strict mathematical and engineering boundaries—including stratified sequence-aware splits, data-plane RGB-only normalization, valid-pixel depth and identity-centered thermal calibration, Dirac-initialized alignment projections [7], Concurrent Spatial-Channel Squeeze & Excitation (scSE) gating [29], target-preserving Modality Dropout [31], encoder-level Variance-Invariance-Covariance Regularization (VICReg) [11], interior-eroded Sobel boundary supervision, and checkpoint-exact Feature-Level Knowledge Distillation [23]—the framework establishes a reproducible foundation model for real-time edge inference [17].
+
+---
+
+## Repository Layout & Quickstart
+
+### Core Modules
+
+| File | Role |
+| :--- | :--- |
+| `freeze_splits.py` | Adapts canonical `train_dataset.csv` and `eval_dataset.csv` manifests into locked 3-way splits (`train.csv`, `val.csv`, `test.csv`) using group-aware and rare-class-stratified 50/50 partitioning, emitting `split_audit.json`. |
+| `dataset_jepa.py` | Enforces data-plane RGB-only normalization, native $[0, 1]$ Depth/Thermal physical scaling, split-interpolation planar augmentations, stride-32 aligned random patch masking, target-preserving Modality Dropout, and hash-keyed atomic statistics caching. |
+| `models.py` | Implements `ModalityIsolatedPatchEmbed`, `ConcurrentSpatialChannelSE`, asymmetric `PositionalEncoding2D`, non-leaking `SpatialJEPAPredictor`, `MultimodalJEPA`, `SegFormerAllMLPDecoder`, `LoRALinear`, `TMLPN_Downstream_v1`/`v2`/`v3`, and `instantiate_model_from_checkpoint`. |
+| `pretrain_jepa.py` | Phase 1 self-supervised MM-JEPA pre-training with encoder-level VICReg (`z_context`), centered physical anchoring priors, linear warmup + cosine LR decay, gradient clipping, crash-safe resume, and completion-gated encoder export. |
+| `train_downstream.py` | Phase 2 5-stage state machine (`baseline` $\rightarrow$ `hpo` $\rightarrow$ `hero` $\rightarrow$ `microtune` $\rightarrow$ `export`) with exact teacher KD reconstruction, LoRA key remapping, full-precision GDL/Focal/Sobel loss, true `SegmentationGradCAM`, blind test TTA, and `opset_version=16` ONNX export. |
+| `ml_pipeline.py` | Multi-seed ($N=5$) MLOps orchestrator writing immutable per-trial YAMLs (`.pipeline_configs/`), teacher-first scheduling, validation-only optimal backbone selection, and Phase 1 artifact reuse. |
+| `analyse_results.py` | Unified statistical and latent evaluation suite reporting unbiased sample standard deviation (`ddof=1`), seed-aligned paired $t$-tests with Benjamini-Hochberg FDR [32], and full-test uniform UMAP/t-SNE projections. *(Replaces the deprecated `visualize_latents.py`.)* |
+| `validate_pipeline.py` | 7-check zero-dataset pre-flight validation suite verifying stem dropout stability, 2D PE asymmetry, predictor non-leakage, encoder VICReg gradients, cross-ablation teacher KD, Grad-CAM hooks, and ONNX runtime parity. |
+| `config_utils.py` | YAML configuration loader and CLI override dispatcher. |
+
+### End-to-End Execution Workflow
+
+```bash
+# 1. Freeze and audit stratified 3-way canonical splits
+#    (Add --group_regex "^(.+)_\d+$" if filenames encode sequential capture prefixes)
+uv run freeze_splits.py --dataset MM5 --stratify_by_mask
+
+# 2. Run the 7-check pre-flight validation suite before committing GPU compute
+uv run validate_pipeline.py --device cuda --opset 16
+
+# 3. Launch the multi-seed (N=5) training and ablation orchestration matrix
+uv run ml_pipeline.py --dataset MM5 --model TMLPN_Downstream_v3
+
+# 4. Aggregate metrics, paired-t BH-FDR statistics, and full-test UMAP/t-SNE manifolds
+uv run analyse_results.py --model TMLPN_Downstream_v3 --dataset MM5
+```
 
 ---
 
 ## 1. Introduction
 
-The integration of high-resolution, unaligned multimodal sensors provides critical advantages in detecting structural defects and organic anomalies [20]. Deploying continuous multi-channel arrays—specifically utilizing Nuwa HP60C RGBD and 640x512 LWIR Vanadium Oxide fused sensor systems—onto edge compute modules necessitates strict algorithmic efficiency [20].
+Integrating multimodal sensors improves the detection of surface and subsurface structural defects and organic anomalies [17]. While architecture development and statistical benchmarking in this repository are conducted on the 5-channel MM5 benchmark dataset [17, 18], the validated model is engineered for deployment on our developing fused sensor array comprising a Nuwa HP60C RGB-D camera and a $640 \times 512$ Long-Wave Infrared (LWIR) Vanadium Oxide thermal sensor on bounded edge compute modules [16, 17].
 
-Early iterations of multimodal learning utilized generative pixel-space decoders [1]. However, reconstructing pixel-space values forces the network to map irrelevant high-frequency radiometric noise, reducing available representational capacity [1]. To address this, we transitioned to Latent Space Prediction, building upon recent advancements in self-supervised architectures [2]. This repository executes target-selective spatial inference via an empirically evaluated two-phase pipeline [2, 10].
+Early iterations of multimodal self-supervised learning relied on generative pixel-space decoders [1]. Reconstructing raw pixel intensities forces the network to allocate capacity to high-frequency sensor noise and ambient thermal drift [1]. To prevent this, TMLPN transitions to latent-space prediction via a two-phase self-supervised and supervised pipeline [2, 9].
 
-### 1.1 Architectural Deviations: TMLPN vs. MuMo-JEPA
+### 1.1 Architectural Deviations: TMLPN vs. Multi-Trunk Multimodal Architectures
 
-Recent literature highlights Multimodal JEPA (MuMo-JEPA) architectures, which rely on late-fusion, independent Vision Transformer (ViT-Huge) trunks per modality, and cross-attention joint embeddings [3]. While theoretically optimal for unconstrained server environments, we deviate from the MuMo-JEPA methodology for the following grounded reasons:
+Server-scale multimodal representation frameworks (such as multi-encoder contrastive models like ImageBind [3] or late-fusion multimodal JEPA variants) typically assign independent Vision Transformer trunks per modality with deep cross-attention joint embeddings. TMLPN deviates from late-fusion ViT trunks for three hardware-grounded reasons:
 
-1. **Memory-Bandwidth Bottlenecks:** Maintaining multiple independent ViT trunks in VRAM violates the shared-memory and bandwidth constraints of edge devices, as standard non-hierarchical Transformers incur prohibitive parameter counts during inference [19].
-2. **Quadratic Scaling:** Standard self-attention mechanisms scale with $O(N^2)$ complexity relative to spatial resolution, prohibiting real-time inference on high-resolution industrial image strips [4].
-3. **Hardware-Aware Early Fusion:** TMLPN utilizes a single hierarchical MiT trunk with a structurally isolated modality stem [10]. The MiT sequence reduction process ensures linear $O(N)$ computational scaling [10], while our Dirac-initialized 1x1 projections address the latent alignment discrepancies typically associated with early fusion [5, 7].
+1. **Memory-Bandwidth Constraints:** Maintaining multiple independent ViT trunks in VRAM exceeds the shared-memory and bandwidth limits of embedded edge devices [16].
+2. **Computational Complexity:** Standard non-hierarchical self-attention scales quadratically at $O(N^2)$ with respect to spatial resolution, preventing real-time inference on high-resolution industrial frames [4].
+3. **Hardware-Aware Early Fusion:** TMLPN uses a single hierarchical Mix Transformer (MiT) trunk preceded by a structurally isolated modality stem [9]. The hierarchical sequence reduction in MiT maintains efficient scaling [9], while Dirac-initialized $1 \times 1$ alignment projections and concurrent spatial-channel gating mitigate the representational interference associated with naive early fusion [5, 7, 29].
 
 ---
 
-## 2. Reproducibility & Open Source Assets
+## 2. Reproducibility, Data-Plane Isolation & Split Hygiene
 
-To ensure strict academic reproducibility of our evaluation benchmarks, all artifacts will be published alongside this repository following the conclusion of the training cycle [24]:
+To ensure statistical reproducibility across benchmarks, the repository enforces strict separation between the data ingestion plane, the training control plane, and the evaluation engine [21]:
 
-* **Pre-Trained Weights:** Converged `best_model.pt` checkpoints will be provided for identical inference replication [24].
-* **Dataset Splits & Blind Testing:** Exact training and evaluation subsets are mapped via CSV data splits (`data/splits/`) to eliminate distribution variance [21]. To correct statistical inference and address validation leakage, the framework employs a strictly separated blind test set. The original evaluation pool is programmatically split into a 50% validation set (used strictly for hyperparameter sweep monitoring and early stopping) and a 50% test set reserved exclusively for final gradient-free metrics generation.
-* **Deterministic Execution & Multi-Seed Verification:** The execution engines utilize strict environmental locking (`seed=42`) across PyTorch, NumPy, and CUDA backends to minimize stochastic gradient variance [24]. To eliminate single-run optimistic bias, all main architectural baselines and ablation experiments output multi-seed main results (N=5) to capture the Mean mIoU ± Standard Deviation.
+* **Stratified & Sequence-Grouped 3-Way Splits (`freeze_splits.py`):** Exact training and evaluation subsets are mapped via static CSV manifests (`data/splits/<dataset>/`) [18]. To eliminate both validation leakage and rare-class or sequential-frame skew, the canonical evaluation pool is deterministically partitioned (`seed=42`) into a 50% validation split (`val.csv`, used strictly for Optuna pruning, early stopping, and automatic backbone selection) and a 50% blind test split (`test.csv`, evaluated exclusively once at final `microtune` convergence):
+  * Uses `StratifiedGroupKFold(n_splits=2)` whenever scene/sequence columns (`scene_id`, `sequence_id`, `capture_id`, `group_id`) or `--group_regex` capture prefixes are supplied, guaranteeing zero group overlap.
+  * Uses `StratifiedShuffleSplit(test_size=0.5)` with deterministic singleton alternation otherwise, automatically deriving each frame's rarest foreground defect class from `Class_Annotations` when CSV `class_label` metadata is absent or constant.
+  * Emits `split_audit.json` documenting exact per-stratum balance and zero file/group overlap.
+* **Data-Plane vs. Control-Plane Normalization Boundary (`dataset_jepa.py`):** Z-score normalization (`TF.normalize`) is applied exclusively to the 3-channel photometric RGB tensor (`x_full[:3]`). Geometric Depth (`x_full[3:4]`) and radiometric Thermal (`x_full[4:5]`) tensors are maintained in their native $[0, 1]$ sensor-scaled domain. Statistics are cached atomically under `dataset_stats_{H}x{W}_{manifest_hash}.pt` so resolution or split changes never load stale statistics, and input bit-depth sanity guards warn if 8-bit Depth/Thermal PNGs are divided by 16-bit fallback scales.
+* **Deterministic Multi-Worker, HPO & Orchestration Locking:** All multi-process `DataLoader` instances attach `seed_worker` and a seeded `torch.Generator` alongside `enforce_reproducibility` [21]. Hyperparameter sweeps lock `optuna.samplers.TPESampler(seed=active_seed)`. Rather than mutating `config.yaml` in place, `ml_pipeline.py` materializes isolated per-trial YAML configurations under `.pipeline_configs/` and passes them via `--config`, ensuring crash/SIGKILL safety. All primary baselines and ablations execute across $N=5$ locked seeds (`[42, 1024, 2048, 4096, 8192]`) [21].
 
 ---
 
 ## 3. Phase 1: Self-Supervised MM-JEPA Pre-Training
 
-To construct a foundation model of the physical environment, the network must decouple feature extraction from human-annotated labels [2]. Phase 1 achieves this through self-supervised spatial inference, forcing the network to model structural geometry prior to task-specific fine-tuning [2].
+Phase 1 decouples geometric and radiometric feature extraction from human-annotated segmentation labels [2]. The Context Encoder learns multimodal structural representations through self-supervised latent prediction prior to downstream task adaptation [2].
 
-### 3.1 Stem Modality Isolation & Alignment Projection
+### 3.1 Stem Modality Isolation, Valid-Pixel Calibration & scSE Gating
 
-Initializing a multi-channel stream directly from 3-channel weights introduces representational interference due to the cross-modal domain gap [5]. TMLPN isolates modality ingestion at the stem using a `ModalityIsolatedPatchEmbed` module to safely fuse unaligned manifolds [5]:
+Feeding a 5-channel RGB-D-T tensor directly into a 3-channel convolutional stem corrupts pre-trained visual priors due to cross-modal statistical divergence [5]. `ModalityIsolatedPatchEmbed` (`models.py`) isolates modality ingestion at the stem and exposes `forward_split(x)` as a single source of truth for both forward execution and latent manifold extraction:
 
-* **RGB Stream:** Inherits unmodified 3-channel ImageNet kernels to leverage generalized edge-detection priors [22].
-* **D+T Stream:** Utilizes independent, Kaiming-initialized convolutions to prevent early-epoch activation vanishing in the high-variance depth and thermal tensors [6].
-* **1x1 Dirac Alignment:** To bridge this dimensional gap prior to additive fusion, TMLPN utilizes a 1x1 convolutional projection initialized via a Dirac delta distribution [7]: 
+* **RGB Stream:** Retains unmodified 3-channel ImageNet pre-trained kernels (`rgb_proj`) to preserve spatial edge and texture priors [19].
+* **Valid-Pixel Scale-Invariant Depth Calibration:** Let $M_{D} = \mathbb{I}(x_{\text{depth}} > 10^{-6})$ denote the valid-pixel mask excluding invalid sensor zeros, rotation corner padding, masked regions, and dropped channels. Depth is normalized strictly over valid pixels prior to affine calibration:
 
-$$ W_{i,j,k,l} = \begin{cases} 1 & \text{if } i=j \text{ and } k,l \text{ are the center} \\ 0 & \text{otherwise} \end{cases} $$
+$$\mu_{D} = \frac{\sum_{h,w} x_{\text{depth}} \odot M_{D}}{\max\left(1, \sum_{h,w} M_{D}\right)}, \quad x_{\text{depth\_cal}} = \left(\frac{x_{\text{depth}}}{\max(\mu_{D}, 10^{-4})} \cdot \gamma_{\text{depth}} + \beta_{\text{depth}}\right) \odot M_{D}$$
 
-This initialization provides a structural identity mapping that mitigates initial gradient shocks, allowing the Kaiming-initialized Depth/Thermal kernels to gradually assimilate into the pre-trained ImageNet manifold without corrupting the learned weights [7].
+This evaluates relative surface geometry rather than global standoff distance while remaining numerically immune to division-by-zero or sign-flip instability under 100% Modality Dropout.
+* **Identity-Centered Bounded Thermal Calibration:** Letting $M_{T} = \mathbb{I}(x_{\text{therm}} > 10^{-6})$, thermal inputs are scaled by a bounded gain centered at exact physical identity ($2\sigma(0) = 1.0$, range $(0, 2)$) with additive offset $\beta_{\text{therm}}$:
 
-### 3.2 The MM-JEPA Topology
+$$x_{\text{therm\_cal}} = \left(x_{\text{therm}} \cdot 2\sigma(\gamma_{\text{therm}}) + \beta_{\text{therm}}\right) \odot M_{T}$$
 
-To satisfy the theoretical mandates of latent prediction, the network executes the following spatial constraints:
+* **Kaiming Projection & Dirac $1 \times 1$ Alignment:** The calibrated 2-channel Depth+Thermal tensor passes through a Kaiming-initialized convolution (`depth_therm_proj`) [6] followed by a bias-free $1 \times 1$ convolution (`dt_alignment`) initialized with a Dirac delta identity distribution [7]:
 
-* **Token Replacement Masking:** Masked spatial coordinates are explicitly replaced with a broadcasted, learnable parameter (`encoder_mask_token`), aligning with proven masked image modeling protocols [1, 9].
-* **Multi-Block Strategy:** The architecture samples 4 independent overlapping target blocks with varying scales (0.15–0.20) and aspect ratios (0.75–1.5) [2].
-* **Target-Conditioned Spatial Predictor:** 2D Positional Encodings are concatenated strictly alongside the context feature map and target mask within the depthwise-separable predictor, ensuring the network is conditioned on the target location [10].
-* **EMA Cosine Annealing & Gradient Isolation:** Target network outputs are severed from the computational graph and updated strictly via a Cosine Annealing Exponential Moving Average (EMA) schedule from 0.996 to 1.0 to prevent representation collapse [11].
+$$W_{i,j,k,l} = \begin{cases} 1 & \text{if } i = j \text{ and } k, l \text{ are the spatial center} \\ 0 & \text{otherwise} \end{cases}$$
+
+* **Dynamic Cross-Modal Gating (scSE):** Immediately following additive stem fusion, `ConcurrentSpatialChannelSE` (`models.py`) applies concurrent Channel Squeeze & Excitation (`cSE`, reduction ratio $r = 16$) [30] and Spatial Squeeze & Excitation (`sSE`, $1 \times 1$ spatial gating) [29]: $U_{\text{scSE}}(X) = U_{\text{cSE}}(X) + U_{\text{sSE}}(X)$.
+
+### 3.2 Rectified MM-JEPA Topology
+
+The Phase 1 architecture (`MultimodalJEPA` and `SpatialJEPAPredictor` in `models.py`) enforces five structural invariants:
+
+1. **RGB-Isolated Token Replacement Masking:** The learnable `encoder_mask_token` ($\mathbb{R}^{1 \times 3 \times 1 \times 1}$) is applied strictly to photometric RGB channels (`x_visible[:, :3]`). Masked Depth and Thermal coordinates remain at `0.0`, preserving the physical no-signal convention expected by $M_D$ and $M_T$ [1, 8].
+2. **Stride-32 Aligned Spatial Masking:** Random patch masking (`mask_strategy: random`) samples non-overlapping $32 \times 32$ pixel patches at a $0.60$ mask ratio (`patch_size=32` in `dataset_jepa.py`), matching the MiT Stage-4 (`c4`) output stride so area-majority pooling (`F.adaptive_avg_pool2d >= 0.5`) yields an exact 1-to-1 binary latent mask with zero quadrant leakage. Contiguous `multi_block` masking (4 blocks, scale $[0.15, 0.20]$, aspect ratio $[0.75, 1.5]$) [2] is retained for ablations.
+3. **Asymmetric 2D Sinusoidal Positional Encoding (`PositionalEncoding2D`):** Allocates disjoint channel halves ($C / 2$ for $x$, $C / 2$ for $y$) concatenated along the channel dimension, avoiding transpose symmetry where $\text{PE}(x, y) = \text{PE}(y, x)$.
+4. **Non-Leaking Predictor Residual (`SpatialJEPAPredictor`):** Replaces masked spatial positions in `z_context` with `self.mask_token` to form `grid`, adds 2D positional encodings, and anchors the residual connection strictly on `grid` (`grid + self.predictor(grid_with_pos)`) rather than `z_context`, preventing direct shortcut leakage of masked encoder activations.
+5. **Floating-Point-Guarded EMA Target Encoder:** The Target Encoder processes clean `x_full` under `torch.no_grad()` and updates via a Cosine Annealing EMA schedule ($\tau \in [0.996, 1.0]$) [10], guarding buffer updates with `is_floating_point()` for backbone generality.
+
+### 3.3 Encoder-Level Fortified Pre-Training Objective & Target-Preserving Modality Dropout
+
+`pretrain_jepa.py` runs `bfloat16` mixed-precision forward passes with `float32` loss computation, linear LR warmup, cosine LR decay [26], gradient clipping (`max_norm=1.0`), atomic checkpointing, full crash-safe resume (bypassing SMP's custom `load_state_dict` override via `nn.Module.load_state_dict`), and completion-gated export of `jepa_context_encoder_{backbone}.pt`:
+
+$$\mathcal{L}_{\text{Phase1}} = \mathcal{L}_{\text{target}} + 0.5 \, \mathcal{L}_{\text{context}} + 0.1 \, \mathcal{L}_{\text{reg}} + \mathcal{L}_{\text{physics}}$$
+
+1. **Direction-Aligned Target Prediction ($\mathcal{L}_{\text{target}}$):** MSE between $L_2$-normalized online predictions (`z_pred_norm`) and detached target representations (`z_target_norm`) over masked latent tokens ($M = 1$) [2].
+2. **Context Consistency ($\mathcal{L}_{\text{context}}$):** MSE between `z_pred_norm` and `z_target_norm` over unmasked tokens ($M = 0$) to prevent visible context drift [2].
+3. **Encoder-Level VICReg ($\mathcal{L}_{\text{reg}}$):** Variance and off-diagonal covariance regularization [11] computed directly on the **unnormalized online encoder output (`z_context`)** in `float32` (preventing the predictor's final $1 \times 1$ head from gaming variance/covariance while `context_encoder` collapses).
+4. **Centered Physical Anchoring Prior ($\mathcal{L}_{\text{physics}}$):** Regularizes stem calibration around the true physical identity mapping ($\gamma_{\text{depth}} \rightarrow 1.0$, $\gamma_{\text{therm}} \rightarrow 0.0$ so $2\sigma(0) = 1.0$, biases $\rightarrow 0.0$):
+
+$$\mathcal{L}_{\text{physics}} = 0.01 \left[ (\gamma_{\text{depth}} - 1)^2 + \beta_{\text{depth}}^2 + \gamma_{\text{therm}}^2 + \beta_{\text{therm}}^2 \right]$$
+
+5. **Target-Preserving Modality Dropout:** During Phase 1 training (`JEPAPretrainDataset`), independent 15% dropout of Depth or Thermal (`modality_dropout_prob: 0.15`) is applied strictly to `x_visible` while `x_full` remains intact for the EMA Target Encoder [2, 31]. Because Depth and Thermal reside in $[0, 1]$ physical space, zeroing dropped channels introduces zero Z-score mean-shift corruption.
 
 ---
 
-## 4. Phase 2: Supervised Semantic Fine-Tuning
+## 4. Phase 2: Supervised Semantic Segmentation & Optimization
 
-Phase 2 transfers the pre-trained Context Encoder to the downstream task of semantic segmentation, utilizing a resolution-invariant SegFormer MLP decoder [10].
+Phase 2 transfers the converged Phase 1 Context Encoder to downstream semantic segmentation across a 5-stage state machine (`baseline` $\rightarrow$ `hpo` $\rightarrow$ `hero` $\rightarrow$ `microtune` $\rightarrow$ `export`) managed by `ExperimentManager` (`train_downstream.py`) [9].
 
-### 4.1 The Multi-Scale All-MLP Decoder
+### 4.1 Multi-Scale All-MLP Decoder
 
-Heavy transposed convolution decoders violate the latency constraints required for real-time edge processing [19]. TMLPN synthesizes sub-pixel spatial boundaries using an All-MLP Decoder [10]. Batch Normalization within the SegFormer decoder was substituted with Layer Normalization to maintain activation stability under bounded hardware batch constraints (N=6). By projecting the 1/4, 1/8, 1/16, and 1/32 hierarchical feature grids to a unified embedding dimension, applying LayerNorms, upsampling exclusively to a common 1/4 resolution, and concatenating them, the network achieves boundary delineation within an edge-compliant footprint [10].
+To satisfy bounded edge latency constraints without transposed convolutions [16], `SegFormerAllMLPDecoder` (`models.py`) projects hierarchical feature maps (`c1`–`c4`, strides $4$ to $32$) to 256 channels, bilinearly upsamples them to $1/4$ resolution, and fuses them with `nn.GroupNorm(1, 256)` (batch-size-invariant channel LayerNorm) and out-of-place `nn.ReLU(inplace=False)` for clean Grad-CAM hooking [9].
 
-### 4.2 Mitigating Imbalance: Alpha-Balanced Focal GDL
+### 4.2 Composite Imbalance & Boundary Objective (`AlphaBalancedFocalGDLLoss`)
 
-Industrial datasets exhibit high foreground-background class imbalance [20]. The downstream engine utilizes a rigorous bipartite loss objective:
+Industrial defect segmentation suffers from extreme foreground-to-background class imbalance [17]. `compute_dataset_statistics` computes exact pixel frequencies once over the full deterministic (unaugmented, unshuffled) training split and caches them per dataset and resolution:
 
-1. **Alpha-Balanced Focal Loss:** Mitigates background dominance by explicitly weighting classes according to their empirical dataset frequencies via Median Frequency Balancing [13].
-2. **Global Volume Anchored Generalized Dice Loss (GDL):** TMLPN utilizes *Global Volume Anchoring*, where GDL weights are anchored to the inverse square of the global dataset frequencies [14]. Additive Laplace Smoothing ensures theoretical bounds are constrained by the dataset's native volume [24].
+1. **Valid-Pixel Alpha-Balanced Focal Loss:** Uses Median Frequency Balancing ($\alpha_c = \text{median}(f) / f_c$) with focusing parameter $\gamma$ [12], averaging strictly over valid (non-`ignore_index`) pixels so rotated corner padding never biases loss magnitude.
+2. **Full-Precision Global Volume Anchored GDL:** Computes class weights $w_c \propto 1 / f_c^2$ [13] normalized by their median across present classes and clamped to $[10^{-6}, 10^{6}]$ without 4-decimal rounding, preventing non-rare classes from underflowing to `0.0` and silently dropping out of Dice supervision.
+3. **Interior-Eroded Explicit Sobel Boundary Supervision:** Fixed $3 \times 3$ depthwise Sobel kernels ($G_x, G_y$) compute spatial edge magnitudes $E(X) = \sqrt{(G_x * X)^2 + (G_y * X)^2 + \epsilon}$ on softmax probabilities and one-hot ground truth. To prevent artificial step edges along rotated `ignore_index=255` borders, the invalid mask is dilated by 1 pixel via max-pooling so the $L_1$ boundary penalty is evaluated strictly on eroded interior valid pixels:
+
+$$\mathcal{L}_{\text{boundary}} = \frac{1}{|V_{\text{eroded}}|} \sum_{(h,w) \in V_{\text{eroded}}} \sum_{c=1}^{C} \left| E(P_{\text{soft}})_{c,h,w} - E(Y_{\text{onehot}})_{c,h,w} \right|$$
+
+### 4.3 Multimodal Augmentation & Split Interpolation
+
+In `dataset_jepa.py` [25]:
+* **RGB-Isolated Color Jitter:** Brightness, contrast, saturation, and hue perturbations apply exclusively to `x_full[:3]`, preserving physical Depth and Thermal values.
+* **Synchronized Horizontal Flipping (No Vertical Flips):** Preserves gravity-aligned structural and shadow priors.
+* **Planar Rotation ($\theta \in [-15^\circ, +15^\circ]$) with Split Interpolation:** `BILINEAR` for RGB, `NEAREST` for Depth and Thermal (avoiding depth-discontinuity smearing), and `NEAREST` with `fill=255.0` (`ignore_index`) for ground-truth segmentation masks.
+
+### 4.4 Downstream Optimization & MLOps Rectifications
+
+* **Phase 1 LoRA Key Remapping (`load_phase1_encoder_weights`):** Calls `nn.Module.load_state_dict` directly (bypassing SMP's `MixVisionTransformerEncoder.load_state_dict` signature constraint) and automatically remaps unwrapped Phase 1 `.q`/`.kv` keys into `.q.original_layer`/`.kv.original_layer` when LoRA adapters (`use_lora=True`) [22] are active—ensuring pre-trained attention weights are never silently dropped to random initialization.
+* **Unfrozen Modality Stem & Decoupled LLRD:** `patch_embed1.proj` (calibration priors, Dirac alignment, and `scSE`) remains trainable across all Phase 2 stages. During `microtune`, `build_llrd_optimizer` assigns undecayed `base_lr` to `decode_head`, `patch_embed1.proj`, and any `lora_` parameters while applying Layer-Wise Learning Rate Decay ($\text{lr} \times \text{decay\_rate}^i$) from `block4` down to `block1` [24], with steeper decay (`0.75`) on high-capacity backbones (`mit_b3`, `mit_b4`, `mit_b5`).
+* **Checkpoint-Exact Teacher KD & HPO Parity:** When `enable_kd=True`, `teacher_model` is reconstructed directly from its own serialized checkpoint via `models.instantiate_model_from_checkpoint(..., strict=True)` so student structural ablations (e.g., `NaiveFusion`, `NoSCSE`) never corrupt teacher weights with random stems. `teacher_model` is passed into `run_hpo_phase` as well as `hero` and `microtune` for objective parity [23], and `feature_distillation_loss` only combines KD loss when matching spatial stages exist.
+* **Persistent HPO Propagation:** `find_hpo_best_params` resolves `*_Hpo/best_params.json` across both `hero` and `microtune`, ensuring Optuna's tuned `weight_decay`, `gamma`, `dice_weight`, and `boundary_weight` carry into `microtune` rather than reverting to defaults.
+* **Validation-Only Selection & Blind Test TTA:** `ml_pipeline.py` selects `optimal_backbone` strictly from `val_mIoU_checkpoint` (`val.csv`). Two-view Horizontal-Flip Test-Time Augmentation (`TTA_DownstreamSegmentationDataset`) [28] runs exclusively once at the end of `microtune` on `test.csv`. Training uses `bfloat16` autocast (with redundant `GradScaler` disabled), 4-step gradient accumulation (`max_norm=1.0`), and phase-specific early stopping [26, 27].
 
 ---
 
-## 5. V1 Pipeline Findings & Ablation Analysis
+## 5. Architectural Evolution: V1 & V2 Historical Benchmarks
 
-Initial executions of the `v1` pipeline yielded stable baseline convergence during the frozen `hero` phase. However, transitioning to the `microtune` phase for end-to-end unfreezing caused performance to plateau and occasionally degrade. Unconstrained downstream gradients propagating back from the high-capacity decoder interfered with the generalized multimodal manifolds learned during Phase 1 pre-training.
+> **Methodological Note:** Historical V1 and V2 benchmarks below were recorded prior to the introduction of the stratified 3-way `train`/`val`/`test` split (`freeze_splits.py`) and the V3 pipeline rectifications. Direct apples-to-apples comparisons against rectified V3 require re-evaluating V1/V2 baselines on the locked 3-way manifests.
+
+### 5.1 V1 Pipeline Findings & The `microtune` Plateau
+
+In `TMLPN_Downstream_v1`, frozen-backbone `hero` training converged reliably, but uniform end-to-end unfreezing during `microtune` plateaued or degraded validation mIoU across `mit_b1`, `mit_b2`, and `mit_b5`. An $N=5$ V1 ablation study confirmed two foundational findings:
+1. **Modality Isolation Necessity:** Replacing `ModalityIsolatedPatchEmbed` with `NaiveEarlyFusionPatchEmbed` (`NaiveFusion`) collapsed performance to **$0.4476$ mIoU** ($p = 0.0001$), confirming that unified 5-channel convolutions destroy ImageNet RGB priors [5].
+2. **Logit-Level KD Inefficacy:** Output logit distillation (`NoKD`, $p = 0.7603$) yielded no significant benefit on dense pixel boundaries while increasing VRAM usage [14].
 
 > ![v1 Network Architecture Diagram](assets/v1_Network_Architecture_Diagram.png)
 >
-> **Figure 1: The Tri-Modal Latent Predictive Network (TMLPN_v1) two-stage execution pipeline.** Demonstrates the baseline architecture prior to the LoRA and LLRD preservation interventions.
-
-### 5.1 V1 Experimental Results & The `microtune` Plateau
-
-As detailed in the experimental results below, architectures such as `mit_b1`, `mit_b2`, and `mit_b5` experienced measurable degradation in Base Validation mIoU when transitioning from the `hero` to `microtune` phase, highlighting the instability of end-to-end unfreezing without gradient constraints.
+> **Figure 1:** Legacy `TMLPN_v1` two-stage pipeline prior to LLRD, LoRA, and Feature-Level KD.
 
 | Method | Backbone | Parameters | Pre-Training | Hero mIoU (Base / TTA) | Microtune mIoU (Base / TTA) |
-| --- | --- | --- | --- | --- | --- |
-| **TMLPN_v1** | **MiT-b1** | 13.7M | **MM-JEPA** | 0.7311 / 0.7262 | 0.7301 / 0.7265 |
-| **TMLPN_v1** | **MiT-b2** | 24.2M | **MM-JEPA** | 0.7531 / 0.7473 | 0.7501 / 0.7444 |
-| **TMLPN_v1** | **MiT-b3** | 44.0M | **MM-JEPA** | 0.7923 / 0.7851 | 0.7946 / 0.7866 |
-| **TMLPN_v1** | **MiT-b4** | 60.8M | **MM-JEPA** | 0.7896 / 0.7969 | 0.7960 / 0.8014 |
-| **TMLPN_v1** | **MiT-b5** | 81.4M | **MM-JEPA** | 0.7829 / 0.7870 | 0.7827 / 0.7865 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **TMLPN_v1** | **MiT-b1** | 13.7M | **MM-JEPA** | $0.7311$ / $0.7262$ | $0.7301$ / $0.7265$ |
+| **TMLPN_v1** | **MiT-b2** | 24.2M | **MM-JEPA** | $0.7531$ / $0.7473$ | $0.7501$ / $0.7444$ |
+| **TMLPN_v1** | **MiT-b3** | 44.0M | **MM-JEPA** | $0.7923$ / $0.7851$ | $0.7946$ / $0.7866$ |
+| **TMLPN_v1** | **MiT-b4** | 60.8M | **MM-JEPA** | $0.7896$ / $0.7969$ | $0.7960$ / $0.8014$ |
+| **TMLPN_v1** | **MiT-b5** | 81.4M | **MM-JEPA** | $0.7829$ / $0.7870$ | $0.7827$ / $0.7865$ |
 
 > ![v1 Phase Progression](assets/v1_phase_progression_trajectory.png)
 >
-> **Figure 2: Architecture Progression Trajectory (V1).** Visualizes the performance plateau when the multi-scale decoder's gradients interfere with the JEPA-pretrained foundation during the Microtune phase.
-
-### 5.2 V1 Ablation Matrix: Component Necessity
-
-A rigorous N=5 ablation study isolated the empirical necessity of our initial architectural components:
+> **Figure 2:** `TMLPN_v1` progression trajectory illustrating the unconstrained `microtune` plateau.
 
 > ![v1 Ablation Studies](assets/v1_ablation_statistics.png)
 >
-> **Figure 3: N=5 Ablation Study Results (V1).** Validated using Welch's t-test for statistical significance against the optimal control.
+> **Figure 3:** $N=5$ `TMLPN_v1` ablation statistics highlighting the `NaiveFusion` collapse.
 
-* **Modality Isolation:** The `NaiveFusion` ablation dropped the network to a **0.4476 mIoU** ($p=0.0001$), proving that forcing 3-channel pretrained weights to adapt to 5-channel unaligned data compromises ImageNet priors. The Dirac-initialized 1x1 alignment stem is empirically supported.
-* **Logit-Level KD Limitations:** Disabling Knowledge Distillation (`NoKD`) yielded no statistically significant penalty ($p=0.7603$). In dense pixel-prediction tasks, raw logit distributions contain high spatial noise, rendering traditional KD less effective while increasing VRAM usage.
+### 5.2 V2 Architecture: LoRA, LLRD & Feature-Level KD
 
----
-
-## 6. V2 Architecture: Optimization & Preservation Strategies
-
-To address the plateau vulnerabilities in the `v1` pipeline, the `v2` architecture transitions to a fortified downstream engine designed to adapt the network toward semantic segmentation while preserving foundational weights.
+`TMLPN_Downstream_v2` introduced Low-Rank Adaptation (`LoRALinear`) [22], Layer-Wise Learning Rate Decay (`build_llrd_optimizer`) [24], and intermediate $L_2$-normalized Feature-Level Knowledge Distillation [23], eliminating the `microtune` plateau across `mit_b1`–`mit_b5`.
 
 > ![v2 Network Architecture Diagram](assets/v2_Network_Architecture_Diagram.png)
 >
-> **Figure 4: The fortified Tri-Modal Latent Predictive Network (TMLPN_v2) two-stage execution pipeline.**
+> **Figure 4:** `TMLPN_v2` pipeline integrating LoRA, LLRD, and Feature-Level KD.
 
-### 6.1 Low-Rank Adaptation (LoRA)
-
-To mitigate gradient instability during the `microtune` phase, the `v2` pipeline integrates Low-Rank Adaptation (LoRA) [25]. Rather than fully unfreezing the N x N weight matrices inside the MiT backbone, the foundation remains mathematically constrained. Trainable low-rank matrices (A and B) are injected specifically into the Query and Value projection layers of the transformer blocks [25]. 
-
-### 6.2 Layer-Wise Learning Rate Decay (LLRD)
-
-To safely couple the LoRA modules with the high-capacity decoder, Layer-Wise Learning Rate Decay (LLRD) is deployed [27]. The optimizer groups parameters hierarchically: the downstream decoder receives the base learning rate, while gradients flowing deeper into the backbone are exponentially decayed (e.g., $lr \times 0.85^n$). 
-
-### 6.3 Feature-Level Knowledge Distillation
-
-To compress the `mit_b5` architecture into an edge-ready `mit_b1` without the noise of logit-level distillation, `v2` employs Feature-Level KD [26]. By L2-normalizing and aligning the intermediate feature grids of the teacher directly with the student via MSE loss, the student inherits the representational structure of the teacher while circumventing spatial boundary noise [26].
-
-### 6.4 V2 Experimental Results & Scaling Laws
-
-Evaluation of the `v2` architecture across the MM5 dataset demonstrates the mitigation of catastrophic forgetting and the restoration of standard scaling laws. Advancing from the `mit_b1` student model to the `mit_b2` architecture yielded a significant performance increase, while extending to `mit_b4` and `mit_b5` revealed dataset saturation mechanics.
-
-| Method | Backbone | Pre-Training | Mean mIoU | Train Loss | Val Loss |
-| --- | --- | --- | --- | --- | --- |
-| **TMLPN_v2** | **MiT-b1 (Student)** | **MM-JEPA** | **0.8015** | **0.0182** | **0.2184** |
-| **TMLPN_v2** | **MiT-b2** | **MM-JEPA** | **0.8694** | **0.0068** | **0.1372** |
-| **TMLPN_v2** | **MiT-b3** | **MM-JEPA** | **0.8687** | **0.0112** | **0.1193** |
-| **TMLPN_v2** | **MiT-b4** | **MM-JEPA** | **0.8461** | **0.0231** | **0.1177** |
-| **TMLPN_v2** | **MiT-b5 (Teacher)** | **MM-JEPA** | **0.8557** | **0.0117** | **0.1516** |
+| Method | Backbone | Pre-Training | Historical Mean mIoU | Train Loss | Val Loss |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **TMLPN_v2** | **MiT-b1 (Student)** | **MM-JEPA** | $0.8015$ | $0.0182$ | $0.2184$ |
+| **TMLPN_v2** | **MiT-b2** | **MM-JEPA** | $0.8694$ | $0.0068$ | $0.1372$ |
+| **TMLPN_v2** | **MiT-b3** | **MM-JEPA** | $0.8687$ | $0.0112$ | $0.1193$ |
+| **TMLPN_v2** | **MiT-b4** | **MM-JEPA** | $0.8461$ | $0.0231$ | $0.1177$ |
+| **TMLPN_v2** | **MiT-b5 (Teacher)** | **MM-JEPA** | $0.8557$ | $0.0117$ | $0.1516$ |
 
 > ![V2 Phase Progression](assets/v2_phase_progression_trajectory.png)
 >
-> **Figure 5: Architecture Progression Trajectory (V2).** Demonstrates the mitigation of the Microtune plateau, restoring stable scaling laws.
-
-### 6.5 V2 Ablation Analysis
-
-An updated ablation matrix was executed across 5 random seeds to empirically validate the constraints governing the `v2` architecture. Statistical significance was determined utilizing standard Welch's t-tests against the optimal control baseline.
+> **Figure 5:** `TMLPN_v2` phase progression showing restored `microtune` stability.
 
 > ![v2 Ablation Studies](assets/v2_ablation_statistics.png)
 >
-> **Figure 6: N=5 Ablation Study Results (V2).** Validated using Welch's t-test for statistical significance.
-
-### 6.6 Latent Space Alignment (Manifold Progression)
-
-Visualizing the latent embeddings confirms that the V2 supervised downstream decoder effectively organizes spatial data without compromising foundational priors.
+> **Figure 6:** `TMLPN_v2` $N=5$ ablation statistics.
 
 > ![V2 mit_b2 Microtune Manifolds](assets/v2_mit_b2_Microtune.png)
 >
-> **Figure 7: TMLPN_v2 `mit_b2` Microtune Manifold Projections.** The t-SNE and UMAP projections demonstrate semantic separation of classes (bottom row) while maintaining Modality Isolation (top row) between the RGB and Depth+Thermal streams directly after the stem.
+> **Figure 7:** `TMLPN_v2` `mit_b2` latent manifold projections (t-SNE and UMAP).
 
 ---
 
-## 7. V3 Architecture: Theoretical Fortification & Physical Priors
-
-The TMLPN_v3 pipeline represents an overhaul of the data ingestion and objective formulation strategies, systematically addressing memory inefficiencies, latent manifold degeneracy, and physically contradictory normalization priors.
+## 6. V3 Diagnostic Telemetry, Root-Cause Rectifications & Re-Execution Matrix
 
 > ![v3 Network Architecture Diagram](assets/v3_Network_Architecture_Diagram.png)
 >
-> **Figure 8: The master Tri-Modal Latent Predictive Network (TMLPN_v3) architecture diagram.** Demonstrates the complete V3 pipeline including Dynamic Cross-Modal Gating, Modality Dropout regularizers, fortified JEPA pre-training objectives, and Explicit Boundary Supervision.
+> **Figure 8:** Master `TMLPN_v3` architecture diagram showing Modality-Isolated Patch Embedding, Dirac alignment, scSE gating, target-preserving Modality Dropout, fortified MM-JEPA pre-training, and Phase 2 supervised segmentation.
 
-### 7.1 Modality-Decoupled Physical Calibration
+### 6.1 Pre-Rectification Diagnostic Telemetry & Queued Re-Execution
 
-In prior iterations, geometric depth and thermal intensities shared bundled affine scaling parameters. Depth values represent scale-invariant distance measurements, whereas thermal tensors represent temperature-dependent radiometric variances [20]. TMLPN_v3 isolates these priors at the tensor level (`depth_scale` and `therm_scale`), allowing the network to learn independent calibration mappings:
-* **Scale-Invariant Depth:** Depth matrices are normalized by their spatial mean prior to calibration, ensuring the network evaluates geometric structural differences rather than absolute global distances.
-* **Radiometrically Bounded Thermal:** The thermal scaling factor is bounded to prevent the network from improperly adapting to ambient factory temperature drift rather than localized physical anomalies.
+Initial $N=5$ diagnostic execution of `TMLPN_Downstream_v3` under `use_lora: True` and `mask_strategy: multi_block` confirmed monotonic phase improvement (`Baseline` $\rightarrow$ `Hero` $\rightarrow$ `Microtune`), but peaked at `mit_b2` ($0.7326 \pm 0.0137$ mIoU) and declined on `mit_b3`–`mit_b5`. Code auditing traced this degradation to three concrete root causes—now rectified across Parts 1–3:
 
-### 7.2 Dynamic Cross-Modal Gating (scSE)
+1. **Silent Phase 1 Weight Omission under LoRA:** Wrapping `.q`/`.kv` layers into `LoRALinear` renamed keys to `*.original_layer.*`, causing `strict=False` Phase 1 weight loading to leave attention projections randomly initialized and frozen (hurting larger backbones disproportionately). Fixed via `load_phase1_encoder_weights`, while `control_optimal` defaults to full backbone unfreezing under LLRD (`use_lora: False`) and cleanly isolates LoRA variants in Part 3.
+2. **Mask-to-Latent Stride Misalignment & Predictor Shortcutting:** $16 \times 16$ random patches under nearest-neighbor stride-32 downsampling ignored 75% of masked quadrants, while `SpatialJEPAPredictor`'s `z_context` residual and predictor-level VICReg weakened pre-training. Fixed via `patch_size=32`, area-majority pooling, `grid`-anchored residuals, and encoder-level VICReg on `z_context`.
+3. **Downstream Optimization & KD Defects:** Fixed HPO `best_params.json` propagation into `microtune`, full-precision GDL weights (eliminating 4-decimal rounding underflow), strict checkpoint-based teacher reconstruction, and interior-eroded Sobel boundary supervision.
 
-Early fusion architectures rely on static projection weights that may fail to adapt to localized sensor variations. For instance, when identifying structural fractures creating thermal voids, the surrounding RGB context might be obscured by low-light conditions. To address this within hardware constraints, TMLPN_v3 implements a Concurrent Spatial and Channel Squeeze & Excitation (scSE) block directly following the Dirac alignment stem [32]. 
+Following these rectifications, the clean $N=5$ benchmark suite is queued for execution on the locked stratified 3-way MM5 split (`[PENDING]`):
 
-Unlike standard Squeeze-and-Excitation modules that perform global average pooling to apply a uniform 1D scale [33], scSE concurrently applies global channel-wise attention and localized, per-pixel spatial attention [32]. This enables the network to dynamically weight modalities per-pixel, actively suppressing RGB feature maps in localized shadow regions while boosting the corresponding thermal signatures.
+| Method | Backbone | Pre-Training | Diagnostic V3 mIoU (Pre-Rectification) | Rectified V3 mIoU (Blind Test TTA) | Val mIoU | Train Loss | Val Loss | Edge FPS |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| SFDFNet [15] | ResNet-50 | ImageNet | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** |
+| **TMLPN_v3 (Ours)** | **MiT-b1 (Student)** | **MM-JEPA** | $0.6727 \pm 0.0201$ | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** |
+| **TMLPN_v3 (Ours)** | **MiT-b2** | **MM-JEPA** | $0.7326 \pm 0.0137$ | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** |
+| **TMLPN_v3 (Ours)** | **MiT-b3** | **MM-JEPA** | $0.7001 \pm 0.0320$ | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** |
+| **TMLPN_v3 (Ours)** | **MiT-b4 (Teacher)** | **MM-JEPA** | $0.6630 \pm 0.0198$ | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** |
+| **TMLPN_v3 (Ours)** | **MiT-b5** | **MM-JEPA** | $0.6840 \pm 0.0207$ | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** |
 
-### 7.3 Fortified Pre-Training Objective
+> ![V3 Phase Progression](assets/phase_progression_trajectory_2.jpg)
+>
+> **Figure 9:** Pre-rectification `TMLPN_v3` diagnostic trajectory ($N=5$) showing stable monotonic phase improvement alongside the LoRA key-mismatch capacity suppression above `mit_b2`.
 
-Relying exclusively on an Exponential Moving Average (EMA) teacher network [11] to prevent dimensional collapse introduces a potential point of failure. TMLPN_v3 fortifies the loss formulation:
-1. **Context Consistency Restoration:** The objective incorporates Mean Squared Error explicitly on the *unmasked* spatial coordinates. This physically anchors the context encoder, discouraging unmasked geometry from drifting into a degenerate, low-rank manifold [2].
-2. **Covariance Penalty (VICReg-Inspired):** To immunize the network against dimensional collapse, a covariance penalty is evaluated. By calculating the covariance matrix of the channel embeddings and penalizing the off-diagonal correlations, the network is encouraged to map orthogonal, independent features [12].
+> ![V3 Ablation Studies](assets/ablation_statistics_2.png)
+>
+> **Figure 10:** Pre-rectification `TMLPN_v3` diagnostic ablation matrix ($N=5$, `mit_b2`) demonstrating $+9.5\%$ to $+10.1\%$ mIoU recovery upon disabling LoRA (`NoLoRA`: $0.8186$, `Vanilla_V1`: $0.8248$) and the collapse under `NaiveFusion` ($0.4955$).
 
-### 7.4 Modality Robustness and Graceful Degradation (Modality Dropout)
+### 6.2 Statistical Rigor & Full-Test Latent Evaluation (`analyse_results.py`)
 
-Continuous hardware deployment involves the risk of sensor failure or environmental occlusion. Static fusion networks are vulnerable to *modality dominance*, leading to substantial performance degradation when an relied-upon sensor is compromised [34]. 
-
-To regularize the network and support graceful degradation, TMLPN_v3 employs Modality Dropout during training [34]. With an empirical probability (e.g., 15%), Depth or Thermal tensors are zeroed out strictly *post-normalization*. This circumvents normalization shift corruption, preventing the global mean from acting as a substitute signal. The context encoder is thus required to extract functional representations across all available sensors, ensuring that if the Nuwa HP60C depth feed fails in deployment, the system can maintain optimal representations from the LWIR thermal profile to infer the anomaly safely.
-
-### 7.5 Downstream Optimization: Explicit Boundary Supervision
-
-Standard volume-anchored objectives (such as GDL) optimize for regional overlap but may not heavily penalize sub-pixel perimeter deviations, resulting in imprecise boundaries around structural fractures [14]. 
-
-TMLPN_v3 integrates an explicit Boundary Supervision penalty [35]. The network utilizes fixed 3x3 Sobel convolutions ($G_x, G_y$) to extract structural edge magnitudes directly from the predicted spatial probability map and the ground-truth mask. The objective function then calculates the $L_1$ norm between these edge maps. This mathematically guides the MLP decoder to output precise boundary delineations, supporting the geometric requirements for high-quality industrial defect localization [35].
-
-### 7.6 Multimodal Data Augmentation & Precision
-
-To preserve alignment integrity, radiometric augmentations (brightness, contrast, hue, and saturation jitter) are strictly isolated to the RGB manifold. This simulates ambient lighting variance while protecting the absolute physical measurement metrics of the Depth and Thermal modalities.
-
-* **Removal of the Vertical Flip:** Top-to-bottom spatial mirroring operations were removed from the data ingestion logic. For gravity-bound objects, a vertical flip creates physically contradictory orientations and shadow mappings.
-* **Horizontal Strip Flipping:** Horizontal spatial geometry augmentations are applied to individual camera strips during ingestion to correctly simulate physical post-installation lane adjustments. 
-* **Z-Axis Planar Rotation:** To maintain regularization density, continuous planar rotation (-15° to +15°) is utilized. To prevent the network from evaluating non-existent boundaries along rotation edges, **split interpolation** is enforced: Bilinear smoothing is applied to RGB, while Nearest-Neighbor interpolation preserves the absolute scales of the Depth and Thermal tensors. 
-
-### 7.7 Downstream Optimization and Architectural Safeguards
-
-To maintain fine-tuning stability and manage gradient flows across high-capacity backbones, the pipeline enforces strict downstream optimization safeguards:
-
-* **Gradient Accumulation:** Loss evaluation is divided by the accumulation steps, and optimizer updates are deferred to aggregate gradients over sequential micro-batches. This provides stable optimization under hardware memory limits, yielding consistent gradient estimates [29].
-* **Metric-Bound Early Stopping:** A patience tracking mechanism halts training if the validation mIoU fails to improve. This acts as an implicit form of structural regularization, preventing the network from memorizing training set artifacts [30].
-* **Constrained Focal Loss Boundaries:** The Hyperparameter Optimization (HPO) search space for the gamma parameter is bound between 1.0 and 2.5, preventing the Optuna engine from selecting boundary values that cause numeric instability [13].
-* **Adaptive Capacity Scaling:** The LoRA rank and alpha are halved, and a steeper Layer-Wise Learning Rate Decay (LLRD) is applied for high-capacity backbones (`mit_b3` and `mit_b4`). This limits the trainable parameter space to restrict noise memorization [25] and stabilizes fine-tuning [27].
-
-### 7.8 Test-Time Augmentation (TTA)
-
-To evaluate the generalization limits of the TMLPN pipeline without altering the trained weights, the final evaluation stage integrates a custom Test-Time Augmentation suite:
-
-* **Lossless Multi-View Aggregation:** A dataset wrapper yields a 2-view mini-batch (Base View and Horizontally Flipped View) per physical sample during the final test loop.
-* **Boundary Dilution Prevention:** Rotational augmentations were purged from the TTA ensemble to prevent zero-padded probability artifacts from diluting valid predictions along the perimeter.
-* **Metric Maximization & Boundary Smoothing:** The predicted logits for the horizontally flipped views are geometrically inverted using bilinear interpolation. Averaging lossless probability manifolds reduces high-frequency noise and boundary flickering at the pixel edges [31].
+* **Unbiased Dispersion & Seed-Aligned Paired Testing:** Reports Mean mIoU $\pm$ unbiased sample standard deviation (`ddof=1`) across $N=5$ locked seeds. Ablations are compared against `Control_Optimal` (automatically mirrored from Part 1's converged baseline on `optimal_backbone` to eliminate redundant runs) using seed-aligned paired $t$-tests (`stats.ttest_rel`, falling back to Welch's $t$-test only for non-overlapping seeds) adjusted via Benjamini-Hochberg False Discovery Rate (FDR) control at $\alpha = 0.05$ [32].
+* **Uniform Full-Test Manifold Projection:** `extract_modality_embeddings` and `extract_semantic_embeddings` sample tokens uniformly across *all* batches of `test.csv` with a seeded `np.random.default_rng(42)`—preventing first-batch sampling bias—and invoke `models.instantiate_model_from_checkpoint` and `stem.forward_split` directly for exact numerical parity.
 
 ---
 
-## 8. Experimental Results & Ablation Analysis
+## 7. Edge Deployment, Explainability & Pre-Flight Verification
 
-Evaluation of the `v3` architecture demonstrates the integration of physical priors, dynamic gating, and fortified objective sums. As we are currently executing the MLOps pipeline to aggregate N=5 seed distributions, full SOTA empirical comparisons remain "PENDING".
+### 7.1 Edge ONNX Export (Jetson Orin Nano / Orange Pi 5)
 
-| Method | Backbone | Pre-Training | Mean mIoU | Train Loss | Val Loss | Edge FPS |
-| --- | --- | --- | --- | --- | --- | --- |
-| SFDFNet [18] | ResNet-50 | ImageNet | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** |
-| **TMLPN_v3 (Ours)** | **MiT-b1 (Student)** | **MM-JEPA** | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** |
-| **TMLPN_v3 (Ours)** | **MiT-b2** | **MM-JEPA** | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** |
-| **TMLPN_v3 (Ours)** | **MiT-b3** | **MM-JEPA** | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** |
-| **TMLPN_v3 (Ours)** | **MiT-b4** | **MM-JEPA** | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** |
-| **TMLPN_v3 (Ours)** | **MiT-b5 (Teacher)** | **MM-JEPA** | **[PENDING]** | **[PENDING]** | **[PENDING]** | **[PENDING]** |
+During the `export` phase, `export_to_onnx` (`train_downstream.py`) serializes the converged model with dynamic batch axes, constant folding, config-driven resolution, and physical-domain dummy inputs (Z-scored RGB + $[0.1, 1.0]$ Depth/Thermal). It defaults to `opset_version=16` via the TorchScript exporter (`dynamo=False` for opset $< 18$) to ensure native compatibility with Rockchip RKNN-Toolkit2 (Orange Pi 5 / RK3588) and NVIDIA TensorRT (Jetson Orin Nano) without failing C-API version downgrades [16, 17].
 
-### 8.1 Statistical Rigor & Benjamini-Hochberg Correction
+> **Sensor Registration Note:** Because `ModalityIsolatedPatchEmbed` performs additive fusion at stride 4, field deployment on the Nuwa HP60C + $640 \times 512$ LWIR array requires extrinsic RGB-to-LWIR calibration (depth-guided warping/homography) within $< 4$ pixels prior to tensor concatenation.
 
-An updated ablation matrix is executed across 5 random seeds to empirically validate the architectural constraints. To address Type I errors during multiple hypothesis testing, all generated ablation p-values are processed through the Benjamini-Hochberg False Discovery Rate (FDR) correction. 
+### 7.2 True Feature-Level Grad-CAM Explainability
 
-The Benjamini-Hochberg FDR was selected over the standard Bonferroni correction because it strictly bounds the expected proportion of falsely rejected null hypotheses without sacrificing the statistical power required to validate synergistic architectural contributions in deep learning ablations.
-
-### 8.2 V3 Component Isolation Matrix
-
-To attribute which architectural components definitively support gradient stability and precision, the automated pipeline extracts the optimal performing backbone and executes a targeted Component Isolation matrix (N=5 seeds per variant):
-
-* **Without LoRA (`Ablation_NoLoRA`):** Unfreezes the N x N network weights to measure whether unbounded gradient flows overwrite generalized multimodal representations.
-* **Without LLRD (`Ablation_NoLLRD`):** Overrides the hierarchical optimization with a flat learning rate multiplier across all layers.
-* **Without Feature-Level KD (`Ablation_NoFeatureKD`):** Removes the student-teacher MSE spatial alignment constraint.
-* **Without Context / Covariance:** Validates the Phase 1 objective by selectively disabling the unmasked MSE [2] and VICReg penalties [12].
-
----
-
-## 9. Edge Deployment (Jetson Orin Nano / Orange Pi 5)
-
-The finetuned architecture is natively serialized to an ONNX artifact (`opset_version=18`) for cross-platform compatibility [20]. By deploying this TensorRT engine onto edge hardware such as the Jetson Orin Nano or Rockchip RK3588 NPUs, the system achieves sub-pixel structural segmentation and real-time autonomous predictions at the sensor source [20].
-
-To ensure explainability is preserved during deployment, Segmentation Grad-CAM heatmaps are extracted directly from the `decode_head.linear_pred` layer, verifying structural defect focus over artifact exploitation [23].
+`SegmentationGradCAM` (`train_downstream.py`) hooks the intermediate post-ReLU fused feature tensor (`decode_head.linear_fuse[2]`, using a tensor-level backward hook rather than hooking raw output logits) and dynamically selects an active foreground defect class present in the validation mask to log spatial attention overlays every 5 epochs [20].
 
 > ![V2 GradCAM Explainability](assets/v2_Gradcam_mit_b2_b3.png)
 >
-> **Figure 9: Segmentation Grad-CAM Defect Focus.** Explanability heatmaps tracking visual attention across the Baseline, Hero, and Microtune phases. The spatial attention confirms the network localizes on physical anomalies rather than overfitting to background noise.
+> **Figure 11:** Representative segmentation explainability overlays logged across training phases.
+
+### 7.3 Pre-Flight Validation (`validate_pipeline.py`)
+
+Before committing GPU-hours to the full $N=5$ matrix, `validate_pipeline.py` verifies seven invariants on synthetic physical-contract tensors:
+1. Stem calibration identity ($2\sigma(0) = 1.0$), `forward_split` parity, and finite activations/gradients under 100% Depth+Thermal dropout.
+2. Asymmetric 2D PE ($\text{PE}(y, x) \ne \text{PE}(x, y)$), exact binary stride-32 latent masks, and zero `z_context` leakage in `SpatialJEPAPredictor`.
+3. Non-zero encoder-level VICReg gradients in `context_encoder`, detached `target_encoder`, and verified EMA parameter updates.
+4. Forward/backward parity across `v1`/`v2`/`v3`, LLRD learning-rate group assignments, and `AlphaBalancedFocalGDLLoss` stability under `ignore_index=255` borders and all-ignore batches.
+5. Bit-exact cross-ablation teacher checkpoint loading (`instantiate_model_from_checkpoint(..., strict=True)`) and student-only KD gradients.
+6. Non-degenerate `SegmentationGradCAM` heatmaps on `decode_head.linear_fuse[2]` with clean hook removal.
+7. Exact `opset_version=16` ONNX export, `onnx.checker` graph validation, and dynamic-batch PyTorch-vs-ONNXRuntime numerical parity.
 
 ---
 
-## 10. Future Work
+## 8. Future Work
 
-To complete our evaluation suite and validate its utility in physical infrastructure settings, future work is outlined below:
-
-1. **SOTA Empirical Benchmarking:** Execute architectural comparisons against SFDFNet and leading RGB-D-T semantic segmentation baselines. This evaluation will utilize the locked dataset splits and Benjamini-Hochberg multi-seed correction framework to secure statistical validity.
-2. **Edge Deployment Validation (FPS):** Complete formal edge deployment validation by evaluating execution latency, reporting the absolute Frames Per Second (FPS) achievable via our generated TensorRT engine directly on Jetson Orin Nano and Orange Pi 5 edge endpoints.
+1. **Full Execution of the Rectified V3 Benchmark & SOTA Comparisons:** Complete the $N=5$ multi-seed execution of the rectified `TMLPN_Downstream_v3` pipeline alongside head-to-head comparisons against SFDFNet [15] and re-benchmarked V1/V2 baselines on the locked stratified 3-way split.
+2. **Hardware-in-the-Loop Edge Latency Benchmarking (FPS):** Compile exported `opset_version=16` ONNX artifacts into FP16/INT8 TensorRT and RKNN engines to benchmark throughput (FPS), VRAM footprint, and power draw on NVIDIA Jetson Orin Nano and Orange Pi 5 endpoints [16, 17].
+3. **Field Transfer to the Nuwa HP60C + LWIR Fused Sensor System:** Deploy the validated `TMLPN_v3` foundation and segmentation pipeline onto extrinsically calibrated captures from our custom Nuwa HP60C RGB-D and $640 \times 512$ LWIR Vanadium Oxide sensor array for autonomous structural health monitoring.
 
 ---
 
@@ -299,76 +309,70 @@ To complete our evaluation suite and validate its utility in physical infrastruc
 
 [7] Zagoruyko, S., & Komodakis, N. (2017). DiracNets: Training Very Deep Neural Networks Without Skip-Connections. *arXiv preprint arXiv:1706.00388*.
 
-[8] Perez, E., Strub, F., De Vries, H., Dumoulin, V., & Courville, A. (2018). FiLM: Visual Reasoning with a General Conditioning Layer. *AAAI*.
+[8] Bao, H., Dong, L., Piao, S., & Wei, F. (2022). BEiT: BERT Pre-Training of Image Transformers. *ICLR*.
 
-[9] Bao, H., Dong, L., Piao, S., & Wei, F. (2022). BEiT: BERT Pre-Training of Image Transformers. *ICLR*.
+[9] Xie, E., Wang, W., Yu, Z., Anandkumar, A., Alvarez, J. M., & Luo, P. (2021). SegFormer: Simple and Efficient Design for Semantic Segmentation with Transformers. *NeurIPS*.
 
-[10] Xie, E., Wang, W., Yu, Z., Anandkumar, A., Alvarez, J. M., & Luo, P. (2021). SegFormer: Simple and Efficient Design for Semantic Segmentation with Transformers. *NeurIPS*.
+[10] Grill, J.-B., Strub, F., Altché, F., Tallec, C., Richemond, P. H., Buchatskaya, E., Doersch, C., Pires, B. A., Guo, Z. D., Azar, M. G., Piot, B., Kavukcuoglu, K., Munos, R., & Valko, M. (2020). Bootstrap your own latent: A new approach to self-supervised learning. *NeurIPS*.
 
-[11] Grill, J. B., Strub, F., Altché, F., Tallec, C., Richemond, P. H., Buchatskaya, E., ... & Valko, M. (2020). Bootstrap your own latent: A new approach to self-supervised learning. *NeurIPS*.
+[11] Bardes, A., Ponce, J., & LeCun, Y. (2022). VICReg: Variance-Invariance-Covariance Regularization for Self-Supervised Learning. *ICLR*.
 
-[12] Bardes, A., Ponce, J., & LeCun, Y. (2022). VICReg: Variance-Invariance-Covariance Regularization for Self-Supervised Learning. *ICLR*.
+[12] Lin, T.-Y., Goyal, P., Girshick, R., He, K., & Dollár, P. (2017). Focal Loss for Dense Object Detection. *ICCV*.
 
-[13] Lin, T.-Y., Goyal, P., Girshick, R., He, K., & Dollár, P. (2017). Focal Loss for Dense Object Detection. *ICCV*.
+[13] Sudre, C. H., Li, W., Vercauteren, T., Ourselin, S., & Jorge Cardoso, M. (2017). Generalised Dice overlap as a deep learning loss function for highly unbalanced segmentations. *DLMIA*.
 
-[14] Sudre, C. H., Li, W., Vercauteren, T., Ourselin, S., & Jorge Cardoso, M. (2017). Generalised Dice overlap as a deep learning loss function for highly unbalanced segmentations. *DLMIA*.
+[14] Hinton, G., Vinyals, O., & Dean, J. (2015). Distilling the Knowledge in a Neural Network. *NIPS Deep Learning Workshop*.
 
-[15] Shrivastava, A., Gupta, A., & Girshick, R. (2016). Training Region-based Object Detectors with Online Hard Example Mining. *CVPR*.
+[15] An, G., Geng, Y., Fang, S., et al. (2025). SFDFNet: Leveraging spatial-frequency deep fusion for RGB-T semantic segmentation. *Image and Vision Computing*.
 
-[16] Huang, Y., et al. (2020). Dynamic Weighting for Imbalanced Semantic Segmentation. *IEEE Access*.
+[16] Mehta, S., & Rastegari, M. (2021). MobileViT: Light-weight, General-purpose, and Mobile-friendly Vision Transformer. *ICLR*.
 
-[17] Hinton, G., Vinyals, O., & Dean, J. (2015). Distilling the Knowledge in a Neural Network. *NIPS Deep Learning Workshop*.
+[17] Brenner, M., Reyes, N. H., Susnjak, T., & Barczak, A. L. C. (2026). MM5: Multimodal image capture and dataset generation for RGB, depth, thermal, UV, and NIR. *Information Fusion*, 126, 103516.
 
-[18] SFDFNet: Leveraging spatial-frequency deep fusion for RGB-T semantic segmentation. (2025). *Image and Vision Computing*.
+[18] Brenner, M., Reyes, N., Susnjak, T., & Barczak, A. (2025). MM5: Multimodal Image Dataset. *figshare. Dataset*.
 
-[19] Mehta, S., & Rastegari, M. (2021). MobileViT: Light-weight, General-purpose, and Mobile-friendly Vision Transformer. *ICLR*.
+[19] Deng, J., Dong, W., Socher, R., Li, L.-J., Li, K., & Fei-Fei, L. (2009). ImageNet: A large-scale hierarchical image database. *CVPR*.
 
-[20] Brenner, M., Reyes, N. H., Susnjak, T., & Barczak, A. L. C. (2026). MM5: Multimodal image capture and dataset generation for RGB, depth, thermal, UV, and NIR. *Information Fusion*, 126, 103516.
+[20] Selvaraju, R. R., Cogswell, M., Das, A., Vedantam, R., Parikh, D., & Batra, D. (2017). Grad-CAM: Visual Explanations from Deep Networks via Gradient-based Localization. *ICCV*.
 
-[21] Brenner, M., Reyes, N., Susnjak, T., & Barczak, A. (2025). MM5: Multimodal Image Dataset. *figshare. Dataset*.
+[21] Bouthillier, X., Delaunay, P., Bronzi, M., Trofimov, A., Nichyporuk, B., Szeto, J., Sepahvand, N. M., Raff, E., Madan, K., Voleti, V., Kahou, S. E., Michalski, V., Serdyuk, D., Arbel, T., Pal, C., Varoquaux, G., & Vincent, P. (2021). Accounting for Variance in Machine Learning Benchmarks. *MLSys*.
 
-[22] Deng, J., Dong, W., Socher, R., Li, L.-J., Li, K., & Fei-Fei, L. (2009). ImageNet: A large-scale hierarchical image database. *CVPR*.
+[22] Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L., & Chen, W. (2021). LoRA: Low-Rank Adaptation of Large Language Models. *ICLR*.
 
-[23] Selvaraju, R. R., Cogswell, M., Das, A., Vedantam, R., Parikh, D., & Batra, D. (2017). Grad-CAM: Visual Explanations from Deep Networks via Gradient-based Localization. *ICCV*.
+[23] Romero, A., Ballas, N., Kahou, S. E., Chassang, A., Gatta, C., & Bengio, Y. (2014). FitNets: Hints for Thin Deep Nets. *ICLR*.
 
-[24] Bouthillier, X., Delaunay, P., Bronzi, M., Trofimov, A., Nichyporuk, B., Szeto, J., ... & Vincent, P. (2021). Accounting for Variance in Machine Learning Benchmarks. *MLSys*.
+[24] Clark, K., Luong, M.-T., Le, Q. V., & Manning, C. D. (2020). ELECTRA: Pre-training Text Encoders as Discriminators Rather Than Generators. *ICLR*.
 
-[25] Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L., & Chen, W. (2021). LoRA: Low-Rank Adaptation of Large Language Models. *ICLR*.
+[25] Shorten, C., & Khoshgoftaar, T. M. (2019). A survey on Image Data Augmentation for Deep Learning. *Journal of Big Data*, 6(1), 1-48.
 
-[26] Romero, A., Ballas, N., Kahou, S. E., Chassang, A., Gatta, C., & Bengio, Y. (2014). FitNets: Hints for Thin Deep Nets. *ICLR*.
+[26] Goyal, P., Dollár, P., Girshick, R., Noordhuis, P., Wesolowski, L., Kyrola, A., Tulloch, A., Jia, Y., & He, K. (2017). Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour. *arXiv preprint arXiv:1706.02677*.
 
-[27] Clark, K., Luong, M. T., Le, Q. V., & Manning, C. D. (2020). ELECTRA: Pre-training Text Encoders as Discriminators Rather Than Generators. *ICLR*.
+[27] Prechelt, L. (1998). Early Stopping - But When? In *Neural Networks: Tricks of the Trade* (pp. 55-69). Springer.
 
-[28] Shorten, C., & Khoshgoftaar, T. M. (2019). A survey on Image Data Augmentation for Deep Learning. *Journal of Big Data*, 6(1), 1-48.
+[28] Shanmugam, D., Blalock, D., Balakrishnan, G., & Guttag, J. (2020). Better Aggregation in Test-Time Augmentation. *ICCV*.
 
-[29] Goyal, P., Dollár, P., Girshick, R., Noordhuis, P., Wesolowski, L., Kyrola, A., ... & He, K. (2017). Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour. *arXiv preprint arXiv:1706.02677*.
+[29] Roy, A. G., Navab, N., & Wachinger, C. (2018). Concurrent Spatial and Channel 'Squeeze & Excitation' in Fully Convolutional Networks. *MICCAI*.
 
-[30] Prechelt, L. (1998). Early Stopping - But When?. In *Neural Networks: Tricks of the Trade* (pp. 55-69). Springer, Berlin, Heidelberg.
+[30] Hu, J., Shen, L., & Sun, G. (2018). Squeeze-and-Excitation Networks. *CVPR*.
 
-[31] Shanmugam, D., Blalock, Davis., Balakrishnan, Guha., & Guttag, John. (2020). Better Aggregation in Test-Time Augmentation. *ICCV*.
+[31] Neverova, N., Wolf, C., Taylor, G., & Nebiyou, F. (2015). ModDrop: Adaptive Multi-Modal Dropout for Data Fusion. *CVPR*.
 
-[32] Roy, A. G., Navab, N., & Wachinger, C. (2018). Concurrent Spatial and Channel ‘Squeeze & Excitation’ in Fully Convolutional Networks. *MICCAI*.
-
-[33] Hu, J., Shen, L., & Sun, G. (2018). Squeeze-and-Excitation Networks. *CVPR*.
-
-[34] Neverova, N., Wolf, C., Taylor, G., & Nebiyou, F. (2015). ModDrop: Adaptive Multi-Modal Dropout for Data Fusion. *CVPR*.
-
-[35] Cheng, B., Schwing, A. G., & Kirillov, A. (2021). Boundary IoU: Improving Object-Centric Image Segmentation Evaluation. *CVPR*.
+[32] Benjamini, Y., & Hochberg, Y. (1995). Controlling the False Discovery Rate: A Practical and Powerful Approach to Multiple Testing. *Journal of the Royal Statistical Society: Series B*, 57(1), 289-300.
 
 ---
 
-## 🙏 Acknowledgments & Citations
+## Acknowledgments & Citations
 
-This project would not be possible without the MM5 Dataset. We sincerely thank the original creators and authors for their foundational work in multi-modal data collection, hardware synchronization, and curation, which enabled the training and evaluation of this architecture.
+This project was developed and evaluated using the MM5 Dataset. We thank the original authors for their work in multimodal data collection, hardware synchronization, and dataset curation.
 
-If you utilize this pipeline, the underlying architecture, or the data, please cite the primary publication alongside the dataset repository:
+If you use this pipeline, architecture, or dataset in your research, please cite the primary publication and dataset repository:
 
 **Primary Publication:**
 
-> Brenner, M., Reyes, N. H., Susnjak, T., & Barczak, A. L. C. (2026). MM5: Multimodal image capture and dataset generation for RGB, depth, thermal, UV, and NIR. Information Fusion, 126, 103516.
+> Brenner, M., Reyes, N. H., Susnjak, T., & Barczak, A. L. C. (2026). MM5: Multimodal image capture and dataset generation for RGB, depth, thermal, UV, and NIR. *Information Fusion*, 126, 103516.  
 > DOI: [https://doi.org/10.1016/j.inffus.2025.103516](https://doi.org/10.1016/j.inffus.2025.103516)
 
 **Dataset:**
 
-> Brenner, M., Reyes, N., Susnjak, T., & Barczak, A. (2025). MM5: Multimodal Image Dataset. figshare. Dataset.
-> DOI: [https://doi.org/10.6084/m9.figshare.28722164](https://www.google.com/search?q=https://doi.org/10.6084/m9.figshare.28722164)
+> Brenner, M., Reyes, N., Susnjak, T., & Barczak, A. (2025). MM5: Multimodal Image Dataset. *figshare. Dataset*.  
+> DOI: [https://doi.org/10.6084/m9.figshare.28722164](https://doi.org/10.6084/m9.figshare.28722164)
