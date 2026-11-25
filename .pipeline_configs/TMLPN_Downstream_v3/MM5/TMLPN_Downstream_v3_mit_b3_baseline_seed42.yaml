@@ -1,0 +1,95 @@
+dataset:
+  name: MM5
+  image_height: 480
+  image_width: 640
+phase1_pretraining:
+  backbone: mit_b3
+  batch_size: 8
+  epochs: 300
+  optimizer:
+    lr: 0.0001
+    weight_decay: 0.04
+  jepa:
+    mask_ratio: 0.6
+    tau_base: 0.996
+  modality_dropout_prob: 0.15
+  ablations:
+    enable_modality_isolation: true
+    variance_type: spatial
+    gdl_type: global_anchored
+    enable_kd: true
+    mask_strategy: random
+    enable_covariance_penalty: true
+    enable_context_consistency: true
+    use_lora: false
+    llrd_decay: 0.85
+    enable_dirac: true
+    dynamic_lora_rank: true
+    adaptive_llrd_decay: true
+    enable_scse: true
+    enable_modality_dropout: true
+    enable_boundary_loss: true
+  trial_name: baseline_seed42
+  seed: 42
+phase2_downstream:
+  backbone: mit_b3
+  teacher_backbone: mit_b4
+  batch_size: 6
+  use_lora: false
+  lora:
+    r: 8
+    alpha: 16
+  llrd_decay: 0.85
+  early_stopping_patience:
+    baseline: 30
+    hero: 40
+    microtune: 35
+    default: 30
+  gradient_accumulation_steps: 4
+  hpo:
+    n_trials: 30
+    lr_min: 1.0e-05
+    lr_max: 0.005
+    wd_min: 0.0001
+    wd_max: 0.1
+    gamma_min: 1.0
+    gamma_max: 2.5
+  epochs:
+    baseline: 200
+    hero: 300
+    microtune: 300
+    default: 200
+  learning_rates:
+    default: 0.0001
+    microtune: 1.0e-05
+  modality_dropout_prob: 0.15
+  ablations:
+    enable_modality_isolation: true
+    variance_type: spatial
+    gdl_type: global_anchored
+    enable_kd: true
+    mask_strategy: random
+    enable_covariance_penalty: true
+    enable_context_consistency: true
+    use_lora: false
+    llrd_decay: 0.85
+    enable_dirac: true
+    dynamic_lora_rank: true
+    adaptive_llrd_decay: true
+    enable_scse: true
+    enable_modality_dropout: true
+    enable_boundary_loss: true
+  trial_name: baseline_seed42
+  seed: 42
+ablations:
+  enable_modality_isolation: true
+  variance_type: spatial
+  gdl_type: global_anchored
+  enable_kd: true
+  mask_strategy: multi_block
+  dynamic_lora_rank: true
+  adaptive_llrd_decay: true
+  enable_scse: true
+  enable_modality_dropout: true
+metadata:
+  model: TMLPN_Downstream_v3

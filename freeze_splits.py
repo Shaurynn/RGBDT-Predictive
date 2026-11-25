@@ -15,7 +15,7 @@ GROUP_COLUMN_CANDIDATES = ["scene_id", "sequence_id", "capture_id", "group_id", 
 def derive_rarest_mask_class(df: pd.DataFrame, ignore_index: int = 255) -> pd.Series:
     """
     Scans ground-truth segmentation masks and labels each frame by the globally rarest
-    foreground class (> 0) present in that frame. Falls back to 0 (background) if empty.
+    foreground class (> 0) present in that frame. Falls back to 'bg_only' if empty.
     """
     print("[*] Deriving per-image stratification labels from rarest foreground defect class in masks...")
     frame_classes = []
@@ -63,10 +63,20 @@ def extract_groups(raw_df: pd.DataFrame, processed_df: pd.DataFrame,
     if group_regex:
         pattern = re.compile(group_regex)
         extracted = []
+        unmatched = 0
         for rgb_path in processed_df["rgb_path"]:
             stem = os.path.splitext(os.path.basename(rgb_path))[0]
             match = pattern.match(stem)
-            extracted.append(match.group(1) if (match and match.groups()) else stem)
+            if match and match.groups():
+                extracted.append(match.group(1))
+            else:
+                extracted.append(stem)
+                unmatched += 1
+
+        if unmatched > 0:
+            pct = 100.0 * unmatched / max(1, len(extracted))
+            print(f"[!] WARNING: --group_regex '{group_regex}' failed to match {unmatched}/{len(extracted)} "
+                  f"({pct:.1f}%) filenames; unmatched files fall back to singleton stem groups.")
         groups = pd.Series(extracted, index=processed_df.index)
         print(f"[*] Grouping val/test split by regex '{group_regex}' ({groups.nunique()} unique groups).")
         return groups, f"regex:{group_regex}"
@@ -79,16 +89,15 @@ def stratified_half_split(df: pd.DataFrame, stratify_labels: pd.Series,
     """
     Performs a deterministic 50/50 split of df into (val_df, test_df).
     - Uses StratifiedGroupKFold(n_splits=2) when scene/sequence groups exist (>= 2 groups).
+      With n_splits=2, folds 0 and 1 are complementary group-disjoint partitions determined by `seed`.
     - Uses StratifiedShuffleSplit(test_size=0.5) with deterministic singleton handling otherwise.
     """
     n_samples = len(df)
     if n_samples < 2:
         raise ValueError(f"[-] CRITICAL: Need at least 2 evaluation samples to create val/test splits (got {n_samples}).")
 
-    # Case 1: Group-aware stratified split (prevents sequential frame leakage)
     if groups is not None and groups.nunique() >= 2 and groups.nunique() < n_samples:
         sgkf = StratifiedGroupKFold(n_splits=2, shuffle=True, random_state=seed)
-        # Pick the fold assignment that produces the closest 50/50 sample count
         val_idx, test_idx = next(sgkf.split(df, stratify_labels, groups))
         val_df = df.iloc[val_idx].copy()
         test_df = df.iloc[test_idx].copy()
@@ -100,7 +109,6 @@ def stratified_half_split(df: pd.DataFrame, stratify_labels: pd.Series,
     if groups is not None and groups.nunique() == n_samples:
         print("[!] NOTICE: Every sample has a unique group ID; falling back to pure class stratification.")
 
-    # Case 2: Class-stratified 50/50 split with graceful singleton class handling
     counts = stratify_labels.value_counts()
     singleton_classes = set(counts[counts < 2].index)
 
@@ -126,7 +134,6 @@ def stratified_half_split(df: pd.DataFrame, stratify_labels: pd.Series,
     else:
         strategy = "SingletonAlternation"
 
-    # Deterministically alternate any singleton-class samples between val and test
     df_single = df[~multi_mask]
     if len(df_single) > 0:
         print(f"[!] WARNING: {len(df_single)} sample(s) belong to singleton strata ({sorted(singleton_classes)}). "
@@ -146,7 +153,8 @@ def stratified_half_split(df: pd.DataFrame, stratify_labels: pd.Series,
 
 def adapt_canonical_splits(data_root: str, dataset_name: str, seed: int = 42,
                            group_col: str = None, group_regex: str = None,
-                           stratify_by_mask: bool = False, verify_files: bool = True):
+                           stratify_by_mask: bool = False, verify_files: bool = True,
+                           allow_canonical_overlap: bool = False):
     canonical_train_path = os.path.join(data_root, "train_dataset.csv")
     canonical_eval_path = os.path.join(data_root, "eval_dataset.csv")
 
@@ -207,7 +215,6 @@ def adapt_canonical_splits(data_root: str, dataset_name: str, seed: int = 42,
                         f"[-] CRITICAL: {len(missing)} missing files in {split_name} ({col}), e.g. {missing[0]}"
                     )
 
-    # Determine stratification labels: explicit class_label, or mask-derived rarest foreground class
     unique_csv_labels = processed_eval_df["class_label"].nunique()
     if stratify_by_mask or unique_csv_labels <= 1:
         if not stratify_by_mask:
@@ -226,16 +233,20 @@ def adapt_canonical_splits(data_root: str, dataset_name: str, seed: int = 42,
         processed_eval_df, stratify_labels=stratify_labels, groups=groups, seed=seed
     )
 
-    # Verify zero file leakage across train, val, and test
     train_files = set(train_df["rgb_path"])
     val_files = set(val_df["rgb_path"])
     test_files = set(test_df["rgb_path"])
-    assert val_files.isdisjoint(test_files), "[-] FATAL: Overlap detected between val.csv and test.csv!"
-    overlap_train_eval = train_files & (val_files | test_files)
-    if overlap_train_eval:
-        print(f"[!] WARNING: {len(overlap_train_eval)} sample(s) appear in both train_dataset.csv and eval_dataset.csv!")
+    if not val_files.isdisjoint(test_files):
+        raise RuntimeError("[-] FATAL: Overlap detected between val.csv and test.csv!")
 
-    # Build distribution audit report
+    overlap_train_eval = sorted(train_files & (val_files | test_files))
+    if overlap_train_eval and not allow_canonical_overlap:
+        raise RuntimeError(
+            f"[-] FATAL DATA LEAKAGE: {len(overlap_train_eval)} sample(s) appear in BOTH "
+            f"train_dataset.csv and eval_dataset.csv (e.g., {overlap_train_eval[0]}). "
+            f"Deduplicate canonical splits or pass --allow_canonical_overlap explicitly."
+        )
+
     val_counts = stratify_labels.loc[val_df.index].value_counts().to_dict()
     test_counts = stratify_labels.loc[test_df.index].value_counts().to_dict()
     all_strata = sorted(set(val_counts.keys()) | set(test_counts.keys()))
@@ -264,6 +275,8 @@ def adapt_canonical_splits(data_root: str, dataset_name: str, seed: int = 42,
         "group_source": group_source,
         "counts": {"train": len(train_df), "val": len(val_df), "test": len(test_df)},
         "val_test_group_overlap": 0 if groups is not None else None,
+        "train_eval_overlap_count": len(overlap_train_eval),
+        "leakage_detected": len(overlap_train_eval) > 0,
         "strata_distribution": strata_summary
     }
 
@@ -275,9 +288,10 @@ def main():
     parser.add_argument("--dataset", type=str, required=True, help="Name of the dataset (e.g., MM5)")
     parser.add_argument("--seed", type=int, default=42, help="Deterministic random seed for val/test split")
     parser.add_argument("--group_col", type=str, default=None, help="Optional CSV column name for scene/sequence grouping")
-    parser.add_argument("--group_regex", type=str, default=None, help="Optional regex with 1 capture group to extract sequence ID from filename (e.g., '^(.+)_\\d+$')")
+    parser.add_argument("--group_regex", type=str, default=None, help="Optional regex with 1 capture group to extract sequence ID from filename")
     parser.add_argument("--stratify_by_mask", action="store_true", help="Force stratification by rarest foreground defect class in Class_Annotations masks")
     parser.add_argument("--skip_file_check", action="store_true", help="Skip disk existence validation for image paths")
+    parser.add_argument("--allow_canonical_overlap", action="store_true", help="Allow canonical train/eval overlap with explicit audit flag instead of failing")
     args = parser.parse_args()
 
     data_root = os.path.join("dataset", args.dataset)
@@ -298,7 +312,8 @@ def main():
         group_col=args.group_col,
         group_regex=args.group_regex,
         stratify_by_mask=args.stratify_by_mask,
-        verify_files=not args.skip_file_check
+        verify_files=not args.skip_file_check,
+        allow_canonical_overlap=args.allow_canonical_overlap
     )
 
     train_df.to_csv(os.path.join(output_dir, "train.csv"), index=False)

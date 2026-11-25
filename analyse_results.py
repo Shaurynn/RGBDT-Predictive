@@ -26,6 +26,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="TMLPN Unified CVPR Evaluation & Latent Visualization Engine")
     parser.add_argument("--model", type=str, default="TMLPN_Downstream_v3", help="Target architecture namespace")
     parser.add_argument("--dataset", type=str, default="MM5", help="Target dataset name")
+    parser.add_argument("--img_height", type=int, default=480, help="Evaluation image height")
+    parser.add_argument("--img_width", type=int, default=640, help="Evaluation image width")
     parser.add_argument("--samples", type=int, default=8000, help="Max spatial tokens to sample per latent projection")
     parser.add_argument("--skip_latents", action="store_true", help="Flag to bypass heavy UMAP/t-SNE rendering")
     return parser.parse_args()
@@ -36,6 +38,18 @@ def sample_std(values: list) -> float:
     if len(values) <= 1:
         return 0.0
     return float(np.std(values, ddof=1))
+
+
+def significance_stars(p_val, is_sig) -> str:
+    if not is_sig or not isinstance(p_val, (int, float)):
+        return ""
+    if p_val < 0.001:
+        return "***"
+    if p_val < 0.01:
+        return "**"
+    if p_val < 0.05:
+        return "*"
+    return ""
 
 
 def configure_dark_mode() -> None:
@@ -53,6 +67,18 @@ def configure_dark_mode() -> None:
             "ytick.color": "#c9d1d9"
         }
     )
+
+
+def render_na_panel(ax, title: str, message: str) -> None:
+    ax.set_facecolor("#0d1117")
+    ax.text(
+        0.5, 0.5, message,
+        ha='center', va='center', color='#8b949e', fontsize=11,
+        transform=ax.transAxes, wrap=True
+    )
+    ax.set_title(title, fontweight='bold', color='white')
+    ax.set_xticks([])
+    ax.set_yticks([])
 
 
 # ====================================================================================
@@ -86,39 +112,46 @@ def generate_metric_visualizations(primary_baselines: dict, ablation_stats: dict
             ax.set_ylabel("Mean Intersection over Union (mIoU)")
             ax.set_xlabel("Training Phase")
             plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, "phase_progression_trajectory.png"), dpi=300)
+            plt.savefig(os.path.join(output_dir, "phase_progression_trajectory.png"), dpi=200)
             plt.close()
 
     if ablation_stats:
-        plt.figure(figsize=(12, 6))
-        ablation_records = [
-            {
+        ablation_records = []
+        for trial, stats_data in ablation_stats.items():
+            if stats_data.get("skipped_reason") or stats_data.get("mean_mIoU") is None:
+                continue
+            ablation_records.append({
                 "Variant": trial.replace("Ablation_", "").replace("_", " "),
                 "Mean mIoU": stats_data["mean_mIoU"],
-                "Std Dev": stats_data["std_dev"]
-            }
-            for trial, stats_data in ablation_stats.items()
-        ]
+                "Std Dev": stats_data["std_dev"],
+                "Stars": significance_stars(
+                    stats_data.get("p_value_vs_control"),
+                    stats_data.get("is_statistically_significant")
+                )
+            })
+
         df_abl = pd.DataFrame(ablation_records)
         if not df_abl.empty:
+            plt.figure(figsize=(max(10, 0.9 * len(df_abl)), 6.5))
             ax = sns.barplot(x='Variant', y='Mean mIoU', hue='Variant', data=df_abl, palette='mako', legend=False)
             ax.errorbar(
                 x=range(len(df_abl)), y=df_abl['Mean mIoU'], yerr=df_abl['Std Dev'],
                 fmt='none', c='black', capsize=5, elinewidth=1.5
             )
-            ax.set_title("Ablation Study Results (Multi-Seed, Unbiased Std)", fontweight='bold')
-            ymax = max(0.1, float((df_abl['Mean mIoU'] + df_abl['Std Dev']).max()) * 1.15)
+            ax.set_title("Ablation Study Results (Multi-Seed, Unbiased Std, BH-FDR Sig.)", fontweight='bold')
+            ymax = max(0.1, float((df_abl['Mean mIoU'] + df_abl['Std Dev']).max()) * 1.22)
             ax.set_ylim(0, ymax)
             ax.set_ylabel("Mean mIoU (Blind Test TTA)")
             plt.xticks(rotation=25, ha='right')
             for i, row in df_abl.iterrows():
+                star_line = f"{row['Stars']}\n" if row['Stars'] else ""
                 ax.annotate(
-                    f"{row['Mean mIoU']:.4f}\n±{row['Std Dev']:.4f}",
+                    f"{star_line}{row['Mean mIoU']:.4f}\n±{row['Std Dev']:.4f}",
                     (i, row['Mean mIoU'] + row['Std Dev']),
-                    ha='center', va='bottom', fontsize=9, xytext=(0, 8), textcoords='offset points'
+                    ha='center', va='bottom', fontsize=8.5, xytext=(0, 6), textcoords='offset points'
                 )
             plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, "ablation_statistics.png"), dpi=300)
+            plt.savefig(os.path.join(output_dir, "ablation_statistics.png"), dpi=200)
             plt.close()
 
 
@@ -128,10 +161,17 @@ def generate_metric_visualizations(primary_baselines: dict, ablation_stats: dict
 
 def extract_modality_embeddings(model, dataloader, device, max_samples: int, seed: int = 42):
     """
-    Samples RGB and Depth+Thermal stem tokens uniformly across ALL batches of the test split
-    (avoiding first-batch sampling bias) using the model's exact `forward_split` stem math.
+    Samples RGB and Depth+Thermal stem tokens uniformly across ALL batches of the test split.
+    Returns (None, None) when the model uses NaiveEarlyFusionPatchEmbed (single unified 5-ch stem)
+    so the renderer does not falsely plot identical overlapping manifolds.
     """
     model.eval()
+    stem = model.context_encoder.patch_embed1.proj
+    if isinstance(stem, models.NaiveEarlyFusionPatchEmbed) or (
+        not hasattr(stem, 'forward_split') and not hasattr(stem, 'rgb_proj')
+    ):
+        return None, None
+
     rng = np.random.default_rng(seed)
     target_per_modality = max_samples // 2
     num_batches = max(1, len(dataloader))
@@ -141,17 +181,12 @@ def extract_modality_embeddings(model, dataloader, device, max_samples: int, see
     with torch.no_grad():
         for batch in dataloader:
             x_full = batch['x_full'].to(device)
-            stem = model.context_encoder.patch_embed1.proj
-
             if hasattr(stem, 'forward_split'):
                 rgb_aligned, dt_aligned = stem.forward_split(x_full)
-            elif hasattr(stem, 'rgb_proj'):
+            else:
                 rgb_aligned = stem.rgb_proj(x_full[:, :3, :, :])
                 dt_raw = stem.depth_therm_proj(x_full[:, 3:, :, :])
                 dt_aligned = stem.dt_alignment(dt_raw)
-            else:
-                unified = stem(x_full)
-                rgb_aligned, dt_aligned = unified, unified
 
             rgb_flat = rgb_aligned.permute(0, 2, 3, 1).reshape(-1, rgb_aligned.shape[1]).cpu().numpy()
             dt_flat = dt_aligned.permute(0, 2, 3, 1).reshape(-1, dt_aligned.shape[1]).cpu().numpy()
@@ -173,9 +208,7 @@ def extract_modality_embeddings(model, dataloader, device, max_samples: int, see
 
 
 def extract_semantic_embeddings(model, dataloader, device, max_samples: int, seed: int = 42):
-    """
-    Samples Stage-4 (c4) semantic embeddings uniformly across ALL batches of the test split.
-    """
+    """Samples Stage-4 (c4) semantic embeddings uniformly across ALL batches of the test split."""
     model.eval()
     rng = np.random.default_rng(seed)
     num_batches = max(1, len(dataloader))
@@ -210,6 +243,9 @@ def extract_semantic_embeddings(model, dataloader, device, max_samples: int, see
             feat_chunks.append(f_valid[chosen])
             label_chunks.append(l_valid[chosen])
 
+    if not feat_chunks:
+        return np.empty((0, 0)), np.empty((0,), dtype=np.int64)
+
     f_np = np.concatenate(feat_chunks, axis=0)
     l_np = np.concatenate(label_chunks, axis=0)
     if len(f_np) > max_samples:
@@ -218,16 +254,39 @@ def extract_semantic_embeddings(model, dataloader, device, max_samples: int, see
     return f_np, l_np
 
 
+def compute_safe_projection_params(n_samples: int):
+    """Computes valid t-SNE perplexity (0 < p < n_samples) and UMAP n_neighbors (2 <= k < n_samples)."""
+    if n_samples < 3:
+        raise ValueError(f"Need at least 3 samples for 2D t-SNE/UMAP projection, got {n_samples}.")
+    perplexity = min(45, max(5, (n_samples - 1) // 3), n_samples - 1)
+    n_neighbors = min(15, n_samples - 1)
+    return perplexity, n_neighbors
+
+
 def compute_and_plot_latents(features, labels, title, ax_tsne, ax_umap, palette_type, class_names=None):
-    perplexity = min(45, max(5, (len(features) - 1) // 3))
+    if features is None or labels is None:
+        msg = "N/A\n(Naive Early Fusion — Single Unified 5-Ch Stem;\nNo Separate RGB vs. D+T Streams)"
+        render_na_panel(ax_tsne, f"t-SNE: {title}", msg)
+        render_na_panel(ax_umap, f"UMAP: {title}", msg)
+        return
+
+    n_samples = len(features)
+    if n_samples < 3:
+        msg = f"N/A\n(Insufficient valid tokens: n={n_samples} < 3)"
+        render_na_panel(ax_tsne, f"t-SNE: {title}", msg)
+        render_na_panel(ax_umap, f"UMAP: {title}", msg)
+        return
+
+    perplexity, n_neighbors = compute_safe_projection_params(n_samples)
     tsne_results = TSNE(n_components=2, perplexity=perplexity, random_state=42, max_iter=1000).fit_transform(features)
-    umap_results = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine', random_state=42).fit_transform(features)
+    umap_results = umap.UMAP(n_neighbors=n_neighbors, min_dist=0.1, metric='cosine', random_state=42).fit_transform(features)
 
     if palette_type == "semantic" and class_names is not None:
         unique_int_labels = sorted(np.unique(labels).astype(int))
         display_labels = [class_names[int(lbl)] if int(lbl) < len(class_names) else f"Class {lbl}" for lbl in labels]
         hue_order = [class_names[i] if i < len(class_names) else f"Class {i}" for i in unique_int_labels]
-        palette = sns.color_palette("nipy_spectral", len(unique_int_labels))
+        palette_name = "tab20" if len(unique_int_labels) <= 20 else "husl"
+        palette = sns.color_palette(palette_name, len(unique_int_labels))
     else:
         display_labels = labels
         hue_order = ["RGB Manifold", "Depth+Thermal Manifold"]
@@ -243,7 +302,7 @@ def compute_and_plot_latents(features, labels, title, ax_tsne, ax_umap, palette_
 
     sns.scatterplot(
         data=df, x='TSNE_1', y='TSNE_2', hue='Label', hue_order=hue_order,
-        palette=palette, s=15, alpha=0.85, ax=ax_tsne, edgecolor='none'
+        palette=palette, s=14, alpha=0.85, ax=ax_tsne, edgecolor='none'
     )
     ax_tsne.set_title(f"t-SNE: {title}", fontweight='bold', color='white')
     ax_tsne.set_xticks([])
@@ -251,7 +310,7 @@ def compute_and_plot_latents(features, labels, title, ax_tsne, ax_umap, palette_
 
     sns.scatterplot(
         data=df, x='UMAP_1', y='UMAP_2', hue='Label', hue_order=hue_order,
-        palette=palette, s=15, alpha=0.85, ax=ax_umap, edgecolor='none'
+        palette=palette, s=14, alpha=0.85, ax=ax_umap, edgecolor='none'
     )
     ax_umap.set_title(f"UMAP: {title}", fontweight='bold', color='white')
     ax_umap.set_xticks([])
@@ -259,7 +318,7 @@ def compute_and_plot_latents(features, labels, title, ax_tsne, ax_umap, palette_
 
     if palette_type == "semantic":
         for ax in [ax_tsne, ax_umap]:
-            legend = ax.legend(title="Structural Class", bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., fontsize='small')
+            legend = ax.legend(title="Structural Class", bbox_to_anchor=(1.04, 1), loc='upper left', borderaxespad=0., fontsize='small')
             plt.setp(legend.get_title(), color='white')
             plt.setp(legend.get_texts(), color='white')
             legend.get_frame().set_facecolor('#161b22')
@@ -285,7 +344,6 @@ def main():
     primary_baselines, ablation_trials = {}, {}
     ablation_backbone_detected = None
 
-    # Backbone-agnostic pattern supporting MiT (mit_b1..b5) and external baselines (e.g., resnet50)
     run_folder_pattern = re.compile(r"^(.+?)_(baseline|Control_Optimal|Ablation_.+|LoRA_.+)_seed(\d+)$")
     json_files = sorted(glob.glob(os.path.join(base_dir, "*", "*", "results.json")))
 
@@ -319,7 +377,17 @@ def main():
         else:
             primary_baselines.setdefault(isolated_backbone, {}).setdefault(phase, {})["42"] = record
 
-    # Fall back to the ablation backbone's baseline microtune seeds if Control_Optimal was not mirrored
+    # Load any explicitly skipped degenerate ablations (e.g., self-distillation Ablation_NoKD)
+    skipped_ablations = {}
+    skip_path = os.path.join(base_dir, "skipped_ablations.json")
+    if os.path.exists(skip_path):
+        try:
+            with open(skip_path, "r") as f:
+                skipped_ablations = json.load(f)
+        except json.JSONDecodeError:
+            skipped_ablations = {}
+
+    # Alias Part 1 baseline microtune seeds on the ablation backbone as Control_Optimal (zero disk duplication)
     control_key = "Control_Optimal"
     if (
         control_key not in ablation_trials
@@ -329,7 +397,12 @@ def main():
         ablation_trials[control_key] = primary_baselines[ablation_backbone_detected]["microtune"]
 
     analysis_payload = {
-        "metadata": {"model": args.model, "dataset": args.dataset, "std_ddof": 1},
+        "metadata": {
+            "model": args.model,
+            "dataset": args.dataset,
+            "ablation_backbone": ablation_backbone_detected,
+            "std_ddof": 1
+        },
         "primary_baselines": {},
         "ablation_statistics": {}
     }
@@ -376,10 +449,25 @@ def main():
         else:
             common_seeds = sorted(set(control_seed_map.keys()) & set(seed_data.keys()))
             if len(common_seeds) > 1:
-                c_vals = [control_seed_map[s]["mIoU"] for s in common_seeds]
-                t_vals = [seed_data[s]["mIoU"] for s in common_seeds]
+                c_vals = np.array([control_seed_map[s]["mIoU"] for s in common_seeds], dtype=np.float64)
+                t_vals = np.array([seed_data[s]["mIoU"] for s in common_seeds], dtype=np.float64)
+                diffs = t_vals - c_vals
+                mean_diff = float(np.mean(diffs))
+                std_diff = float(np.std(diffs, ddof=1))
+                se_diff = std_diff / math.sqrt(len(diffs))
+                t_crit = float(stats.t.ppf(0.975, df=len(diffs) - 1))
+
                 _, p_value = stats.ttest_rel(c_vals, t_vals)
                 stat_entry["test_type"] = "paired_t"
+                stat_entry["paired_seeds_tested"] = len(common_seeds)
+                stat_entry["paired_mean_diff"] = round(mean_diff, 4)
+                stat_entry["paired_ci_95"] = [
+                    round(mean_diff - t_crit * se_diff, 4),
+                    round(mean_diff + t_crit * se_diff, 4)
+                ]
+                if len(common_seeds) != len(scores) or len(common_seeds) != len(control_scores):
+                    print(f"[!] WARNING: Seed count mismatch for {trial_name} "
+                          f"(paired={len(common_seeds)}, trial={len(scores)}, control={len(control_scores)}).")
             elif len(control_scores) > 1 and len(scores) > 1:
                 _, p_value = stats.ttest_ind(control_scores, scores, equal_var=False)
                 stat_entry["test_type"] = "welch_t"
@@ -398,12 +486,26 @@ def main():
 
         analysis_payload["ablation_statistics"][trial_name] = stat_entry
 
-    # Apply Benjamini-Hochberg False Discovery Rate (FDR) Correction
+    # Apply Benjamini-Hochberg FDR strictly to executed non-degenerate trials
     if raw_p_values:
         reject, pvals_corrected, _, _ = multipletests(raw_p_values, alpha=0.05, method='fdr_bh')
         for i, trial_name in enumerate(trial_order):
             analysis_payload["ablation_statistics"][trial_name]["p_value_vs_control"] = round(float(pvals_corrected[i]), 4)
             analysis_payload["ablation_statistics"][trial_name]["is_statistically_significant"] = bool(reject[i])
+
+    # Document skipped trials AFTER BH-FDR so they never dilute corrected p-values
+    for skipped_trial, meta in skipped_ablations.items():
+        if skipped_trial not in analysis_payload["ablation_statistics"]:
+            analysis_payload["ablation_statistics"][skipped_trial] = {
+                "seeds_evaluated": 0,
+                "raw_scores": [],
+                "mean_mIoU": None,
+                "std_dev": None,
+                "skipped_reason": meta.get("skipped_reason", "skipped"),
+                "test_type": "skipped",
+                "p_value_vs_control": None,
+                "is_statistically_significant": None
+            }
 
     with open(os.path.join(base_dir, "analysis.json"), 'w') as f:
         json.dump(analysis_payload, f, indent=4)
@@ -411,11 +513,11 @@ def main():
     vis_dir = os.path.join(base_dir, "analysis_plots")
     generate_metric_visualizations(primary_baselines, analysis_payload["ablation_statistics"], vis_dir)
 
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 96)
     print(f"📊 CVPR STATISTICAL SUMMARY: {args.model} | {args.dataset} (Unbiased Sample Std, ddof=1)")
-    print("=" * 90)
+    print("=" * 96)
     print(f"{'Backbone':<15} | {'Phase':<12} | {'Mean ± Std':<17} | {'Val mIoU':<10} | {'Train Loss':<10} | {'Val Loss':<10}")
-    print("-" * 90)
+    print("-" * 96)
     for bb in sorted(primary_baselines.keys()):
         for phase in ["baseline", "hero", "microtune"]:
             if phase in primary_baselines[bb]:
@@ -425,20 +527,24 @@ def main():
                 t_loss = f"{d['mean_train_loss']:.4f}" if d['mean_train_loss'] is not None else "N/A"
                 v_loss = f"{d['mean_val_loss']:.4f}" if d['mean_val_loss'] is not None else "N/A"
                 print(f"{bb:<15} | {phase.capitalize():<12} | {mu_sigma:<17} | {v_miou:<10} | {t_loss:<10} | {v_loss:<10}")
-        print("-" * 90)
+        print("-" * 96)
 
-    print(f"\n[ ABLATION MATRIX STATISTICS (N={len(control_scores)} Seeds, Paired-t + BH-FDR) ]")
-    print(f"{'Ablation Variant':<30} | {'Mean ± Std':<17} | {'Test':<10} | {'p-val (FDR)':<12} | {'Sig (<0.05)'}")
-    print("-" * 90)
+    print(f"\n[ ABLATION MATRIX STATISTICS (Target: {ablation_backbone_detected} | N={len(control_scores)} Seeds, Paired-t + BH-FDR) ]")
+    print(f"{'Ablation Variant':<30} | {'Mean ± Std':<17} | {'Δ (95% CI)':<21} | {'p-val (FDR)':<11} | {'Sig'}")
+    print("-" * 96)
     for trial, s_data in analysis_payload["ablation_statistics"].items():
-        mu_sigma = f"{s_data['mean_mIoU']:.4f} ± {s_data['std_dev']:.4f}"
-        if trial == control_key:
-            print(f"{trial:<30} | {mu_sigma:<17} | {'Ref':<10} | {'---':<12} | Reference Baseline")
+        if s_data.get("skipped_reason"):
+            print(f"{trial:<30} | {'SKIPPED':<17} | {'---':<21} | {'---':<11} | {s_data['skipped_reason']}")
+        elif trial == control_key:
+            mu_sigma = f"{s_data['mean_mIoU']:.4f} ± {s_data['std_dev']:.4f}"
+            print(f"{trial:<30} | {mu_sigma:<17} | {'Reference':<21} | {'---':<11} | Ref")
         else:
-            print(
-                f"{trial:<30} | {mu_sigma:<17} | {s_data.get('test_type', 'N/A'):<10} | "
-                f"{str(s_data.get('p_value_vs_control')):<12} | {s_data.get('is_statistically_significant')}"
-            )
+            mu_sigma = f"{s_data['mean_mIoU']:.4f} ± {s_data['std_dev']:.4f}"
+            ci = s_data.get("paired_ci_95")
+            diff_str = f"{s_data['paired_mean_diff']:+.4f} [{ci[0]:+.3f},{ci[1]:+.3f}]" if ci else "N/A"
+            stars = significance_stars(s_data.get("p_value_vs_control"), s_data.get("is_statistically_significant"))
+            sig_str = f"{s_data.get('is_statistically_significant')} {stars}".strip()
+            print(f"{trial:<30} | {mu_sigma:<17} | {diff_str:<21} | {str(s_data.get('p_value_vs_control')):<11} | {sig_str}")
 
     # ---------------------------------------------------------
     # STAGE 2: LATENT SPACE EMBEDDING RENDERER
@@ -447,9 +553,9 @@ def main():
         print("\n[*] Skipping heavy Latent Embedding renderings as requested.")
         return
 
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 96)
     print("🌌 INITIALIZING MANIFOLD PROJECTION ENGINE (FULL-TEST UNIFORM UMAP / t-SNE)")
-    print("=" * 90)
+    print("=" * 96)
 
     configure_dark_mode()
 
@@ -463,11 +569,17 @@ def main():
         print(f"[-] WARNING: classes.txt not found. Cannot perform latent rendering for {args.dataset}")
         return
 
+    if NUM_CLASSES == 0:
+        print("[-] WARNING: classes.txt is empty. Skipping latent rendering.")
+        return
+    if class_names[0].lower() not in {"background", "bg", "unlabeled", "void", "other", "none"}:
+        print(f"[!] NOTICE: Class 0 in classes.txt is '{class_names[0]}'. Verify 0-indexed alignment with mask labels.")
+
     eval_dataset = DownstreamSegmentationDataset(
         dataset_name=args.dataset,
         split="test",
         splits_root=splits_root,
-        image_size=(480, 640),
+        image_size=(args.img_height, args.img_width),
         enable_augmentation=False
     )
     eval_loader = DataLoader(eval_dataset, batch_size=4, shuffle=False, num_workers=4)
@@ -503,27 +615,30 @@ def main():
             fallback_p1 = os.path.join("weights", args.model, args.dataset, "baseline_seed42", f"jepa_context_encoder_{backbone}.pt")
             if os.path.exists(fallback_p1):
                 p1_weights = fallback_p1
+            else:
+                print(f"[!] NOTICE: No Phase 1 weights found for {folder_tag if 'folder_tag' in locals() else parent_backbone_folder}; rendering Phase 2 only.")
+                p1_weights = None
         runs_to_process.append((p1_weights, wf, backbone, parent_backbone_folder, run_name))
 
     for p1_weights, p2_weights, backbone, folder_tag, run_name in runs_to_process:
         print(f"[*] Extracting latents for: {folder_tag}/{run_name} (Backbone: {backbone})...")
 
-        has_p1 = p1_weights and os.path.exists(p1_weights)
-        has_p2 = p2_weights and os.path.exists(p2_weights)
+        has_p1 = bool(p1_weights and os.path.exists(p1_weights))
+        has_p2 = bool(p2_weights and os.path.exists(p2_weights))
 
         cols = 4 if (has_p1 and has_p2) else 2
-        fig, axes = plt.subplots(2, cols, figsize=(8 * cols, 16), facecolor="#0d1117")
+        fig, axes = plt.subplots(2, cols, figsize=(6.5 * cols, 12), facecolor="#0d1117")
         if cols == 2:
             axes = axes.reshape(2, 2)
 
         try:
             if has_p1:
-                print("    -> Extracting Phase 1 (Foundation) manifolds...")
-                raw_ckpt = torch.load(p1_weights, map_location=DEVICE)
-                ce_weights = raw_ckpt.get('context_encoder_state_dict', raw_ckpt)
-                prefixed_ce_weights = {f"context_encoder.{k}": v for k, v in ce_weights.items()}
+                print("    -> Extracting Phase 1 (Foundation) manifolds (strict encoder load)...")
+                raw_ckpt = torch.load(p1_weights, map_location=DEVICE, weights_only=True)
+                ce_weights = raw_ckpt.get('context_encoder_state_dict', raw_ckpt) if isinstance(raw_ckpt, dict) else raw_ckpt
                 model_p1 = models.instantiate_model_from_checkpoint(
-                    ModelClass, NUM_CLASSES, backbone, prefixed_ce_weights, DEVICE, strict=False
+                    ModelClass, NUM_CLASSES, backbone, ce_weights, DEVICE,
+                    strict=True, encoder_only=True
                 )
 
                 m_f1, m_l1 = extract_modality_embeddings(model_p1, eval_loader, DEVICE, args.samples)
@@ -533,10 +648,11 @@ def main():
                 compute_and_plot_latents(s_f1, s_l1, "Phase 1: Semantic Foundation", axes[1, 0], axes[1, 1], "semantic", class_names)
 
             if has_p2:
-                print("    -> Extracting Phase 2 (Fine-Tuned) manifolds...")
-                p2_state_dict = torch.load(p2_weights, map_location=DEVICE)
+                print("    -> Extracting Phase 2 (Fine-Tuned) manifolds (strict full load)...")
+                p2_state_dict = torch.load(p2_weights, map_location=DEVICE, weights_only=True)
                 model_p2 = models.instantiate_model_from_checkpoint(
-                    ModelClass, NUM_CLASSES, backbone, p2_state_dict, DEVICE, strict=False
+                    ModelClass, NUM_CLASSES, backbone, p2_state_dict, DEVICE,
+                    strict=True, encoder_only=False
                 )
 
                 m_f2, m_l2 = extract_modality_embeddings(model_p2, eval_loader, DEVICE, args.samples)
@@ -546,10 +662,10 @@ def main():
                 compute_and_plot_latents(m_f2, m_l2, "Phase 2: Modality Alignment", axes[0, col_offset], axes[0, col_offset + 1], "modality", class_names)
                 compute_and_plot_latents(s_f2, s_l2, "Phase 2: Semantic Separation", axes[1, col_offset], axes[1, col_offset + 1], "semantic", class_names)
 
-            plt.tight_layout(pad=3.0)
+            plt.tight_layout(pad=2.5)
             save_path = os.path.join(vis_dir, f"manifold_progression_{folder_tag}_{run_name}.png")
-            plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor="#0d1117")
-            plt.close()
+            plt.savefig(save_path, dpi=200, bbox_inches='tight', facecolor="#0d1117")
+            plt.close(fig)
             print(f"    -> Render saved to: {save_path}")
 
         except Exception as e:

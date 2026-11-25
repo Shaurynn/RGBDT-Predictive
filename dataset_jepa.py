@@ -57,7 +57,7 @@ class BaseRGBDTDataset(Dataset):
         for _, row in self.manifest.iterrows():
             if 'rgb_path' in row and pd.notna(row['rgb_path']):
                 rgb_filename = os.path.basename(str(row['rgb_path']))
-                base_name = os.path.splitext(rgb_filename)[0].replace('_rgb', '')
+                base_name = os.path.splitext(rgb_filename)[0].removesuffix('_rgb')
             else:
                 base_name = str(row.iloc[0])
             self.image_files.append(base_name)
@@ -183,7 +183,7 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
     def __init__(self, data_dir: str = None, dataset_name: str = None, split: str = 'train',
                  splits_root: str = "data/splits", image_size: Tuple[int, int] = (480, 640),
                  mask_strategy: str = "random", enable_augmentation: bool = True,
-                 modality_dropout_prob: float = 0.0):
+                 modality_dropout_prob: float = 0.0, mask_ratio: float = 0.60):
         super().__init__(
             data_dir=data_dir,
             dataset_name=dataset_name,
@@ -194,6 +194,7 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
         self.mask_strategy = mask_strategy
         self.enable_augmentation = enable_augmentation
         self.modality_dropout_prob = modality_dropout_prob
+        self.mask_ratio = mask_ratio
 
     def _generate_multiblock_mask(self, h: int, w: int, num_blocks: int = 4) -> torch.Tensor:
         mask = torch.zeros((1, h, w), dtype=torch.float32)
@@ -220,16 +221,16 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
         return mask
 
     def _generate_random_patch_mask(self, h: int, w: int, patch_size: int = 32,
-                                    mask_ratio: float = 0.60) -> torch.Tensor:
+                                    mask_ratio: float = None) -> torch.Tensor:
         """
         Generates random non-overlapping patches aligned with the MiT Stage-4 (stride 32)
         latent grid so every masked pixel patch maps 1-to-1 to a target latent token.
         """
+        ratio = self.mask_ratio if mask_ratio is None else mask_ratio
         mask = torch.zeros((1, h, w), dtype=torch.float32)
         num_patches_h, num_patches_w = h // patch_size, w // patch_size
         total_patches = num_patches_h * num_patches_w
-        num_mask_patches = max(1, int(total_patches * mask_ratio))
-
+        num_mask_patches = max(1, int(total_patches * ratio))
         mask_indices = np.random.choice(total_patches, num_mask_patches, replace=False)
 
         for idx in mask_indices:
@@ -267,7 +268,9 @@ class JEPAPretrainDataset(BaseRGBDTDataset):
         x_normalized = self._normalize_rgb_only(x_full)
 
         if self.mask_strategy == "random":
-            mask = self._generate_random_patch_mask(self.image_size[0], self.image_size[1], patch_size=32)
+            mask = self._generate_random_patch_mask(
+                self.image_size[0], self.image_size[1], patch_size=32, mask_ratio=self.mask_ratio
+            )
         else:
             mask = self._generate_multiblock_mask(self.image_size[0], self.image_size[1])
 

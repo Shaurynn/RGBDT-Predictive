@@ -10,6 +10,8 @@
         "test": 38
     },
     "val_test_group_overlap": null,
+    "train_eval_overlap_count": 0,
+    "leakage_detected": false,
     "strata_distribution": {
         "mask_cls_1": {
             "val": 1,

@@ -19,6 +19,7 @@ from dataset_jepa import DownstreamSegmentationDataset, TTA_DownstreamSegmentati
 import models
 from config_utils import parse_with_config
 
+PHASE_SEQUENCE = ("baseline", "hpo", "hero", "microtune", "export")
 
 def enforce_reproducibility(seed: int = 42) -> None:
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -45,7 +46,7 @@ def load_phase1_encoder_weights(context_encoder: nn.Module, pt_weights_path: str
     2. Remaps unwrapped `.q.*`/`.kv.*` keys to `.q.original_layer.*`/`.kv.original_layer.*`
        when LoRA wrappers are active so attention weights are never silently left random.
     """
-    raw_sd = torch.load(pt_weights_path, map_location=device)
+    raw_sd = torch.load(pt_weights_path, map_location=device, weights_only=True)
     if isinstance(raw_sd, dict) and 'context_encoder_state_dict' in raw_sd:
         raw_sd = raw_sd['context_encoder_state_dict']
 
@@ -68,10 +69,11 @@ def load_phase1_encoder_weights(context_encoder: nn.Module, pt_weights_path: str
 
     incompatible = nn.Module.load_state_dict(context_encoder, remapped_sd, strict=False)
     non_lora_missing = [k for k in incompatible.missing_keys if 'lora_' not in k]
-    if non_lora_missing:
-        print(f"[!] WARNING: Missing non-LoRA Phase 1 keys ({len(non_lora_missing)}): {non_lora_missing[:5]}")
-    if incompatible.unexpected_keys:
-        print(f"[!] WARNING: Unexpected Phase 1 keys ({len(incompatible.unexpected_keys)}): {incompatible.unexpected_keys[:5]}")
+    if non_lora_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            f"[-] CRITICAL: Phase 1 -> Phase 2 encoder key mismatch! "
+            f"Missing non-LoRA: {non_lora_missing[:5]} | Unexpected: {incompatible.unexpected_keys[:5]}"
+        )
         
         
 def build_model_kwargs(ModelClass, num_classes: int, backbone_name: str, isolated_stem: bool,
@@ -294,7 +296,7 @@ class IoUMetric:
 def export_to_onnx(model, weights_path: str, run_dir: str, device: torch.device,
                    img_size=(480, 640), opset_version: int = 16) -> str:
     print(f"\n--- Serializing Architecture to ONNX (opset={opset_version}, size={img_size}) ---")
-    model.load_state_dict(torch.load(weights_path, map_location=device))
+    model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
     model.to(device)
     model.eval()
 
@@ -398,7 +400,7 @@ class ExperimentManager:
         self.backbone = backbone
         self.model_dir = os.path.join(base_dir, self.model_name, self.dataset, self.backbone)
         os.makedirs(self.model_dir, exist_ok=True)
-        self.phase_sequence = ["baseline", "hpo", "hero", "microtune", "export"]
+        self.phase_sequence = list(PHASE_SEQUENCE)
 
     def detect_state(self):
         existing_runs = sorted(glob.glob(os.path.join(self.model_dir, "*_*")))
@@ -584,7 +586,7 @@ def run_hpo_phase(run_dir: str, inherit_weights, ModelClass, model_kwargs: dict,
     def objective(trial):
         model = ModelClass(**model_kwargs).to(device)
         if inherit_weights and os.path.exists(inherit_weights):
-            model.load_state_dict(torch.load(inherit_weights, map_location=device), strict=False)
+            model.load_state_dict(torch.load(inherit_weights, map_location=device, weights_only=True), strict=True)
 
         for name, param in model.context_encoder.named_parameters():
             param.requires_grad = ('patch_embed1.proj' in name)
@@ -713,7 +715,7 @@ def main():
     llrd_decay = ablation_cfg.get('llrd_decay', cfg.get('llrd_decay', 0.85))
 
     high_capacity_backbones = {'mit_b3', 'mit_b4', 'mit_b5'}
-    if ablation_cfg.get('dynamic_lora_rank', False) and cfg['backbone'] in high_capacity_backbones:
+    if use_lora and ablation_cfg.get('dynamic_lora_rank', False) and cfg['backbone'] in high_capacity_backbones:
         print(f"[*] Dynamic LoRA Active: Scaling down adapter capacity for {cfg['backbone']}")
         lora_r = max(4, lora_r // 2)
         lora_alpha = max(8, lora_alpha // 2)
@@ -795,7 +797,7 @@ def main():
     if enable_kd and teacher_ckpt_path and os.path.exists(teacher_ckpt_path):
         teacher_bb = cfg.get('teacher_backbone', 'mit_b4')
         print(f"[*] Initializing Feature-Level KD Teacher ({teacher_bb}) from: {teacher_ckpt_path}")
-        t_state_dict = torch.load(teacher_ckpt_path, map_location=DEVICE)
+        t_state_dict = torch.load(teacher_ckpt_path, map_location=DEVICE, weights_only=True)
         teacher_model = models.instantiate_model_from_checkpoint(
             ModelClass=ModelClass,
             num_classes=NUM_CLASSES,
@@ -875,12 +877,12 @@ def main():
 
         if state.get("inherit_weights") and os.path.exists(state["inherit_weights"]):
             print(f"[*] Inheriting converged weights from previous phase: {state['inherit_weights']}")
-            model.load_state_dict(torch.load(state["inherit_weights"], map_location=DEVICE), strict=False)
+            model.load_state_dict(torch.load(state["inherit_weights"], map_location=DEVICE, weights_only=True), strict=True)
 
     if phase == "microtune":
         print("\n[*] Initializing Microtune Phase")
         if use_lora:
-            print("[*] LoRA Active: Tuning Decoder, Modality-Isolated Stem, and Low-Rank matrices.")
+            print(f"[*] LoRA Active (r={lora_r}, alpha={lora_alpha}): Tuning Decoder, Modality-Isolated Stem, and Low-Rank matrices.")
             for name, param in model.named_parameters():
                 param.requires_grad = ('lora_' in name or 'decode_head' in name or 'patch_embed1.proj' in name)
         else:
@@ -901,6 +903,7 @@ def main():
     ).to(DEVICE)
 
     active_hparams = {
+        **ablation_cfg,
         "lr": lr,
         "weight_decay": weight_decay,
         "gamma": gamma,
@@ -909,10 +912,10 @@ def main():
         "batch_size": cfg['batch_size'],
         "use_lora": use_lora,
         "lora_r": lora_r,
+        "lora_alpha": lora_alpha,
         "llrd_decay": llrd_decay,
         "modality_dropout_prob": modality_dropout_prob,
         "teacher_checkpoint": teacher_ckpt_path,
-        **ablation_cfg
     }
     state["hyperparameters"] = active_hparams
 
@@ -933,8 +936,8 @@ def main():
     if state["is_resume"]:
         checkpoint_path = os.path.join(run_dir, "checkpoint.pt")
         if os.path.exists(checkpoint_path):
-            checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=True)
+            model.load_state_dict(checkpoint['model_state_dict'], strict=True)
             try:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             except ValueError:
@@ -1078,7 +1081,7 @@ def main():
         print("\n[*] Microtune complete. Loading best validation checkpoint for Blind Test Set TTA Evaluation...")
         best_model_path = os.path.join(run_dir, "best_model.pt")
         if os.path.exists(best_model_path):
-            model.load_state_dict(torch.load(best_model_path, map_location=DEVICE))
+            model.load_state_dict(torch.load(best_model_path, map_location=DEVICE, weights_only=True), strict=True)
 
         test_dataset_tta = TTA_DownstreamSegmentationDataset(
             dataset_name=dataset_name,

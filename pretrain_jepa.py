@@ -115,7 +115,7 @@ def main():
     encoder_export_path = os.path.join(weight_dir, f"jepa_context_encoder_{cfg['backbone']}.pt")
 
     if os.path.exists(encoder_export_path) and os.path.exists(ckpt_path):
-        existing_ckpt = torch.load(ckpt_path, map_location="cpu")
+        existing_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         if existing_ckpt.get('completed', False) or existing_ckpt.get('epoch', 0) >= cfg['epochs']:
             print(f"[>>] Phase 1 already completed ({existing_ckpt.get('epoch')}/{cfg['epochs']} epochs). Exiting.")
             return
@@ -140,7 +140,8 @@ def main():
         splits_root=splits_root,
         image_size=img_size,
         mask_strategy=mask_strategy,
-        modality_dropout_prob=modality_dropout_prob
+        modality_dropout_prob=modality_dropout_prob,
+        mask_ratio=float(cfg['jepa'].get('mask_ratio', 0.60))
     )
 
     dl_generator = torch.Generator()
@@ -194,7 +195,7 @@ def main():
     start_epoch = 0
     if os.path.exists(ckpt_path):
         print(f"[*] Resuming Phase 1 Pre-Training from checkpoint: {ckpt_path}")
-        checkpoint = torch.load(ckpt_path, map_location=DEVICE)
+        checkpoint = torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
         torch.nn.Module.load_state_dict(model.context_encoder, checkpoint['context_encoder_state_dict'], strict=True)
         torch.nn.Module.load_state_dict(model.target_encoder, checkpoint['target_encoder_state_dict'], strict=True)
         model.predictor.load_state_dict(checkpoint['predictor_state_dict'])

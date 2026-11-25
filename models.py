@@ -140,8 +140,8 @@ class NaiveEarlyFusionPatchEmbed(nn.Module):
 
 class PositionalEncoding2D(nn.Module):
     """
-    Asymmetric 2D sinusoidal positional encoding that allocates disjoint channel
-    halves to X and Y coordinates and concatenates them along the channel axis.
+    Asymmetric 2D sinusoidal positional encoding allocating disjoint channel halves
+    to X and Y coordinates and concatenating them along the channel axis.
     """
     def __init__(self, channels: int):
         super().__init__()
@@ -198,26 +198,34 @@ class SpatialJEPAPredictor(nn.Module):
 # ====================================================================================
 
 class LoRALinear(nn.Module):
-    def __init__(self, original_layer: nn.Linear, r: int = 8, alpha: int = 16):
+    """
+    Low-Rank Adaptation wrapper for nn.Linear (Hu et al., ICLR 2022).
+    Stores right-multiplied factors A: (in_features, r) and B: (r, out_features)
+    (transposed relative to the paper's column-vector notation, mathematically identical:
+    x @ A @ B * (alpha / r)). Serializes `lora_alpha` as a buffer for exact checkpoint reload.
+    """
+    def __init__(self, original_layer: nn.Linear, r: int = 8, alpha: float = 16.0):
         super().__init__()
         if r <= 0:
             raise ValueError(f"[-] CRITICAL: LoRA rank 'r' must be strictly positive. Received: {r}")
 
         self.original_layer = original_layer
-        self.r = r
-        self.alpha = alpha
-        self.scaling = alpha / r
+        self.r = int(r)
+        self.alpha = float(alpha)
+        self.register_buffer('lora_alpha', torch.tensor(float(alpha), dtype=torch.float32))
 
-        self.lora_A = nn.Parameter(torch.zeros(original_layer.in_features, r))
-        self.lora_B = nn.Parameter(torch.zeros(r, original_layer.out_features))
+        self.lora_A = nn.Parameter(torch.zeros(original_layer.in_features, self.r))
+        self.lora_B = nn.Parameter(torch.zeros(self.r, original_layer.out_features))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.original_layer(x) + (x @ self.lora_A @ self.lora_B) * self.scaling
+        scaling = self.lora_alpha / self.r
+        return self.original_layer(x) + (x @ self.lora_A @ self.lora_B) * scaling
 
 
-def apply_lora_to_mit(model: nn.Module, r: int = 8, alpha: int = 16) -> None:
+def apply_lora_to_mit(model: nn.Module, r: int = 8, alpha: float = 16.0) -> None:
+    """Injects LoRA into MiT Query (.q) and Key-Value (.kv) linear projections."""
     for name, _ in list(model.named_modules()):
         if name.endswith('.q') or name.endswith('.kv'):
             parent_name, child_name = name.rsplit('.', 1)
@@ -288,6 +296,11 @@ class MultimodalJEPA(nn.Module):
 
 
 class SegFormerAllMLPDecoder(nn.Module):
+    """
+    Lightweight All-MLP Semantic Segmentation Decoder (Xie et al., SegFormer, NeurIPS 2021).
+    Uses GroupNorm(1, C) (mathematically equivalent to LayerNorm across C x H x W) for
+    batch-size-invariant stability under small micro-batches.
+    """
     def __init__(self, in_channels_list, embedding_dim: int = 256, num_classes: int = 10):
         super().__init__()
         self.linear_c4 = nn.Conv2d(in_channels_list[3], embedding_dim, kernel_size=1)
@@ -343,7 +356,7 @@ class TMLPN_Downstream_v1(nn.Module):
 
 class TMLPN_Downstream_v2(nn.Module):
     def __init__(self, num_classes: int = 10, backbone_name: str = 'mit_b1', isolated_stem: bool = True,
-                 use_lora: bool = False, lora_r: int = 8, lora_alpha: int = 16):
+                 use_lora: bool = False, lora_r: int = 8, lora_alpha: float = 16.0):
         super().__init__()
         self.isolated_stem = isolated_stem
         self.context_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, weights=None)
@@ -375,7 +388,7 @@ class TMLPN_Downstream_v2(nn.Module):
 class TMLPN_Downstream_v3(nn.Module):
     def __init__(self, num_classes: int = 10, backbone_name: str = 'mit_b1', isolated_stem: bool = True,
                  enable_dirac: bool = True, enable_scse: bool = True,
-                 use_lora: bool = False, lora_r: int = 8, lora_alpha: int = 16):
+                 use_lora: bool = False, lora_r: int = 8, lora_alpha: float = 16.0):
         super().__init__()
         self.isolated_stem = isolated_stem
         self.context_encoder = smp.encoders.get_encoder(backbone_name, in_channels=3, weights=None)
@@ -411,17 +424,32 @@ class TMLPN_Downstream_v3(nn.Module):
 
 def instantiate_model_from_checkpoint(ModelClass, num_classes: int, backbone: str,
                                       state_dict: dict, device: torch.device,
-                                      strict: bool = True) -> nn.Module:
+                                      strict: bool = True,
+                                      encoder_only: bool = False) -> nn.Module:
+    """
+    Reconstructs the exact structural configuration (isolated stem, scSE, LoRA rank/alpha)
+    from a serialized state_dict.
+    - When `encoder_only=True` (Phase 1 weights), enforces `strict=True` on `context_encoder`
+      only (via nn.Module.load_state_dict to bypass SMP's override) while leaving `decode_head`
+      randomly initialized.
+    - When `encoder_only=False` (Phase 2 weights), enforces `strict` across the full model.
+    """
     is_isolated = any('rgb_proj' in k for k in state_dict.keys())
     has_scse = any('scse_gate' in k for k in state_dict.keys())
     has_lora = any('lora_A' in k for k in state_dict.keys())
 
     lora_r = 8
+    lora_alpha = None
     if has_lora:
         for k, v in state_dict.items():
             if k.endswith('lora_A') and v.ndim == 2:
                 lora_r = int(v.shape[1])
-                break
+            elif k.endswith('lora_alpha'):
+                lora_alpha = float(v.item())
+        if lora_alpha is None:
+            lora_alpha = float(lora_r * 2)
+    else:
+        lora_alpha = float(lora_r * 2)
 
     model_kwargs = {
         "num_classes": num_classes,
@@ -434,15 +462,25 @@ def instantiate_model_from_checkpoint(ModelClass, num_classes: int, backbone: st
             "enable_scse": has_scse,
             "use_lora": has_lora,
             "lora_r": lora_r,
-            "lora_alpha": lora_r * 2,
+            "lora_alpha": lora_alpha,
         })
     elif ModelClass.__name__ == "TMLPN_Downstream_v2":
         model_kwargs.update({
             "use_lora": has_lora,
             "lora_r": lora_r,
-            "lora_alpha": lora_r * 2,
+            "lora_alpha": lora_alpha,
         })
 
     model = ModelClass(**model_kwargs).to(device)
-    model.load_state_dict(state_dict, strict=strict)
+
+    if encoder_only:
+        ce_prefix = "context_encoder."
+        ce_sd = {
+            (k[len(ce_prefix):] if k.startswith(ce_prefix) else k): v
+            for k, v in state_dict.items()
+            if not k.startswith("decode_head.")
+        }
+        nn.Module.load_state_dict(model.context_encoder, ce_sd, strict=strict)
+    else:
+        model.load_state_dict(state_dict, strict=strict)
     return model
