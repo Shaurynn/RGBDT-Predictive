@@ -8,6 +8,8 @@ phase1_pretraining:
   epochs: 300
   optimizer:
     lr: 0.0001
+    min_lr: 1.0e-06
+    warmup_epochs: 15
     weight_decay: 0.04
   jepa:
     mask_ratio: 0.6
@@ -40,6 +42,9 @@ phase2_downstream:
     r: 8
     alpha: 16
   llrd_decay: 0.85
+  optimizer:
+    weight_decay: 0.0001
+  onnx_opset: 16
   early_stopping_patience:
     baseline: 30
     hero: 40
@@ -48,6 +53,7 @@ phase2_downstream:
   gradient_accumulation_steps: 4
   hpo:
     n_trials: 30
+    epochs_per_trial: 30
     lr_min: 1.0e-05
     lr_max: 0.005
     wd_min: 0.0001
@@ -81,15 +87,5 @@ phase2_downstream:
     enable_boundary_loss: true
   trial_name: baseline_seed42
   seed: 42
-ablations:
-  enable_modality_isolation: true
-  variance_type: spatial
-  gdl_type: global_anchored
-  enable_kd: true
-  mask_strategy: multi_block
-  dynamic_lora_rank: true
-  adaptive_llrd_decay: true
-  enable_scse: true
-  enable_modality_dropout: true
 metadata:
   model: TMLPN_Downstream_v3

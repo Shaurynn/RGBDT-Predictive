@@ -369,17 +369,27 @@ def test_onnx_export_and_parity(device: torch.device, opset: int = 16):
 
         try:
             import onnxruntime as ort
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device.type == 'cuda' else ['CPUExecutionProvider']
+            available = ort.get_available_providers()
+            use_ort_cuda = (device.type == 'cuda' and 'CUDAExecutionProvider' in available)
+            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if use_ort_cuda else ['CPUExecutionProvider']
             sess = ort.InferenceSession(onnx_path, providers=providers)
 
-            x_test = make_synthetic_rgbdt(2, 128, 128, device)  # Tests dynamic batch axis (B=2 != trace B=1)
+            ref_device = device if use_ort_cuda else torch.device('cpu')
+            ref_model = model.to(ref_device).eval()
+            x_test = make_synthetic_rgbdt(2, 128, 128, ref_device)  # Dynamic batch axis (B=2 != trace B=1)
+
             with torch.no_grad():
-                pt_out = model(x_test).cpu().numpy()
+                pt_out = ref_model(x_test).cpu().numpy()
 
             ort_out = sess.run(None, {'input_5channel': x_test.cpu().numpy()})[0]
             max_diff = float(np.max(np.abs(pt_out - ort_out)))
-            print(f"    -> ONNXRuntime parity (B=2 dynamic batch): max_abs_diff = {max_diff:.6e}")
-            assert max_diff < 1e-3, f"PyTorch vs ONNXRuntime numerical mismatch: {max_diff}"
+            mean_diff = float(np.mean(np.abs(pt_out - ort_out)))
+            argmax_match = float(np.mean(np.argmax(pt_out, axis=1) == np.argmax(ort_out, axis=1))) * 100.0
+            print(
+                f"    -> ONNXRuntime parity ({providers[0]}, B=2): "
+                f"max_abs_diff={max_diff:.2e} | mean_abs_diff={mean_diff:.2e} | argmax_match={argmax_match:.2f}%"
+            )
+            assert max_diff < 1e-4, f"PyTorch vs ONNXRuntime numerical mismatch: {max_diff}"
         except ImportError:
             print("    -> [!] `onnxruntime` package not installed; run `uv add --dev onnxruntime` to verify parity.")
 
